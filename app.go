@@ -248,186 +248,36 @@ func (a *App) SearchSpotifyByType(req SpotifySearchByTypeRequest) ([]backend.Sea
 }
 
 func (a *App) DownloadTrack(req DownloadRequest) (DownloadResponse, error) {
-	if req.TrackID == "" && req.SpotifyID == "" {
+	if err := normalizeDownloadRequest(&req); err != nil {
 		return DownloadResponse{
 			Success: false,
-			Error:   "track ID or Spotify ID is required",
-		}, fmt.Errorf("track ID or Spotify ID is required")
+			Error:   err.Error(),
+		}, err
 	}
 
-	if req.SessionToken == "" {
-		return DownloadResponse{
-			Success: false,
-			Error:   "session token is required",
-		}, fmt.Errorf("session token is required")
-	}
-
-	if req.OutputDir == "" {
-		req.OutputDir = "."
-	} else {
-
-		if req.PlaylistName != "" {
-			sanitizedPlaylist := backend.SanitizeFilename(req.PlaylistName)
-			req.OutputDir = filepath.Join(req.OutputDir, sanitizedPlaylist)
-		}
-
-		req.OutputDir = backend.SanitizeFolderPath(req.OutputDir)
-	}
-
-	if req.AudioFormat == "" {
-		req.AudioFormat = "mp3"
-	}
-
-	if req.FilenameFormat == "" {
-		req.FilenameFormat = "title-artist"
-	}
-
-	itemID := req.ItemID
-	if itemID == "" {
-		trackIDForItemID := req.TrackID
-		if trackIDForItemID == "" {
-			trackIDForItemID = req.SpotifyID
-		}
-		itemID = fmt.Sprintf("%s-%d", trackIDForItemID, time.Now().UnixNano())
-
-		spotifyIDForQueue := req.TrackID
-		if spotifyIDForQueue == "" {
-			spotifyIDForQueue = req.SpotifyID
-		}
-
-		backend.AddToQueue(itemID, req.TrackName, req.ArtistName, req.AlbumName, spotifyIDForQueue)
-	}
+	itemID := ensureDownloadQueueItem(req)
 
 	backend.SetDownloading(true)
 	backend.StartDownloadItem(itemID)
 	defer backend.SetDownloading(false)
 
-	metadataTrackID := req.SpotifyID
-	if metadataTrackID == "" {
-		metadataTrackID = req.TrackID
+	enrichDownloadRequestMetadata(&req)
+
+	if expectedPath, exists := findExistingDownloadPath(req); exists {
+		backend.SkipDownloadItem(itemID, expectedPath)
+		return DownloadResponse{
+			Success:       true,
+			Message:       "File already exists",
+			File:          expectedPath,
+			AlreadyExists: true,
+			ItemID:        itemID,
+		}, nil
 	}
 
-	if metadataTrackID != "" && (req.Copyright == "" || req.Publisher == "" || req.SpotifyTotalDiscs == 0 || req.ReleaseDate == "" || req.TotalTracks == 0 || req.AlbumTrackNumber == 0) {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
+	trackID := primaryTrackID(req)
+	lyricsChan := startLyricsFetch(req, trackID)
 
-		trackURL := fmt.Sprintf("https://open.spotify.com/track/%s", metadataTrackID)
-		trackData, err := backend.GetFilteredSpotifyData(ctx, trackURL, false, 0)
-		if err == nil {
-
-			var trackResp struct {
-				Track struct {
-					Copyright   string `json:"copyright"`
-					Publisher   string `json:"publisher"`
-					TotalDiscs  int    `json:"total_discs"`
-					TotalTracks int    `json:"total_tracks"`
-					TrackNumber int    `json:"track_number"`
-					ReleaseDate string `json:"release_date"`
-				} `json:"track"`
-			}
-			if jsonData, jsonErr := json.Marshal(trackData); jsonErr == nil {
-				if json.Unmarshal(jsonData, &trackResp) == nil {
-
-					if req.Copyright == "" && trackResp.Track.Copyright != "" {
-						req.Copyright = trackResp.Track.Copyright
-					}
-					if req.Publisher == "" && trackResp.Track.Publisher != "" {
-						req.Publisher = trackResp.Track.Publisher
-					}
-					if req.SpotifyTotalDiscs == 0 && trackResp.Track.TotalDiscs > 0 {
-						req.SpotifyTotalDiscs = trackResp.Track.TotalDiscs
-					}
-					if req.TotalTracks == 0 && trackResp.Track.TotalTracks > 0 {
-						req.TotalTracks = trackResp.Track.TotalTracks
-					}
-					if req.AlbumTrackNumber == 0 && trackResp.Track.TrackNumber > 0 {
-						req.AlbumTrackNumber = trackResp.Track.TrackNumber
-					}
-					if req.ReleaseDate == "" && trackResp.Track.ReleaseDate != "" {
-						req.ReleaseDate = trackResp.Track.ReleaseDate
-					}
-				}
-			}
-		}
-	}
-
-	if req.TrackName != "" && req.ArtistName != "" {
-		filenameBase := backend.BuildFilename(req.TrackName, req.ArtistName, req.AlbumName, req.AlbumArtist, req.ReleaseDate, req.DiscNumber, req.FilenameFormat, req.TrackNumber, req.Position, req.UseAlbumTrackNumber, req.PlaylistName, req.PlaylistOwner)
-		filenameBase = backend.SanitizeFilename(filenameBase)
-
-		for _, ext := range backend.PossibleAudioExtensions(req.AudioFormat) {
-			expectedPath := filepath.Join(req.OutputDir, filenameBase+ext)
-			if fileInfo, err := os.Stat(expectedPath); err == nil && fileInfo.Size() > 0 {
-				backend.SkipDownloadItem(itemID, expectedPath)
-				return DownloadResponse{
-					Success:       true,
-					Message:       "File already exists",
-					File:          expectedPath,
-					AlreadyExists: true,
-					ItemID:        itemID,
-				}, nil
-			}
-		}
-	}
-
-	trackID := req.TrackID
-	if trackID == "" {
-		trackID = req.SpotifyID
-	}
-
-	lyricsChan := make(chan string, 1)
-	if req.EmbedLyrics && trackID != "" {
-		go func() {
-			defer close(lyricsChan)
-			fmt.Println("Fetching lyrics in background...")
-			client := backend.NewLyricsClient()
-			resp, _, err := client.FetchLyricsAllSources(trackID, req.TrackName, req.ArtistName, req.Duration)
-			if err == nil && resp != nil && len(resp.Lines) > 0 {
-				lrc := client.ConvertToLRC(resp, req.TrackName, req.ArtistName)
-				lyricsChan <- lrc
-			} else {
-				lyricsChan <- ""
-			}
-		}()
-	} else {
-		close(lyricsChan)
-	}
-
-	downloader := backend.NewSpotiDownloader(req.SessionToken)
-
-	actualTrackNumber := req.AlbumTrackNumber
-	if actualTrackNumber == 0 {
-		actualTrackNumber = 1
-	}
-
-	filename, err := downloader.DownloadTrack(
-		trackID,
-		req.OutputDir,
-		req.AudioFormat,
-		req.FilenameFormat,
-		req.TrackNumber,
-		req.Position,
-		req.TrackName,
-		req.ArtistName,
-		req.AlbumName,
-		req.AlbumArtist,
-		req.ReleaseDate,
-		req.CoverURL,
-		actualTrackNumber,
-		req.DiscNumber,
-		req.TotalTracks,
-		req.UseAlbumTrackNumber,
-		req.EmbedMaxQualityCover,
-		req.SpotifyTotalDiscs,
-		req.Copyright,
-		req.Publisher,
-		req.PlaylistName,
-		req.PlaylistOwner,
-		req.UseFirstArtistOnly,
-		req.UseSingleGenre,
-		req.EmbedGenre,
-	)
-
+	filename, err := downloadTrackFile(req, trackID)
 	if err != nil {
 		backend.FailDownloadItem(itemID, fmt.Sprintf("Download failed: %v", err))
 		return DownloadResponse{
@@ -457,52 +307,8 @@ func (a *App) DownloadTrack(req DownloadRequest) (DownloadResponse, error) {
 		message = "File already exists"
 		backend.SkipDownloadItem(itemID, filename)
 	} else {
-
-		if fileInfo, statErr := os.Stat(filename); statErr == nil {
-			finalSize := float64(fileInfo.Size()) / (1024 * 1024)
-			backend.CompleteDownloadItem(itemID, filename, finalSize)
-		} else {
-
-			backend.CompleteDownloadItem(itemID, filename, 0)
-		}
-
-		go func(fPath, track, artist, album, sID, cover string) {
-			quality := "Unknown"
-			durationStr := "--:--"
-
-			meta, err := backend.GetTrackMetadata(fPath)
-			if err == nil && meta != nil {
-				if meta.BitsPerSample > 0 {
-					quality = fmt.Sprintf("%d-bit/%.1fkHz", meta.BitsPerSample, float64(meta.SampleRate)/1000.0)
-				} else if meta.Bitrate > 0 {
-					quality = fmt.Sprintf("%dkbps/%.1fkHz", meta.Bitrate/1000, float64(meta.SampleRate)/1000.0)
-				} else if meta.SampleRate > 0 {
-					quality = fmt.Sprintf("%.1fkHz", float64(meta.SampleRate)/1000.0)
-				}
-				d := int(meta.Duration)
-				durationStr = fmt.Sprintf("%d:%02d", d/60, d%60)
-			} else if err != nil {
-				fmt.Printf("[History] Failed to get metadata for %s: %v\n", fPath, err)
-			} else {
-
-			}
-
-			item := backend.HistoryItem{
-				SpotifyID:   sID,
-				Title:       track,
-				Artists:     artist,
-				Album:       album,
-				DurationStr: durationStr,
-				CoverURL:    cover,
-				Quality:     quality,
-				Format:      strings.TrimPrefix(strings.ToUpper(filepath.Ext(fPath)), "."),
-				Path:        fPath,
-			}
-			if item.Format == "" {
-				item.Format = strings.ToUpper(strings.TrimPrefix(filepath.Ext(fPath), "."))
-			}
-			backend.AddHistoryItem(item, "SpotiDownloader")
-		}(filename, req.TrackName, req.ArtistName, req.AlbumName, req.SpotifyID, req.CoverURL)
+		completeDownloadTracking(itemID, filename)
+		addHistoryItemAsync(req, filename)
 	}
 
 	return DownloadResponse{
