@@ -3,6 +3,7 @@ import { getSettings } from "@/lib/settings";
 import { fetchSpotifyMetadata } from "@/lib/api";
 import { toastWithSound as toast } from "@/lib/toast-with-sound";
 import { logger } from "@/lib/logger";
+import { logDuplicateTracks } from "@/lib/duplicate-tracks";
 import { extractArtistID } from "@/lib/spotify-url";
 import { AddFetchHistory } from "../../wailsjs/go/main/App";
 import type { SpotifyMetadataResponse } from "@/types/api";
@@ -124,10 +125,13 @@ export function useMetadata() {
             else if ("album_info" in data) {
                 logger.success(`fetched album: ${data.album_info.name}`);
                 logger.debug(`${data.track_list.length} tracks, released: ${data.album_info.release_date}`);
+                logDuplicateTracks(logger, data.track_list, `album ${data.album_info.name}`);
             }
             else if ("playlist_info" in data) {
                 logger.success(`fetched playlist: ${data.track_list.length} tracks`);
                 logger.debug(`by ${data.playlist_info.owner.display_name || data.playlist_info.owner.name}`);
+                const playlistName = data.playlist_info.name || data.playlist_info.owner.display_name || data.playlist_info.owner.name || "playlist";
+                logDuplicateTracks(logger, data.track_list, `playlist ${playlistName}`);
             }
             else if ("artist_info" in data) {
                 logger.success(`fetched artist: ${data.artist_info.name}`);
@@ -226,6 +230,7 @@ export function useMetadata() {
             if ("album_info" in data) {
                 logger.success(`fetched album: ${data.album_info.name}`);
                 logger.debug(`${data.track_list.length} tracks, released: ${data.album_info.release_date}`);
+                logDuplicateTracks(logger, data.track_list, `album ${data.album_info.name}`);
             }
             logger.info(`fetch completed in ${elapsed}s`);
             toast.success("Album metadata fetched successfully");

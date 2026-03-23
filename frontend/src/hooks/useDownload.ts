@@ -6,6 +6,7 @@ import { ensureValidToken } from "@/lib/token-manager";
 import { toastWithSound as toast } from "@/lib/toast-with-sound";
 import { joinPath, sanitizePath, getFirstArtist } from "@/lib/utils";
 import { logger } from "@/lib/logger";
+import { logDuplicateTracks } from "@/lib/duplicate-tracks";
 import type { TrackMetadata } from "@/types/api";
 interface CheckFileExistenceRequest {
     spotify_id: string;
@@ -31,11 +32,6 @@ interface BatchTrackPathInfo {
     relativePath: string;
     trackPosition: number;
     useAlbumTrackNumber: boolean;
-}
-
-interface DuplicateTrackEntry {
-    index: number;
-    track: TrackMetadata;
 }
 
 function splitRelativePath(relativePath: string): string[] {
@@ -64,51 +60,6 @@ function getExistenceRootDir(pathInfo: BatchTrackPathInfo | undefined, settings:
     return pathInfo.targetOutputDir;
 }
 
-function normalizeDuplicateToken(value?: string): string {
-    return (value || "").trim().toLowerCase().replace(/\s+/g, " ");
-}
-
-function buildDuplicateTrackKey(track: TrackMetadata): string {
-    if (track.spotify_id) {
-        return `spotify:${track.spotify_id}`;
-    }
-
-    return [
-        "meta",
-        normalizeDuplicateToken(track.artists),
-        normalizeDuplicateToken(track.name),
-        normalizeDuplicateToken(track.album_name),
-    ].join("|");
-}
-
-function describeDuplicateTrack(entry: DuplicateTrackEntry): string {
-    const track = entry.track;
-    const trackId = track.spotify_id ? ` [${track.spotify_id}]` : "";
-    return `#${entry.index}: ${track.name || "Unknown title"} - ${track.artists || "Unknown artist"}${track.album_name ? ` (${track.album_name})` : ""}${trackId}`;
-}
-
-function logDuplicateTracks(tracks: TrackMetadata[], scopeLabel: string) {
-    const groups = new Map<string, DuplicateTrackEntry[]>();
-
-    tracks.forEach((track, index) => {
-        const key = buildDuplicateTrackKey(track);
-        const entries = groups.get(key) || [];
-        entries.push({ index: index + 1, track });
-        groups.set(key, entries);
-    });
-
-    const duplicateGroups = Array.from(groups.values()).filter((entries) => entries.length > 1);
-    if (duplicateGroups.length === 0) {
-        return;
-    }
-
-    const duplicateTrackCount = duplicateGroups.reduce((sum, entries) => sum + entries.length, 0);
-    logger.warning(`found ${duplicateGroups.length} duplicate track group(s) in ${scopeLabel} covering ${duplicateTrackCount} entries`);
-
-    duplicateGroups.forEach((entries, groupIndex) => {
-        logger.warning(`duplicate group ${groupIndex + 1} in ${scopeLabel}: ${entries.map(describeDuplicateTrack).join(" | ")}`);
-    });
-}
 function normalizeReleaseDate(releaseDate?: string): string {
     if (!releaseDate) {
         return "";
@@ -405,7 +356,7 @@ export function useDownload() {
         const selectedTrackObjects = await enrichTracksReleaseDates(selectedTracks
             .map((id) => allTracks.find((t) => t.spotify_id === id))
             .filter((t): t is TrackMetadata => t !== undefined), settings);
-        logDuplicateTracks(selectedTrackObjects, playlistName ? `selection for ${playlistName}` : "selected tracks");
+        logDuplicateTracks(logger, selectedTrackObjects, playlistName ? `selection for ${playlistName}` : "selected tracks");
         const selectedTrackPathInfo = selectedTrackObjects.map((track, index) => ({
             track,
             pathInfo: buildBatchTrackPathInfo(track, settings, playlistName, isAlbum, index + 1),
@@ -637,7 +588,7 @@ export function useDownload() {
         setBulkDownloadType("all");
         setDownloadProgress(0);
         const enrichedTracksWithId = await enrichTracksReleaseDates(tracksWithId, settings);
-        logDuplicateTracks(enrichedTracksWithId, playlistName ? `${isAlbum ? "album" : "playlist"} ${playlistName}` : "batch download");
+        logDuplicateTracks(logger, enrichedTracksWithId, playlistName ? `${isAlbum ? "album" : "playlist"} ${playlistName}` : "batch download");
         const trackPathInfo = enrichedTracksWithId.map((track, index) => ({
             track,
             pathInfo: buildBatchTrackPathInfo(track, settings, playlistName, isAlbum, index + 1),
