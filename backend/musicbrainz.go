@@ -190,33 +190,24 @@ func queryMusicBrainzRecordings(client *http.Client, query string) (*MusicBrainz
 	req.Header.Set("User-Agent", fmt.Sprintf("SpotiDownloader/%s ( support@exyezed.cc )", AppVersion))
 
 	var resp *http.Response
-	var lastErr error
-	for i := 0; i < 3; i++ {
-		resp, lastErr = client.Do(req)
-		if lastErr == nil && resp.StatusCode == http.StatusOK {
-			break
+	err = RetryWithBackoff(3, 500*time.Millisecond, 2*time.Second, func(int) error {
+		var reqErr error
+		resp, reqErr = client.Do(req)
+		if reqErr != nil {
+			return reqErr
 		}
-
-		if resp != nil {
+		if resp.StatusCode != http.StatusOK {
+			statusCode := resp.StatusCode
 			resp.Body.Close()
+			resp = nil
+			return fmt.Errorf("MusicBrainz API returned status: %d", statusCode)
 		}
-
-		if i < 2 {
-			time.Sleep(2 * time.Second)
-		}
-	}
-
-	if lastErr != nil {
-		return nil, lastErr
-	}
-	if resp == nil {
-		return nil, fmt.Errorf("empty response from MusicBrainz")
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("MusicBrainz API returned status: %d", resp.StatusCode)
-	}
 
 	var mbResp MusicBrainzRecordingResponse
 	if err := json.NewDecoder(resp.Body).Decode(&mbResp); err != nil {

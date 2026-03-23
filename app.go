@@ -20,6 +20,8 @@ type App struct {
 	ctx context.Context
 }
 
+const inlineLyricsWaitTimeout = 3 * time.Second
+
 func NewApp() *App {
 	return &App{}
 }
@@ -47,6 +49,58 @@ func (a *App) startup(ctx context.Context) {
 
 func (a *App) shutdown(ctx context.Context) {
 	backend.CloseHistoryDB()
+}
+
+func (a *App) embedLyrics(filename, lyrics string) {
+	if strings.TrimSpace(lyrics) == "" {
+		fmt.Println("No lyrics found to embed.")
+		return
+	}
+
+	fmt.Printf("\n--- Full LRC Content ---\n")
+	fmt.Println(lyrics)
+	fmt.Printf("--- End LRC Content ---\n\n")
+
+	fmt.Printf("Embedding into: %s\n", filename)
+	if err := backend.EmbedLyricsOnly(filename, lyrics); err != nil {
+		fmt.Printf("Failed to embed lyrics: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Lyrics embedded successfully!\n")
+	if err := backend.FinalizeTaggedAudioFile(filename); err != nil {
+		fmt.Printf("Failed to finalize tagged MP3 file: %v\n", err)
+	}
+}
+
+func (a *App) finishLyricsEmbeddingAsync(filename string, lyricsChan <-chan string) {
+	lyrics, ok := <-lyricsChan
+	if !ok || strings.TrimSpace(lyrics) == "" {
+		fmt.Printf("Lyrics were not found for %s.\n", filepath.Base(filename))
+		return
+	}
+
+	fmt.Printf("Lyrics fetch completed in background for %s.\n", filepath.Base(filename))
+	a.embedLyrics(filename, lyrics)
+}
+
+func (a *App) embedLyricsIfReady(filename string, lyricsChan <-chan string) {
+	timer := time.NewTimer(inlineLyricsWaitTimeout)
+	defer timer.Stop()
+
+	fmt.Printf("\nWaiting up to %v for lyrics fetch...\n", inlineLyricsWaitTimeout)
+
+	select {
+	case lyrics, ok := <-lyricsChan:
+		if !ok {
+			fmt.Println("No lyrics found to embed.")
+			return
+		}
+		a.embedLyrics(filename, lyrics)
+	case <-timer.C:
+		fmt.Printf("Lyrics fetch is still running for %s; finishing download now and embedding later if lyrics arrive.\n", filepath.Base(filename))
+		go a.finishLyricsEmbeddingAsync(filename, lyricsChan)
+	}
 }
 
 type SpotifyMetadataRequest struct {
@@ -324,6 +378,7 @@ func (a *App) DownloadTrack(req DownloadRequest) (DownloadResponse, error) {
 	lyricsChan := make(chan string, 1)
 	if req.EmbedLyrics && trackID != "" {
 		go func() {
+			defer close(lyricsChan)
 			fmt.Println("Fetching lyrics in background...")
 			client := backend.NewLyricsClient()
 			resp, _, err := client.FetchLyricsAllSources(trackID, req.TrackName, req.ArtistName, req.Duration)
@@ -389,27 +444,8 @@ func (a *App) DownloadTrack(req DownloadRequest) (DownloadResponse, error) {
 	}
 
 	if !alreadyExists && trackID != "" && req.EmbedLyrics && (strings.HasSuffix(filename, ".flac") || strings.HasSuffix(filename, ".mp3") || strings.HasSuffix(filename, ".m4a")) {
-		fmt.Printf("\nWaiting for lyrics fetch to complete...\n")
-		lyrics := <-lyricsChan
-		if lyrics != "" {
-			fmt.Printf("\n--- Full LRC Content ---\n")
-			fmt.Println(lyrics)
-			fmt.Printf("--- End LRC Content ---\n\n")
-
-			fmt.Printf("Embedding into: %s\n", filename)
-			if err := backend.EmbedLyricsOnly(filename, lyrics); err != nil {
-				fmt.Printf("Failed to embed lyrics: %v\n", err)
-			} else {
-				fmt.Printf("Lyrics embedded successfully!\n")
-			}
-			if err := backend.FinalizeTaggedAudioFile(filename); err != nil {
-				fmt.Printf("Failed to finalize tagged MP3 file: %v\n", err)
-			}
-		} else {
-			fmt.Println("No lyrics found to embed.")
-		}
+		a.embedLyricsIfReady(filename, lyricsChan)
 	} else {
-
 		select {
 		case <-lyricsChan:
 		default:

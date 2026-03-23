@@ -50,12 +50,8 @@ func GetMetadataWithFFprobe(filePath string) (*AnalysisResult, error) {
 		return nil, err
 	}
 
-	for i := 0; i < 5; i++ {
-		if f, err := os.Open(filePath); err == nil {
-			f.Close()
-			break
-		}
-		time.Sleep(200 * time.Millisecond)
+	if err := WaitForReadableFile(filePath, 5, 200*time.Millisecond); err != nil {
+		return nil, fmt.Errorf("file is not ready for ffprobe: %w", err)
 	}
 
 	infoMap := make(map[string]string)
