@@ -1,15 +1,19 @@
 package backend
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,6 +25,23 @@ type SpotiDownloader struct {
 	sessionToken string
 	httpClient   *http.Client
 }
+
+type sessionTokenError struct {
+	statusCode int
+	body       string
+}
+
+func (e *sessionTokenError) Error() string {
+	if e.body == "" {
+		return fmt.Sprintf("API returned status %d", e.statusCode)
+	}
+	return fmt.Sprintf("API returned status %d: %s", e.statusCode, e.body)
+}
+
+var (
+	sessionTokenMu       sync.RWMutex
+	rememberedSessionTok string
+)
 
 type FlacAvailableRequest struct {
 	ID string `json:"id"`
@@ -41,13 +62,281 @@ type DownloadResponse struct {
 }
 
 func NewSpotiDownloader(sessionToken string) *SpotiDownloader {
+	preferredToken := getPreferredSessionToken(sessionToken)
+	if preferredToken != "" {
+		RememberSessionToken(preferredToken)
+	}
+
 	return &SpotiDownloader{
-		sessionToken: sessionToken,
+		sessionToken: preferredToken,
 		httpClient:   newHTTPClient(60 * time.Second),
 	}
 }
 
+func RememberSessionToken(token string) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return
+	}
+
+	sessionTokenMu.Lock()
+	rememberedSessionTok = token
+	sessionTokenMu.Unlock()
+}
+
+func getPreferredSessionToken(token string) string {
+	sessionTokenMu.RLock()
+	cachedToken := strings.TrimSpace(rememberedSessionTok)
+	sessionTokenMu.RUnlock()
+
+	if cachedToken != "" {
+		return cachedToken
+	}
+
+	token = strings.TrimSpace(token)
+	if token != "" {
+		RememberSessionToken(token)
+	}
+	return token
+}
+
+func (s *SpotiDownloader) setSessionToken(token string) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return
+	}
+
+	s.sessionToken = token
+	RememberSessionToken(token)
+}
+
+func formatStatusBody(body []byte) string {
+	bodyStr := strings.TrimSpace(string(body))
+	if len(bodyStr) > 200 {
+		bodyStr = bodyStr[:200] + "..."
+	}
+	return bodyStr
+}
+
+func isSessionTokenStatus(statusCode int) bool {
+	return statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden
+}
+
+func statusError(statusCode int, body []byte) error {
+	bodyStr := formatStatusBody(body)
+	if isSessionTokenStatus(statusCode) {
+		return &sessionTokenError{statusCode: statusCode, body: bodyStr}
+	}
+	if bodyStr == "" {
+		return fmt.Errorf("API returned status %d", statusCode)
+	}
+	return fmt.Errorf("API returned status %d: %s", statusCode, bodyStr)
+}
+
+func normalizeAudioExtension(ext string) string {
+	ext = strings.ToLower(strings.TrimSpace(ext))
+	switch ext {
+	case ".mp3", "mp3":
+		return ".mp3"
+	case ".flac", "flac":
+		return ".flac"
+	case ".m4a", "m4a", ".mp4", "mp4", ".aac", "aac":
+		return ".m4a"
+	default:
+		return ""
+	}
+}
+
+func PossibleAudioExtensions(audioFormat string) []string {
+	var candidates []string
+	switch strings.ToLower(strings.TrimSpace(audioFormat)) {
+	case "flac":
+		candidates = []string{".flac", ".m4a", ".mp3"}
+	case "m4a", "aac", "mp4":
+		candidates = []string{".m4a", ".mp3", ".flac"}
+	default:
+		candidates = []string{".mp3", ".m4a", ".flac"}
+	}
+
+	seen := make(map[string]struct{}, len(candidates))
+	var result []string
+	for _, ext := range candidates {
+		normalized := normalizeAudioExtension(ext)
+		if normalized == "" {
+			continue
+		}
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		result = append(result, normalized)
+	}
+	return result
+}
+
+func preferredAudioExtension(audioFormat string) string {
+	switch strings.ToLower(strings.TrimSpace(audioFormat)) {
+	case "flac":
+		return ".flac"
+	case "m4a", "aac", "mp4":
+		return ".m4a"
+	default:
+		return ".mp3"
+	}
+}
+
+func detectAudioExtension(contentType string, sniff []byte, fallbackExt string) string {
+	normalizedFallback := normalizeAudioExtension(fallbackExt)
+	contentType = strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
+
+	switch {
+	case strings.Contains(contentType, "flac"):
+		return ".flac"
+	case strings.Contains(contentType, "mp4"), strings.Contains(contentType, "m4a"), strings.Contains(contentType, "aac"), strings.Contains(contentType, "quicktime"):
+		return ".m4a"
+	case strings.Contains(contentType, "mpeg"), strings.Contains(contentType, "mp3"):
+		return ".mp3"
+	}
+
+	if len(sniff) >= 4 && string(sniff[:4]) == "fLaC" {
+		return ".flac"
+	}
+	if len(sniff) >= 12 && string(sniff[4:8]) == "ftyp" {
+		return ".m4a"
+	}
+	if len(sniff) >= 3 && string(sniff[:3]) == "ID3" {
+		return ".mp3"
+	}
+
+	if normalizedFallback != "" {
+		return normalizedFallback
+	}
+	return ".mp3"
+}
+
+func convertDownloadedAudio(inputPath, outputBasePath, audioFormat string) (string, error) {
+	desiredExt := preferredAudioExtension(audioFormat)
+	currentExt := normalizeAudioExtension(filepath.Ext(inputPath))
+	if desiredExt == "" || currentExt == "" || desiredExt == currentExt {
+		return inputPath, nil
+	}
+
+	ffmpegInstalled, err := IsFFmpegInstalled()
+	if err != nil || !ffmpegInstalled {
+		if err != nil {
+			return "", fmt.Errorf("downloaded format mismatch (%s -> %s), and ffmpeg is unavailable: %w", currentExt, desiredExt, err)
+		}
+		return "", fmt.Errorf("downloaded format mismatch (%s -> %s), and ffmpeg is not installed", currentExt, desiredExt)
+	}
+
+	ffmpegPath, err := GetFFmpegPath()
+	if err != nil {
+		return "", fmt.Errorf("failed to get ffmpeg path for conversion: %w", err)
+	}
+
+	outputPath := outputBasePath + desiredExt
+	tempOutputPath := outputBasePath + ".convert" + desiredExt
+	_ = os.Remove(tempOutputPath)
+
+	args := []string{
+		"-i", inputPath,
+		"-vn",
+		"-map", "0:a:0",
+		"-y",
+	}
+
+	switch desiredExt {
+	case ".mp3":
+		args = append(args,
+			"-codec:a", "libmp3lame",
+			"-b:a", "320k",
+			"-id3v2_version", "3",
+		)
+	case ".flac":
+		args = append(args,
+			"-codec:a", "flac",
+		)
+	case ".m4a":
+		args = append(args,
+			"-codec:a", "aac",
+			"-b:a", "256k",
+			"-movflags", "+faststart",
+			"-f", "ipod",
+		)
+	default:
+		return "", fmt.Errorf("unsupported requested conversion target: %s", desiredExt)
+	}
+
+	args = append(args, tempOutputPath)
+
+	fmt.Printf("Converting downloaded audio from %s to %s...\n", currentExt, desiredExt)
+
+	cmd := exec.Command(ffmpegPath, args...)
+	setHideWindow(cmd)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		_ = os.Remove(tempOutputPath)
+		return "", fmt.Errorf("ffmpeg conversion failed: %s - %w", strings.TrimSpace(string(output)), err)
+	}
+
+	if err := os.Remove(inputPath); err != nil {
+		_ = os.Remove(tempOutputPath)
+		return "", fmt.Errorf("failed to remove source file after conversion: %w", err)
+	}
+
+	if err := os.Rename(tempOutputPath, outputPath); err != nil {
+		_ = os.Remove(tempOutputPath)
+		return "", fmt.Errorf("failed to finalize converted file: %w", err)
+	}
+
+	return outputPath, nil
+}
+
+func isSessionTokenError(err error) bool {
+	var tokenErr *sessionTokenError
+	return errors.As(err, &tokenErr)
+}
+
+func (s *SpotiDownloader) refreshSessionToken() error {
+	fmt.Println("Session token expired, fetching a fresh token...")
+
+	token, err := FetchSessionTokenWithParams(5, 1)
+	if err != nil {
+		return fmt.Errorf("failed to refresh session token: %w", err)
+	}
+
+	s.setSessionToken(token)
+	return nil
+}
+
+func withTokenRetry[T any](s *SpotiDownloader, fn func() (T, error)) (T, error) {
+	result, err := fn()
+	if !isSessionTokenError(err) {
+		return result, err
+	}
+
+	if refreshErr := s.refreshSessionToken(); refreshErr != nil {
+		var zero T
+		return zero, refreshErr
+	}
+
+	return fn()
+}
+
+func withTokenRetryVoid(s *SpotiDownloader, fn func() error) error {
+	_, err := withTokenRetry(s, func() (struct{}, error) {
+		return struct{}{}, fn()
+	})
+	return err
+}
+
 func (s *SpotiDownloader) IsFlacAvailable(trackID string) (bool, error) {
+	return withTokenRetry(s, func() (bool, error) {
+		return s.isFlacAvailable(trackID)
+	})
+}
+
+func (s *SpotiDownloader) isFlacAvailable(trackID string) (bool, error) {
 	reqBody := FlacAvailableRequest{ID: trackID}
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
@@ -72,7 +361,7 @@ func (s *SpotiDownloader) IsFlacAvailable(trackID string) (bool, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return false, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
+		return false, statusError(resp.StatusCode, body)
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -98,6 +387,12 @@ func (s *SpotiDownloader) IsFlacAvailable(trackID string) (bool, error) {
 }
 
 func (s *SpotiDownloader) GetDownloadLink(trackID string) (*DownloadResponse, error) {
+	return withTokenRetry(s, func() (*DownloadResponse, error) {
+		return s.getDownloadLink(trackID)
+	})
+}
+
+func (s *SpotiDownloader) getDownloadLink(trackID string) (*DownloadResponse, error) {
 	reqBody := DownloadRequest{ID: trackID}
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
@@ -122,7 +417,7 @@ func (s *SpotiDownloader) GetDownloadLink(trackID string) (*DownloadResponse, er
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
+		return nil, statusError(resp.StatusCode, body)
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -151,10 +446,16 @@ func (s *SpotiDownloader) GetDownloadLink(trackID string) (*DownloadResponse, er
 	return &result, nil
 }
 
-func (s *SpotiDownloader) DownloadFile(downloadURL, outputPath string) error {
+func (s *SpotiDownloader) DownloadFile(downloadURL, outputBasePath, fallbackExt string) (string, error) {
+	return withTokenRetry(s, func() (string, error) {
+		return s.downloadFile(downloadURL, outputBasePath, fallbackExt)
+	})
+}
+
+func (s *SpotiDownloader) downloadFile(downloadURL, outputBasePath, fallbackExt string) (_ string, err error) {
 	req, err := http.NewRequest("GET", downloadURL, nil)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	req.Header.Set("Authorization", "Bearer "+s.sessionToken)
@@ -163,35 +464,53 @@ func (s *SpotiDownloader) DownloadFile(downloadURL, outputPath string) error {
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failed to download file: status %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		if isSessionTokenStatus(resp.StatusCode) {
+			return "", statusError(resp.StatusCode, body)
+		}
+		return "", fmt.Errorf("failed to download file: %w", statusError(resp.StatusCode, body))
 	}
+
+	reader := bufio.NewReader(resp.Body)
+	sniff, _ := reader.Peek(32)
+	actualExt := detectAudioExtension(resp.Header.Get("Content-Type"), sniff, fallbackExt)
+	outputPath := outputBasePath + actualExt
 
 	dir := filepath.Dir(outputPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
+		return "", err
 	}
 
 	out, err := os.Create(outputPath)
 	if err != nil {
-		return err
+		return "", err
 	}
-	defer out.Close()
+	defer func() {
+		_ = out.Close()
+		if err != nil {
+			_ = os.Remove(outputPath)
+		}
+	}()
 
 	progressWriter := NewProgressWriter(out)
 
-	_, err = io.Copy(progressWriter, resp.Body)
+	_, err = io.Copy(progressWriter, reader)
 
 	if err == nil {
 		mbDownloaded := float64(progressWriter.GetTotal()) / (1024 * 1024)
 		fmt.Printf("\rDownloaded: %.2f MB - Complete\n", mbDownloaded)
 	}
 
-	return err
+	if normalizedFallback := normalizeAudioExtension(fallbackExt); normalizedFallback != "" && normalizedFallback != actualExt {
+		fmt.Printf("Detected downloaded audio container %s, saving with that extension instead of %s\n", actualExt, normalizedFallback)
+	}
+
+	return outputPath, err
 }
 
 func (s *SpotiDownloader) DownloadTrack(
@@ -224,43 +543,6 @@ func (s *SpotiDownloader) DownloadTrack(
 
 	outputDir = NormalizePath(outputDir)
 
-	downloadResp, err := s.GetDownloadLink(trackID)
-	if err != nil {
-		return "", fmt.Errorf("failed to get download link: %v", err)
-	}
-
-	var downloadURL string
-	var fileExt string
-
-	if audioFormat == "flac" && downloadResp.LinkFlac != "" {
-		downloadURL = downloadResp.LinkFlac
-		fileExt = ".flac"
-	} else {
-		downloadURL = downloadResp.Link
-		fileExt = ".mp3"
-	}
-
-	if downloadURL == "" {
-		return "", fmt.Errorf("no download link available")
-	}
-
-	filenameArtist := artistName
-	filenameAlbumArtist := albumArtist
-	if useFirstArtistOnly {
-		filenameArtist = GetFirstArtist(artistName)
-		filenameAlbumArtist = GetFirstArtist(albumArtist)
-	}
-
-	filename := BuildFilename(trackName, filenameArtist, albumName, filenameAlbumArtist, releaseDate, discNumber, filenameFormat, includeTrackNumber, position, useAlbumTrackNumber, playlistName, playlistOwner)
-	filename = SanitizeFilename(filename) + fileExt
-
-	outputPath := filepath.Join(outputDir, filename)
-
-	if fileInfo, err := os.Stat(outputPath); err == nil && fileInfo.Size() > 0 {
-		fmt.Printf("File already exists: %s (%.2f MB)\n", outputPath, float64(fileInfo.Size())/(1024*1024))
-		return "EXISTS:" + outputPath, nil
-	}
-
 	type mbResult struct {
 		ISRC     string
 		Metadata Metadata
@@ -292,15 +574,85 @@ func (s *SpotiDownloader) DownloadTrack(
 		metaChan <- mbResult{}
 	}
 
-	if err := s.DownloadFile(downloadURL, outputPath); err != nil {
-		return "", fmt.Errorf("failed to download file: %v", err)
+	filenameArtist := artistName
+	filenameAlbumArtist := albumArtist
+	if useFirstArtistOnly {
+		filenameArtist = GetFirstArtist(artistName)
+		filenameAlbumArtist = GetFirstArtist(albumArtist)
+	}
+
+	resolveDownloadTarget := func() (string, string, error) {
+		downloadResp, err := s.getDownloadLink(trackID)
+		if err != nil {
+			return "", "", err
+		}
+
+		if audioFormat == "flac" && downloadResp.LinkFlac != "" {
+			return downloadResp.LinkFlac, ".flac", nil
+		}
+
+		if downloadResp.Link == "" {
+			return "", "", fmt.Errorf("no download link available")
+		}
+		return downloadResp.Link, ".mp3", nil
+	}
+
+	var outputPath string
+	var downloadCompleted bool
+	for attempt := 0; attempt < 2; attempt++ {
+		downloadURL, fileExt, err := resolveDownloadTarget()
+		if err != nil {
+			if attempt == 0 && isSessionTokenError(err) {
+				if refreshErr := s.refreshSessionToken(); refreshErr != nil {
+					return "", fmt.Errorf("failed to get download link: %v", refreshErr)
+				}
+				continue
+			}
+			return "", fmt.Errorf("failed to get download link: %v", err)
+		}
+
+		filenameBase := BuildFilename(trackName, filenameArtist, albumName, filenameAlbumArtist, releaseDate, discNumber, filenameFormat, includeTrackNumber, position, useAlbumTrackNumber, playlistName, playlistOwner)
+		filenameBase = SanitizeFilename(filenameBase)
+		outputBasePath := filepath.Join(outputDir, filenameBase)
+
+		for _, ext := range PossibleAudioExtensions(audioFormat) {
+			candidatePath := outputBasePath + ext
+			if fileInfo, statErr := os.Stat(candidatePath); statErr == nil && fileInfo.Size() > 0 {
+				fmt.Printf("File already exists: %s (%.2f MB)\n", candidatePath, float64(fileInfo.Size())/(1024*1024))
+				return "EXISTS:" + candidatePath, nil
+			}
+		}
+
+		outputPath, err = s.downloadFile(downloadURL, outputBasePath, fileExt)
+		if err != nil {
+			if attempt == 0 && isSessionTokenError(err) {
+				if refreshErr := s.refreshSessionToken(); refreshErr != nil {
+					return "", fmt.Errorf("failed to download file: %v", refreshErr)
+				}
+				continue
+			}
+			return "", fmt.Errorf("failed to download file: %v", err)
+		}
+
+		outputPath, err = convertDownloadedAudio(outputPath, outputBasePath, audioFormat)
+		if err != nil {
+			return "", fmt.Errorf("failed to convert downloaded file: %v", err)
+		}
+
+		downloadCompleted = true
+		break
+	}
+
+	if !downloadCompleted {
+		return "", fmt.Errorf("failed to download file: retry limit reached")
 	}
 
 	var coverPath string
 	if coverURL != "" {
-		coverPath, err = s.downloadCoverImage(coverURL, outputDir, embedMaxQualityCover)
-		if err != nil {
-			fmt.Printf("Warning: Failed to download cover image: %v\n", err)
+		var coverErr error
+		coverPath, coverErr = s.downloadCoverImage(coverURL, outputDir, embedMaxQualityCover)
+		if coverErr != nil {
+			fmt.Printf("Warning: Failed to download cover image: %v\n", coverErr)
 			coverPath = ""
 		}
 	}

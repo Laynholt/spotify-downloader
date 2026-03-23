@@ -43,6 +43,8 @@ func EmbedMetadata(filePath string, metadata Metadata, coverPath string) error {
 		return embedFlacMetadata(filePath, metadata, coverPath)
 	case ".mp3":
 		return embedMp3Metadata(filePath, metadata, coverPath)
+	case ".m4a":
+		return embedMetadataToM4A(filePath, metadata, coverPath)
 	default:
 		return fmt.Errorf("unsupported file format: %s", ext)
 	}
