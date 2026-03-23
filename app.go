@@ -654,8 +654,9 @@ func (a *App) ExportFailedDownloads() (string, error) {
 }
 
 func (a *App) Quit() {
-
-	panic("quit")
+	if a.ctx != nil {
+		runtime.Quit(a.ctx)
+	}
 }
 
 func (a *App) GetDownloadHistory() ([]backend.HistoryItem, error) {
@@ -1039,7 +1040,7 @@ func (a *App) RenameFileTo(oldPath, newName string) error {
 	dir := filepath.Dir(oldPath)
 	ext := filepath.Ext(oldPath)
 	newPath := filepath.Join(dir, newName+ext)
-	return os.Rename(oldPath, newPath)
+	return backend.MoveFileWithFallback(oldPath, newPath)
 }
 
 func (a *App) ReadImageAsBase64(filePath string) (string, error) {

@@ -449,7 +449,7 @@ func RenameFiles(files []string, format string) []RenameResult {
 			}
 		}
 
-		if err := os.Rename(filePath, newPath); err != nil {
+		if err := MoveFileWithFallback(filePath, newPath); err != nil {
 			result.Error = err.Error()
 			result.Success = false
 			results = append(results, result)

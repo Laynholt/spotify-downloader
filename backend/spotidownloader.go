@@ -455,7 +455,7 @@ func convertDownloadedAudio(inputPath, outputBasePath, audioFormat string) (stri
 		return "", fmt.Errorf("failed to remove source file after conversion: %w", err)
 	}
 
-	if err := os.Rename(tempOutputPath, outputPath); err != nil {
+	if err := MoveFileWithFallback(tempOutputPath, outputPath); err != nil {
 		_ = os.Remove(tempOutputPath)
 		return "", fmt.Errorf("failed to finalize converted file: %w", err)
 	}
