@@ -402,6 +402,9 @@ func (a *App) DownloadTrack(req DownloadRequest) (DownloadResponse, error) {
 			} else {
 				fmt.Printf("Lyrics embedded successfully!\n")
 			}
+			if err := backend.FinalizeTaggedAudioFile(filename); err != nil {
+				fmt.Printf("Failed to finalize tagged MP3 file: %v\n", err)
+			}
 		} else {
 			fmt.Println("No lyrics found to embed.")
 		}

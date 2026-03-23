@@ -31,6 +31,13 @@ type sessionTokenError struct {
 	body       string
 }
 
+type apiErrorPayload struct {
+	Message string `json:"message"`
+	Error   string `json:"error"`
+	Code    string `json:"code"`
+	Detail  string `json:"detail"`
+}
+
 func (e *sessionTokenError) Error() string {
 	if e.body == "" {
 		return fmt.Sprintf("API returned status %d", e.statusCode)
@@ -122,9 +129,63 @@ func isSessionTokenStatus(statusCode int) bool {
 	return statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden
 }
 
+func bodySignalsSessionTokenIssue(body []byte) bool {
+	body = bytes.TrimSpace(body)
+	if len(body) == 0 {
+		return false
+	}
+
+	candidates := []string{string(body)}
+
+	var payload apiErrorPayload
+	if err := json.Unmarshal(body, &payload); err == nil {
+		candidates = append(candidates, payload.Message, payload.Error, payload.Code, payload.Detail)
+	}
+
+	for _, candidate := range candidates {
+		value := strings.ToLower(strings.TrimSpace(candidate))
+		if value == "" {
+			continue
+		}
+
+		switch {
+		case value == "err_request_invalid":
+			return true
+		case strings.Contains(value, "jwt expired"):
+			return true
+		case strings.Contains(value, "token expired"):
+			return true
+		case strings.Contains(value, "expired token"):
+			return true
+		case strings.Contains(value, "invalid token"):
+			return true
+		case strings.Contains(value, "bearer token"):
+			return true
+		case strings.Contains(value, "authorization"):
+			return true
+		case strings.Contains(value, "unauthorized"):
+			return true
+		}
+	}
+
+	return false
+}
+
+func isSessionTokenResponse(statusCode int, body []byte) bool {
+	if isSessionTokenStatus(statusCode) {
+		return true
+	}
+
+	if statusCode == http.StatusBadRequest && bodySignalsSessionTokenIssue(body) {
+		return true
+	}
+
+	return false
+}
+
 func statusError(statusCode int, body []byte) error {
 	bodyStr := formatStatusBody(body)
-	if isSessionTokenStatus(statusCode) {
+	if isSessionTokenResponse(statusCode, body) {
 		return &sessionTokenError{statusCode: statusCode, body: bodyStr}
 	}
 	if bodyStr == "" {
@@ -470,10 +531,11 @@ func (s *SpotiDownloader) downloadFile(downloadURL, outputBasePath, fallbackExt 
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		if isSessionTokenStatus(resp.StatusCode) {
-			return "", statusError(resp.StatusCode, body)
+		err := statusError(resp.StatusCode, body)
+		if isSessionTokenError(err) {
+			return "", err
 		}
-		return "", fmt.Errorf("failed to download file: %w", statusError(resp.StatusCode, body))
+		return "", fmt.Errorf("failed to download file: %w", err)
 	}
 
 	reader := bufio.NewReader(resp.Body)
@@ -710,6 +772,10 @@ func (s *SpotiDownloader) DownloadTrack(
 		fmt.Printf("Warning: Failed to embed metadata: %v\n", err)
 	}
 
+	if finalizeErr := FinalizeTaggedAudioFile(outputPath); finalizeErr != nil {
+		fmt.Printf("Warning: Failed to finalize MP3 tag temp file: %v\n", finalizeErr)
+	}
+
 	if coverPath != "" {
 		os.Remove(coverPath)
 	}
@@ -736,8 +802,9 @@ func (s *SpotiDownloader) downloadCoverImage(coverURL, outputDir string, embedMa
 		return "", fmt.Errorf("failed to download cover: status %d", resp.StatusCode)
 	}
 
-	coverPath := filepath.Join(outputDir, ".temp_cover.jpg")
-	out, err := os.Create(coverPath)
+	_ = outputDir
+
+	out, err := os.CreateTemp("", "spotidownloader-cover-*.jpg")
 	if err != nil {
 		return "", err
 	}
@@ -748,7 +815,7 @@ func (s *SpotiDownloader) downloadCoverImage(coverURL, outputDir string, embedMa
 		return "", err
 	}
 
-	return coverPath, nil
+	return out.Name(), nil
 }
 
 func fetchTrackTaggingMetadata(trackID string) (string, string, bool) {

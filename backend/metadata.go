@@ -3,6 +3,7 @@ package backend
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	pathfilepath "path/filepath"
@@ -48,6 +49,16 @@ func EmbedMetadata(filePath string, metadata Metadata, coverPath string) error {
 	default:
 		return fmt.Errorf("unsupported file format: %s", ext)
 	}
+}
+
+func openMP3TagForWrite(filePath string) (*id3v2.Tag, error) {
+	tag, err := id3v2.Open(filePath, id3v2.Options{Parse: true})
+	if err != nil {
+		return nil, fmt.Errorf("failed to open MP3 file: %w", err)
+	}
+
+	tag.SetDefaultEncoding(id3v2.EncodingUTF8)
+	return tag, nil
 }
 
 func embedFlacMetadata(filePath string, metadata Metadata, coverPath string) error {
@@ -139,9 +150,9 @@ func embedFlacMetadata(filePath string, metadata Metadata, coverPath string) err
 }
 
 func embedMp3Metadata(filePath string, metadata Metadata, coverPath string) error {
-	tag, err := id3v2.Open(filePath, id3v2.Options{Parse: true})
+	tag, err := openMP3TagForWrite(filePath)
 	if err != nil {
-		return fmt.Errorf("failed to open MP3 file: %w", err)
+		return err
 	}
 	defer tag.Close()
 
@@ -220,8 +231,17 @@ func embedMp3Metadata(filePath string, metadata Metadata, coverPath string) erro
 		tag.AddTextFrame("TCON", tag.DefaultEncoding(), metadata.Genre)
 	}
 
-	if err := tag.Save(); err != nil {
-		return fmt.Errorf("failed to save MP3 tags: %w", err)
+	if err := saveMP3Tag(tag, filePath); err != nil {
+		if fallbackErr := embedMetadataToMP3WithFFmpeg(filePath, metadata, coverPath); fallbackErr != nil {
+			return fmt.Errorf("failed to save MP3 tags: %w; ffmpeg fallback failed: %v", err, fallbackErr)
+		}
+		return nil
+	}
+
+	if err := verifyEmbeddedMetadata(filePath, metadata); err != nil {
+		if fallbackErr := embedMetadataToMP3WithFFmpeg(filePath, metadata, coverPath); fallbackErr != nil {
+			return fmt.Errorf("mp3 tags verification failed: %w; ffmpeg fallback failed: %v", err, fallbackErr)
+		}
 	}
 
 	return nil
@@ -259,6 +279,232 @@ func embedCoverArt(f *flac.File, coverPath string) error {
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+func replaceFileWithTemp(tempPath, filePath string) error {
+	if !fileExists(tempPath) {
+		return nil
+	}
+
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		if err := os.Rename(tempPath, filePath); err == nil {
+			return nil
+		}
+	}
+
+	src, err := os.Open(tempPath)
+	if err != nil {
+		return err
+	}
+
+	info, err := src.Stat()
+	if err != nil {
+		_ = src.Close()
+		return err
+	}
+
+	dst, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode())
+	if err != nil {
+		return err
+	}
+
+	copyErr := error(nil)
+	if _, err := io.Copy(dst, src); err != nil {
+		copyErr = err
+	}
+	srcCloseErr := src.Close()
+	closeErr := dst.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	if srcCloseErr != nil {
+		return srcCloseErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+
+	if err := os.Chmod(filePath, info.Mode()); err != nil && !os.IsPermission(err) {
+		return err
+	}
+
+	if err := os.Remove(tempPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	return nil
+}
+
+func replaceFileWithTempLegacy(tempPath, filePath string) error {
+	if !fileExists(tempPath) {
+		return nil
+	}
+
+	if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	return replaceFileWithTemp(tempPath, filePath)
+}
+
+func promoteMP3TagTempFile(tempPath, filePath string) error {
+	return replaceFileWithTemp(tempPath, filePath)
+}
+
+func FinalizeTaggedAudioFile(filePath string) error {
+	if strings.ToLower(pathfilepath.Ext(filePath)) != ".mp3" {
+		return nil
+	}
+
+	return promoteMP3TagTempFile(filePath+"-id3v2", filePath)
+}
+
+func verifyEmbeddedMetadata(filePath string, metadata Metadata) error {
+	actual, err := ExtractFullMetadataFromFile(filePath)
+	if err != nil {
+		return err
+	}
+
+	switch {
+	case metadata.Title != "" && strings.TrimSpace(actual.Title) == "":
+		return fmt.Errorf("title tag is empty after write")
+	case metadata.Artist != "" && strings.TrimSpace(actual.Artist) == "":
+		return fmt.Errorf("artist tag is empty after write")
+	case metadata.Album != "" && strings.TrimSpace(actual.Album) == "":
+		return fmt.Errorf("album tag is empty after write")
+	case metadata.AlbumArtist != "" && strings.TrimSpace(actual.AlbumArtist) == "":
+		return fmt.Errorf("album artist tag is empty after write")
+	case metadata.TrackNumber > 0 && actual.TrackNumber == 0:
+		return fmt.Errorf("track number tag is empty after write")
+	}
+
+	return nil
+}
+
+func embedMetadataToMP3WithFFmpeg(filePath string, metadata Metadata, coverPath string) error {
+	ffmpegPath, err := GetFFmpegPath()
+	if err != nil {
+		return fmt.Errorf("ffmpeg not found: %w", err)
+	}
+
+	args := []string{
+		"-i", filePath,
+		"-y",
+	}
+
+	if coverPath != "" && fileExists(coverPath) {
+		args = append(args,
+			"-i", coverPath,
+			"-map", "0:a",
+			"-map", "1:v",
+			"-c:a", "copy",
+			"-c:v", "mjpeg",
+			"-id3v2_version", "3",
+			"-metadata:s:v", "title=Album cover",
+			"-metadata:s:v", "comment=Cover (front)",
+		)
+	} else {
+		args = append(args,
+			"-map", "0:a",
+			"-c:a", "copy",
+			"-id3v2_version", "3",
+		)
+	}
+
+	if metadata.Title != "" {
+		args = append(args, "-metadata", "title="+metadata.Title)
+	}
+	if metadata.Artist != "" {
+		args = append(args, "-metadata", "artist="+metadata.Artist)
+	}
+	if metadata.Album != "" {
+		args = append(args, "-metadata", "album="+metadata.Album)
+	}
+	if metadata.AlbumArtist != "" {
+		args = append(args, "-metadata", "album_artist="+metadata.AlbumArtist)
+	}
+	if metadata.Date != "" {
+		args = append(args, "-metadata", "date="+metadata.Date)
+	}
+	if metadata.TrackNumber > 0 {
+		trackStr := strconv.Itoa(metadata.TrackNumber)
+		if metadata.TotalTracks > 0 {
+			trackStr = fmt.Sprintf("%d/%d", metadata.TrackNumber, metadata.TotalTracks)
+		}
+		args = append(args, "-metadata", "track="+trackStr)
+	}
+	if metadata.DiscNumber > 0 {
+		discStr := strconv.Itoa(metadata.DiscNumber)
+		if metadata.TotalDiscs > 0 {
+			discStr = fmt.Sprintf("%d/%d", metadata.DiscNumber, metadata.TotalDiscs)
+		}
+		args = append(args, "-metadata", "disc="+discStr)
+	}
+	if metadata.Copyright != "" {
+		args = append(args, "-metadata", "copyright="+metadata.Copyright)
+	}
+	if metadata.Publisher != "" {
+		args = append(args, "-metadata", "publisher="+metadata.Publisher)
+	}
+	if metadata.Description != "" {
+		args = append(args, "-metadata", "comment="+metadata.Description)
+	}
+	if metadata.ISRC != "" {
+		args = append(args, "-metadata", "isrc="+metadata.ISRC)
+	}
+	if metadata.Genre != "" {
+		args = append(args, "-metadata", "genre="+metadata.Genre)
+	}
+
+	tmpOutputFile := strings.TrimSuffix(filePath, pathfilepath.Ext(filePath)) + ".tmp" + pathfilepath.Ext(filePath)
+	defer func() {
+		if _, err := os.Stat(tmpOutputFile); err == nil {
+			_ = os.Remove(tmpOutputFile)
+		}
+	}()
+
+	args = append(args, tmpOutputFile)
+
+	cmd := exec.Command(ffmpegPath, args...)
+	setHideWindow(cmd)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ffmpeg failed to embed mp3 metadata: %s - %w", string(output), err)
+	}
+
+	if err := replaceFileWithTemp(tmpOutputFile, filePath); err != nil {
+		return fmt.Errorf("failed to replace original MP3 file: %w", err)
+	}
+
+	return verifyEmbeddedMetadata(filePath, metadata)
+}
+
+func saveMP3Tag(tag *id3v2.Tag, filePath string) error {
+	tempPath := filePath + "-id3v2"
+
+	saveErr := tag.Save()
+	closeErr := tag.Close()
+
+	if saveErr != nil {
+		if removeErr := os.Remove(tempPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			return fmt.Errorf("%w; failed to remove temporary tagged MP3: %v", saveErr, removeErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("%w; failed to close MP3 file after save failure: %v", saveErr, closeErr)
+		}
+		return saveErr
+	}
+
+	if closeErr != nil {
+		return fmt.Errorf("failed to close MP3 file after saving tags: %w", closeErr)
+	}
+
+	if promoteErr := promoteMP3TagTempFile(tempPath, filePath); promoteErr != nil {
+		return fmt.Errorf("failed to finalize temporary tagged MP3: %w", promoteErr)
+	}
+
+	return nil
 }
 
 func EmbedLyricsOnly(filepath string, lyrics string) error {
@@ -336,9 +582,9 @@ func embedLyricsToFlac(filepath string, lyrics string) error {
 }
 
 func embedLyricsToMp3(filepath string, lyrics string) error {
-	tag, err := id3v2.Open(filepath, id3v2.Options{Parse: true})
+	tag, err := openMP3TagForWrite(filepath)
 	if err != nil {
-		return fmt.Errorf("failed to open MP3 file: %w", err)
+		return err
 	}
 	defer tag.Close()
 
@@ -352,7 +598,7 @@ func embedLyricsToMp3(filepath string, lyrics string) error {
 	}
 	tag.AddUnsynchronisedLyricsFrame(usltFrame)
 
-	if err := tag.Save(); err != nil {
+	if err := saveMP3Tag(tag, filepath); err != nil {
 		return fmt.Errorf("failed to save MP3 tags: %w", err)
 	}
 
@@ -394,7 +640,7 @@ func embedLyricsToM4A(filepath string, lyrics string) error {
 		return fmt.Errorf("ffmpeg failed to embed lyrics: %s - %w", string(output), err)
 	}
 
-	if err := os.Rename(tmpOutputFile, filepath); err != nil {
+	if err := replaceFileWithTemp(tmpOutputFile, filepath); err != nil {
 		return fmt.Errorf("failed to replace original file: %w", err)
 	}
 
@@ -827,9 +1073,9 @@ func EmbedMetadataToConvertedFile(filePath string, metadata Metadata, coverPath 
 }
 
 func embedMetadataToMP3(filePath string, metadata Metadata, coverPath string) error {
-	tag, err := id3v2.Open(filePath, id3v2.Options{Parse: true})
+	tag, err := openMP3TagForWrite(filePath)
 	if err != nil {
-		return fmt.Errorf("failed to open MP3 file: %w", err)
+		return err
 	}
 	defer tag.Close()
 
@@ -906,8 +1152,17 @@ func embedMetadataToMP3(filePath string, metadata Metadata, coverPath string) er
 		}
 	}
 
-	if err := tag.Save(); err != nil {
-		return fmt.Errorf("failed to save MP3 tags: %w", err)
+	if err := saveMP3Tag(tag, filePath); err != nil {
+		if fallbackErr := embedMetadataToMP3WithFFmpeg(filePath, metadata, coverPath); fallbackErr != nil {
+			return fmt.Errorf("failed to save MP3 tags: %w; ffmpeg fallback failed: %v", err, fallbackErr)
+		}
+		return nil
+	}
+
+	if err := verifyEmbeddedMetadata(filePath, metadata); err != nil {
+		if fallbackErr := embedMetadataToMP3WithFFmpeg(filePath, metadata, coverPath); fallbackErr != nil {
+			return fmt.Errorf("mp3 tags verification failed: %w; ffmpeg fallback failed: %v", err, fallbackErr)
+		}
 	}
 
 	return nil
@@ -987,7 +1242,7 @@ func embedMetadataToM4A(filePath string, metadata Metadata, coverPath string) er
 		return fmt.Errorf("ffmpeg failed to embed metadata: %s - %w", string(output), err)
 	}
 
-	if err := os.Rename(tmpOutputFile, filePath); err != nil {
+	if err := replaceFileWithTemp(tmpOutputFile, filePath); err != nil {
 		return fmt.Errorf("failed to replace original file: %w", err)
 	}
 
@@ -1013,9 +1268,9 @@ func EmbedCoverArtOnly(filePath string, coverPath string) error {
 }
 
 func embedCoverToMp3(filePath string, coverPath string) error {
-	tag, err := id3v2.Open(filePath, id3v2.Options{Parse: true})
+	tag, err := openMP3TagForWrite(filePath)
 	if err != nil {
-		return fmt.Errorf("failed to open MP3 file: %w", err)
+		return err
 	}
 	defer tag.Close()
 
@@ -1035,7 +1290,7 @@ func embedCoverToMp3(filePath string, coverPath string) error {
 	}
 	tag.AddAttachedPicture(pic)
 
-	if err := tag.Save(); err != nil {
+	if err := saveMP3Tag(tag, filePath); err != nil {
 		return fmt.Errorf("failed to save MP3 tags: %w", err)
 	}
 
