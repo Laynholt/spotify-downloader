@@ -32,6 +32,32 @@ interface BatchTrackPathInfo {
     trackPosition: number;
     useAlbumTrackNumber: boolean;
 }
+
+function splitRelativePath(relativePath: string): string[] {
+    return relativePath.split(/[\\/]+/).filter((part) => part.trim().length > 0);
+}
+
+function getExistenceRootDir(pathInfo: BatchTrackPathInfo | undefined, settings: Settings, playlistName?: string, isAlbum?: boolean): string {
+    if (!pathInfo) {
+        return settings.downloadPath;
+    }
+
+    if (!playlistName || isAlbum) {
+        return settings.downloadPath;
+    }
+
+    if (settings.createPlaylistFolder) {
+        return pathInfo.baseOutputDir;
+    }
+
+    const safePlaylistName = sanitizePath(playlistName.replace(/\//g, " "), settings.operatingSystem);
+    const relativeParts = splitRelativePath(pathInfo.relativePath);
+    if (relativeParts.length > 0 && relativeParts[0] === safePlaylistName) {
+        return joinPath(settings.operatingSystem, pathInfo.baseOutputDir, relativeParts[0]);
+    }
+
+    return pathInfo.targetOutputDir;
+}
 function normalizeReleaseDate(releaseDate?: string): string {
     if (!releaseDate) {
         return "";
@@ -165,10 +191,6 @@ export function useDownload() {
         return msg.includes("unauthorized") || msg.includes("403") || msg.includes("401") || msg.includes("err_unauthorized");
     };
     const downloadWithSpotiDownloader = async (track: TrackMetadata, settings: Settings, playlistName?: string, position?: number, retryCount: number = 0, isAlbum?: boolean, releaseYear?: string) => {
-        const os = settings.operatingSystem;
-        let outputDir = settings.downloadPath;
-        let useAlbumTrackNumber = false;
-        const placeholder = "__SLASH_PLACEHOLDER__";
         let finalReleaseDate = normalizeReleaseDate(track.release_date);
         let finalTrackNumber = track.track_number;
         if (track.spotify_id) {
@@ -189,68 +211,32 @@ export function useDownload() {
             }
         }
         const resolvedReleaseDate = finalReleaseDate || normalizeReleaseDate(track.release_date);
-        const yearValue = releaseYear || getReleaseYear(resolvedReleaseDate);
-        const hasSubfolder = settings.folderTemplate && settings.folderTemplate.trim() !== "";
-        const trackNumberForTemplate = hasSubfolder && finalTrackNumber > 0 ? finalTrackNumber : position || 0;
-        if (hasSubfolder) {
-            useAlbumTrackNumber = true;
-        }
-        const displayArtist = settings.useFirstArtistOnly && track.artists
-            ? getFirstArtist(track.artists)
-            : track.artists;
-        const displayAlbumArtist = settings.useFirstArtistOnly && track.album_artist
-            ? getFirstArtist(track.album_artist)
-            : track.album_artist;
-        const templateData: TemplateData = {
-            artist: displayArtist?.replace(/\//g, placeholder) || undefined,
-            album: track.album_name?.replace(/\//g, placeholder) || undefined,
-            album_artist: displayAlbumArtist?.replace(/\//g, placeholder) ||
-                displayArtist?.replace(/\//g, placeholder) ||
-                undefined,
-            title: track.name?.replace(/\//g, placeholder) || undefined,
-            track: trackNumberForTemplate,
-            disc: track.disc_number,
-            year: yearValue,
-            date: resolvedReleaseDate || undefined,
-            playlist: playlistName?.replace(/\//g, placeholder) || undefined,
-        };
-        const folderTemplate = settings.folderTemplate || "";
-        const useAlbumSubfolder = folderTemplate.includes("{album}") ||
-            folderTemplate.includes("{album_artist}") ||
-            folderTemplate.includes("{playlist}");
-        if (settings.createPlaylistFolder &&
-            playlistName &&
-            (!isAlbum || !useAlbumSubfolder)) {
-            outputDir = joinPath(os, outputDir, sanitizePath(playlistName.replace(/\//g, " "), os));
-        }
-        if (settings.folderTemplate) {
-            const folderPath = parseTemplate(settings.folderTemplate, templateData);
-            if (folderPath) {
-                const parts = folderPath.split("/").filter((p: string) => p.trim());
-                for (const part of parts) {
-                    const sanitizedPart = part.replace(new RegExp(placeholder, "g"), " ");
-                    outputDir = joinPath(os, outputDir, sanitizePath(sanitizedPart, os));
-                }
-            }
-        }
+        const pathInfo = buildBatchTrackPathInfo({
+            ...track,
+            release_date: resolvedReleaseDate,
+            track_number: finalTrackNumber || 0,
+        }, settings, playlistName, isAlbum, position || 0);
+        const outputDir = pathInfo.targetOutputDir;
+        const existenceRootDir = getExistenceRootDir(pathInfo, settings, playlistName, isAlbum);
         if (track.name && track.artists) {
             try {
                 const checkRequest: CheckFileExistenceRequest = {
                     spotify_id: track.spotify_id || "",
                     track_name: track.name,
-                    artist_name: displayArtist || "",
+                    artist_name: pathInfo.displayArtist || "",
                     album_name: track.album_name,
-                    album_artist: displayAlbumArtist,
+                    album_artist: pathInfo.displayAlbumArtist,
                     release_date: resolvedReleaseDate || "",
                     track_number: finalTrackNumber || 0,
                     disc_number: track.disc_number || 0,
-                    position: trackNumberForTemplate,
-                    use_album_track_number: useAlbumTrackNumber,
+                    position: pathInfo.trackPosition,
+                    use_album_track_number: pathInfo.useAlbumTrackNumber,
                     filename_format: settings.filenameTemplate || "",
                     include_track_number: settings.trackNumber || false,
                     audio_format: settings.audioFormat,
+                    relative_path: pathInfo.relativePath,
                 };
-                const existenceResults = await CheckFilesExistence(outputDir, settings.downloadPath, settings.audioFormat, [checkRequest]);
+                const existenceResults = await CheckFilesExistence(pathInfo.baseOutputDir, existenceRootDir, settings.audioFormat, [checkRequest]);
                 if (existenceResults.length > 0 && existenceResults[0].exists) {
                     return {
                         success: true,
@@ -266,7 +252,7 @@ export function useDownload() {
         }
         const sessionToken = await ensureValidToken();
         const { AddToDownloadQueue } = await import("../../wailsjs/go/main/App");
-        const itemID = await AddToDownloadQueue(track.spotify_id || "", track.name || "", displayArtist || "", track.album_name || "");
+        const itemID = await AddToDownloadQueue(track.spotify_id || "", track.name || "", pathInfo.displayArtist || "", track.album_name || "");
         const response = await downloadTrack({
             track_id: track.spotify_id || "",
             session_token: sessionToken,
@@ -287,8 +273,8 @@ export function useDownload() {
             filename_format: settings.filenameTemplate,
             use_first_artist_only: settings.useFirstArtistOnly,
             track_number: settings.trackNumber,
-            position: trackNumberForTemplate,
-            use_album_track_number: useAlbumTrackNumber,
+            position: pathInfo.trackPosition,
+            use_album_track_number: pathInfo.useAlbumTrackNumber,
             spotify_id: track.spotify_id,
             embed_lyrics: settings.embedLyrics,
             embed_max_quality_cover: settings.embedMaxQualityCover,
@@ -373,6 +359,7 @@ export function useDownload() {
             pathInfo: buildBatchTrackPathInfo(track, settings, playlistName, isAlbum, index + 1),
         }));
         const outputDir = selectedTrackPathInfo[0]?.pathInfo.baseOutputDir || settings.downloadPath;
+        const existenceRootDir = getExistenceRootDir(selectedTrackPathInfo[0]?.pathInfo, settings, playlistName, isAlbum);
         logger.info(`checking existing files in parallel...`);
         const existenceChecks = selectedTrackPathInfo.map(({ track, pathInfo }) => {
             return {
@@ -392,7 +379,7 @@ export function useDownload() {
                 relative_path: pathInfo.relativePath,
             };
         });
-        const existenceResults = await CheckFilesExistence(outputDir, settings.downloadPath, settings.audioFormat, existenceChecks);
+        const existenceResults = await CheckFilesExistence(outputDir, existenceRootDir, settings.audioFormat, existenceChecks);
         const existingSpotifyIDs = new Set<string>();
         const existingFilePathsBySpotifyID = new Map<string, string>();
         const finalFilePaths = new Map<string, string>();
@@ -603,6 +590,7 @@ export function useDownload() {
             pathInfo: buildBatchTrackPathInfo(track, settings, playlistName, isAlbum, index + 1),
         }));
         const outputDir = trackPathInfo[0]?.pathInfo.baseOutputDir || settings.downloadPath;
+        const existenceRootDir = getExistenceRootDir(trackPathInfo[0]?.pathInfo, settings, playlistName, isAlbum);
         logger.info(`checking existing files in parallel...`);
         const existenceChecks = trackPathInfo.map(({ track, pathInfo }) => {
             return {
@@ -622,7 +610,7 @@ export function useDownload() {
                 relative_path: pathInfo.relativePath,
             };
         });
-        const existenceResults = await CheckFilesExistence(outputDir, settings.downloadPath, settings.audioFormat, existenceChecks);
+        const existenceResults = await CheckFilesExistence(outputDir, existenceRootDir, settings.audioFormat, existenceChecks);
         const finalFilePaths: string[] = new Array(enrichedTracksWithId.length).fill("");
         const existingSpotifyIDs = new Set<string>();
         const existingFilePaths = new Map<string, string>();
