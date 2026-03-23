@@ -68,6 +68,12 @@ type DownloadResponse struct {
 	LinkFlac string `json:"linkFlac"`
 }
 
+type taggingMetadataResult struct {
+	ISRC        string
+	ReleaseDate string
+	Genre       string
+}
+
 func NewSpotiDownloader(sessionToken string) *SpotiDownloader {
 	preferredToken := getPreferredSessionToken(sessionToken)
 	if preferredToken != "" {
@@ -78,6 +84,110 @@ func NewSpotiDownloader(sessionToken string) *SpotiDownloader {
 		sessionToken: preferredToken,
 		httpClient:   newHTTPClient(60 * time.Second),
 	}
+}
+
+func fetchTaggingMetadataInBackground(trackID, trackName, artistName, albumName, releaseDate string, useSingleGenre, embedGenre bool) <-chan taggingMetadataResult {
+	resultCh := make(chan taggingMetadataResult, 1)
+
+	go func() {
+		defer close(resultCh)
+
+		result := taggingMetadataResult{
+			ReleaseDate: strings.TrimSpace(releaseDate),
+		}
+		if strings.TrimSpace(trackID) == "" {
+			resultCh <- result
+			return
+		}
+
+		startedAt := time.Now()
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		var musicBrainzGenre string
+		var fallbackGenre string
+
+		if result.ReleaseDate == "" {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if fetchedReleaseDate, _, _ := fetchTrackTaggingMetadata(trackID); fetchedReleaseDate != "" {
+					mu.Lock()
+					result.ReleaseDate = strings.TrimSpace(fetchedReleaseDate)
+					mu.Unlock()
+				}
+			}()
+		}
+
+		if embedGenre {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+
+				client := NewSongLinkClient()
+				isrc, err := client.GetISRC(trackID)
+				if err != nil || isrc == "" {
+					return
+				}
+
+				mu.Lock()
+				result.ISRC = isrc
+				mu.Unlock()
+
+				fmt.Println("Fetching MusicBrainz metadata...")
+				fetchedMeta, err := FetchMusicBrainzMetadata(isrc, trackName, artistName, albumName, useSingleGenre, embedGenre)
+				if err != nil {
+					fmt.Printf("Warning: Failed to fetch MusicBrainz metadata: %v\n", err)
+					return
+				}
+
+				mu.Lock()
+				musicBrainzGenre = strings.TrimSpace(fetchedMeta.Genre)
+				mu.Unlock()
+			}()
+
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+
+				if chosicGenres, err := fetchGenresFromChosic(trackID); err == nil && len(chosicGenres) > 0 {
+					genre := strings.TrimSpace(chosicGenres[0])
+					if !useSingleGenre {
+						genre = strings.TrimSpace(strings.Join(chosicGenres, ", "))
+					}
+					if genre != "" {
+						mu.Lock()
+						fallbackGenre = genre
+						mu.Unlock()
+						return
+					}
+				}
+
+				if deezerGenre, err := fetchGenreFromDeezer(trackID); err == nil && deezerGenre != "" {
+					mu.Lock()
+					fallbackGenre = strings.TrimSpace(deezerGenre)
+					mu.Unlock()
+				}
+			}()
+		}
+
+		wg.Wait()
+
+		mu.Lock()
+		if musicBrainzGenre != "" {
+			result.Genre = musicBrainzGenre
+		} else {
+			result.Genre = fallbackGenre
+		}
+		mu.Unlock()
+
+		if elapsed := time.Since(startedAt); elapsed > time.Second {
+			fmt.Printf("Tagging metadata fetched in %.1fs\n", elapsed.Seconds())
+		}
+
+		resultCh <- result
+	}()
+
+	return resultCh
 }
 
 func RememberSessionToken(token string) {
@@ -605,36 +715,7 @@ func (s *SpotiDownloader) DownloadTrack(
 
 	outputDir = NormalizePath(outputDir)
 
-	type mbResult struct {
-		ISRC     string
-		Metadata Metadata
-	}
-
-	metaChan := make(chan mbResult, 1)
-	if embedGenre {
-		go func() {
-			client := NewSongLinkClient()
-			res := mbResult{}
-			if val, err := client.GetISRC(trackID); err == nil {
-				res.ISRC = val
-				if val != "" {
-					fmt.Println("Fetching MusicBrainz metadata...")
-
-					if fetchedMeta, err := FetchMusicBrainzMetadata(val, trackName, artistName, albumName, useSingleGenre, embedGenre); err == nil {
-						res.Metadata = fetchedMeta
-						fmt.Println("✓ MusicBrainz metadata fetched")
-					} else {
-						fmt.Printf("Warning: Failed to fetch MusicBrainz metadata: %v\n", err)
-					}
-				}
-			} else {
-
-			}
-			metaChan <- res
-		}()
-	} else {
-		metaChan <- mbResult{}
-	}
+	metaChan := fetchTaggingMetadataInBackground(trackID, trackName, artistName, albumName, releaseDate, useSingleGenre, embedGenre)
 
 	filenameArtist := artistName
 	filenameAlbumArtist := albumArtist
@@ -720,31 +801,12 @@ func (s *SpotiDownloader) DownloadTrack(
 	}
 
 	result := <-metaChan
-	isrc := result.ISRC
-	mbMeta := result.Metadata
+	isrc := strings.TrimSpace(result.ISRC)
 	resolvedReleaseDate := strings.TrimSpace(releaseDate)
-	resolvedGenre := strings.TrimSpace(mbMeta.Genre)
-
 	if resolvedReleaseDate == "" {
-		spotifyReleaseDate, _, _ := fetchTrackTaggingMetadata(trackID)
-		if resolvedReleaseDate == "" && spotifyReleaseDate != "" {
-			resolvedReleaseDate = spotifyReleaseDate
-		}
+		resolvedReleaseDate = strings.TrimSpace(result.ReleaseDate)
 	}
-	if embedGenre && resolvedGenre == "" {
-		if chosicGenres, err := fetchGenresFromChosic(trackID); err == nil && len(chosicGenres) > 0 {
-			if useSingleGenre {
-				resolvedGenre = strings.TrimSpace(chosicGenres[0])
-			} else {
-				resolvedGenre = strings.Join(chosicGenres, ", ")
-			}
-		}
-	}
-	if embedGenre && resolvedGenre == "" {
-		if deezerGenre, err := fetchGenreFromDeezer(trackID); err == nil && deezerGenre != "" {
-			resolvedGenre = deezerGenre
-		}
-	}
+	resolvedGenre := strings.TrimSpace(result.Genre)
 
 	if isrc != "" {
 		fmt.Printf("Found ISRC: %s\n", isrc)
