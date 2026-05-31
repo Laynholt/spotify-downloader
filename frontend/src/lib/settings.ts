@@ -105,7 +105,7 @@ export const DEFAULT_SETTINGS: Settings = {
     embedLyrics: false,
     embedMaxQualityCover: false,
     operatingSystem: detectOS(),
-    tokenTimeout: 5,
+    tokenTimeout: 15,
     tokenRetry: 1,
     useSpotFetchAPI: false,
     spotFetchAPIUrl: "https://spotify.afkarxyz.fun/api",
@@ -222,6 +222,9 @@ function normalizeSettingsData(source: LegacySettings | null | undefined): Setti
     }
     if (!("embedGenre" in parsed)) {
         parsed.embedGenre = true;
+    }
+    if (!parsed.tokenTimeout || parsed.tokenTimeout < 15) {
+        parsed.tokenTimeout = 15;
     }
     parsed.operatingSystem = detectOS();
     return { ...DEFAULT_SETTINGS, ...parsed };

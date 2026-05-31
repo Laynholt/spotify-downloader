@@ -168,6 +168,7 @@ func startLyricsFetch(req DownloadRequest, trackID string) <-chan string {
 
 func downloadTrackFile(req DownloadRequest, trackID string) (string, error) {
 	downloader := backend.NewSpotiDownloader(req.SessionToken)
+	defer downloader.CloseIdleConnections()
 
 	actualTrackNumber := req.AlbumTrackNumber
 	if actualTrackNumber == 0 {

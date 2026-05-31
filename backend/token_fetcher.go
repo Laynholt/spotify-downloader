@@ -17,12 +17,15 @@ func getSpotiDownloaderDir() (string, error) {
 }
 
 func FetchSessionToken() (string, error) {
-	return FetchSessionTokenWithParams(5, 1)
+	return FetchSessionTokenWithParams(15, 1)
 }
 
 var ErrChromeNotInstalled = fmt.Errorf("chrome_not_installed")
 
 func FetchSessionTokenWithParams(timeout int, retry int) (string, error) {
+	if timeout < 15 {
+		timeout = 15
+	}
 
 	browserInstalled, browserPath, err := IsChromeInstalled()
 	if err != nil {

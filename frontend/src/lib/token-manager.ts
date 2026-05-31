@@ -24,7 +24,7 @@ export async function ensureValidToken(forceRefresh: boolean = false): Promise<s
     isFetchingToken = true;
     lastFetchTime = Date.now();
     try {
-        const timeout = settings.tokenTimeout || 5;
+        const timeout = Math.max(settings.tokenTimeout || 15, 15);
         const retry = settings.tokenRetry || 1;
         const response = await FetchSessionTokenWithParams(timeout, retry);
         await updateSettings({

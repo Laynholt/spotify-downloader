@@ -4,16 +4,16 @@ import { Menubar, MenubarContent, MenubarMenu, MenubarRadioGroup, MenubarRadioIt
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { getSettings, updateSettings } from "@/lib/settings";
 import { useState, useEffect } from "react";
-const TIMEOUT_OPTIONS = [5, 10, 15, 20, 25, 30];
+const TIMEOUT_OPTIONS = [15, 20, 25, 30, 45, 60];
 const RETRY_OPTIONS = [1, 2, 3, 4, 5];
 export function TitleBar() {
-    const [tokenTimeout, setTokenTimeout] = useState(5);
+    const [tokenTimeout, setTokenTimeout] = useState(15);
     const [tokenRetry, setTokenRetry] = useState(1);
     const [useSpotFetchAPI, setUseSpotFetchAPI] = useState(false);
     useEffect(() => {
         const settings = getSettings();
         if (settings) {
-            setTokenTimeout(settings.tokenTimeout || 5);
+            setTokenTimeout(settings.tokenTimeout || 15);
             setTokenRetry(settings.tokenRetry || 1);
             setUseSpotFetchAPI(settings.useSpotFetchAPI || false);
         }

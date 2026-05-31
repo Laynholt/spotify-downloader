@@ -45,7 +45,30 @@ async def close_browser_safely(browser):
         except:
             pass
 
-async def get_session_token_async(max_wait=5, browser_path=None):
+TEST_TRACK_URL = "https://open.spotify.com/track/53iuhJlwXhSER5J2IYYv1W"
+
+async def submit_and_wait_for_token(page, max_wait=15):
+    inp = await page.select('.searchInput')
+    if inp:
+        await inp.send_keys(TEST_TRACK_URL)
+        await asyncio.sleep(1)
+
+    btn = await page.select('button[type="submit"]')
+    if not btn:
+        return None
+
+    await btn.click()
+
+    deadline = time.monotonic() + max(1, max_wait)
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.5)
+        token = await page.evaluate("window.sessionToken")
+        if token:
+            return token
+
+    return None
+
+async def get_session_token_async(max_wait=15, browser_path=None):
     browser = None
     try:
         start_kwargs = {
@@ -80,20 +103,9 @@ async def get_session_token_async(max_wait=5, browser_path=None):
         """)
         
         try:
-            inp = await page.select('.searchInput')
-            if inp:
-                await inp.send_keys("https://open.spotify.com/track/53iuhJlwXhSER5J2IYYv1W")
-                await asyncio.sleep(1)
-            
-            btn = await page.select('button[type="submit"]')
-            if btn:
-                attempts = max(1, int(max_wait / 2))
-                for _ in range(attempts):
-                    await btn.click()
-                    for _ in range(4):
-                        await asyncio.sleep(0.5)
-                        token = await page.evaluate("window.sessionToken")
-                        if token: return token
+            token = await submit_and_wait_for_token(page, max_wait)
+            if token:
+                return token
         except: pass
 
         return None
@@ -101,7 +113,7 @@ async def get_session_token_async(max_wait=5, browser_path=None):
     finally:
         await close_browser_safely(browser)
 
-def get_token(max_retries=1, timeout=5, browser_path=None):
+def get_token(max_retries=1, timeout=15, browser_path=None):
     for _ in range(max_retries):
         try:
             token = uc.loop().run_until_complete(
@@ -119,7 +131,7 @@ if __name__ == "__main__":
     sys.stderr = open(os.devnull, 'w')
     
     try:
-        timeout, retry, browser_path = 5, 1, None
+        timeout, retry, browser_path = 15, 1, None
         args = sys.argv[1:]
         for i, arg in enumerate(args):
             if arg == "--timeout" and i+1 < len(args):

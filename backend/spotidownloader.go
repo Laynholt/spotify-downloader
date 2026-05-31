@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -19,6 +20,12 @@ import (
 
 const (
 	spotidownloaderAPIBase = "https://api.spotidownloader.com"
+)
+
+const (
+	networkRetryAttempts = 3
+	networkRetryDelay    = 750 * time.Millisecond
+	networkRetryMaxDelay = 3 * time.Second
 )
 
 type SpotiDownloader struct {
@@ -84,6 +91,66 @@ func NewSpotiDownloader(sessionToken string) *SpotiDownloader {
 		sessionToken: preferredToken,
 		httpClient:   newHTTPClient(60 * time.Second),
 	}
+}
+
+func (s *SpotiDownloader) CloseIdleConnections() {
+	if s == nil || s.httpClient == nil {
+		return
+	}
+	s.httpClient.CloseIdleConnections()
+}
+
+func isTransientNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "proxyconnect") ||
+		strings.Contains(msg, "connectex") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "timeout awaiting response headers")
+}
+
+func (s *SpotiDownloader) doRequestWithNetworkRetry(req *http.Request) (*http.Response, error) {
+	var resp *http.Response
+	var finalErr error
+
+	_ = RetryWithBackoff(networkRetryAttempts, networkRetryDelay, networkRetryMaxDelay, func(attempt int) error {
+		if attempt > 1 && req.GetBody != nil {
+			body, err := req.GetBody()
+			if err != nil {
+				finalErr = err
+				return nil
+			}
+			req.Body = body
+		}
+
+		var err error
+		resp, err = s.httpClient.Do(req)
+		if err == nil {
+			finalErr = nil
+			return nil
+		}
+
+		finalErr = err
+		if isTransientNetworkError(err) {
+			return err
+		}
+		return nil
+	})
+
+	if finalErr != nil {
+		return nil, finalErr
+	}
+	return resp, nil
 }
 
 func fetchTaggingMetadataInBackground(trackID, trackName, artistName, albumName, releaseDate string, useSingleGenre, embedGenre bool) <-chan taggingMetadataResult {
@@ -471,7 +538,7 @@ func isSessionTokenError(err error) bool {
 func (s *SpotiDownloader) refreshSessionToken() error {
 	fmt.Println("Session token expired, fetching a fresh token...")
 
-	token, err := FetchSessionTokenWithParams(5, 1)
+	token, err := FetchSessionTokenWithParams(15, 1)
 	if err != nil {
 		return fmt.Errorf("failed to refresh session token: %w", err)
 	}
@@ -524,7 +591,7 @@ func (s *SpotiDownloader) isFlacAvailable(trackID string) (bool, error) {
 	req.Header.Set("Origin", "https://spotidownloader.com")
 	req.Header.Set("Referer", "https://spotidownloader.com/")
 
-	resp, err := s.httpClient.Do(req)
+	resp, err := s.doRequestWithNetworkRetry(req)
 	if err != nil {
 		return false, err
 	}
@@ -580,7 +647,7 @@ func (s *SpotiDownloader) getDownloadLink(trackID string) (*DownloadResponse, er
 	req.Header.Set("Origin", "https://spotidownloader.com")
 	req.Header.Set("Referer", "https://spotidownloader.com/")
 
-	resp, err := s.httpClient.Do(req)
+	resp, err := s.doRequestWithNetworkRetry(req)
 	if err != nil {
 		return nil, err
 	}
@@ -633,7 +700,7 @@ func (s *SpotiDownloader) downloadFile(downloadURL, outputBasePath, fallbackExt 
 	req.Header.Set("Referer", "https://spotidownloader.com/")
 	req.Header.Set("Origin", "https://spotidownloader.com")
 
-	resp, err := s.httpClient.Do(req)
+	resp, err := s.doRequestWithNetworkRetry(req)
 	if err != nil {
 		return "", err
 	}
