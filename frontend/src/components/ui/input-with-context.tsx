@@ -8,12 +8,17 @@ export interface InputWithContextProps extends React.InputHTMLAttributes<HTMLInp
 const InputWithContext = React.forwardRef<HTMLInputElement, InputWithContextProps>(({ className, type, onValueChange, onChange, ...props }, ref) => {
     const inputRef = React.useRef<HTMLInputElement>(null);
     const [hasSelection, setHasSelection] = React.useState(false);
+    const [hasValue, setHasValue] = React.useState(() => Boolean(props.value || props.defaultValue));
     const [canPaste, setCanPaste] = React.useState(false);
     React.useImperativeHandle(ref, () => inputRef.current as HTMLInputElement);
+    React.useEffect(() => {
+        setHasValue(Boolean(props.value || inputRef.current?.value));
+    }, [props.value]);
     const updateSelectionState = () => {
         const input = inputRef.current;
         if (!input)
             return;
+        setHasValue(input.value.length > 0);
         const start = input.selectionStart ?? 0;
         const end = input.selectionEnd ?? 0;
         setHasSelection(start !== end);
@@ -118,6 +123,7 @@ const InputWithContext = React.forwardRef<HTMLInputElement, InputWithContextProp
         if (onValueChange) {
             onValueChange(e.target.value);
         }
+        setHasValue(e.target.value.length > 0);
     };
     return (<ContextMenu onOpenChange={(open) => {
             if (open) {
@@ -144,7 +150,7 @@ const InputWithContext = React.forwardRef<HTMLInputElement, InputWithContextProp
             <span className="ml-auto text-xs text-muted-foreground">Ctrl+V</span>
           </ContextMenuItem>
           <ContextMenuSeparator />
-          <ContextMenuItem onSelect={handleSelectAll} disabled={!inputRef.current?.value || props.disabled}>
+          <ContextMenuItem onSelect={handleSelectAll} disabled={!hasValue || props.disabled}>
             <Type className="mr-2 h-4 w-4"/>
             Select All
             <span className="ml-auto text-xs text-muted-foreground">Ctrl+A</span>

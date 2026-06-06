@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useMemo, useState, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Trash2, ExternalLink, Search, ArrowUpDown, History, Play, Pause, Database, CloudUpload, Music2, Disc3, ListMusic, UserRound } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -45,10 +45,31 @@ interface FetchHistoryItem {
 interface HistoryPageProps {
     onHistorySelect?: (cachedData: string) => void;
 }
+const parseDuration = (str: string) => {
+    const parts = str.split(':').map(Number);
+    if (parts.length === 2)
+        return parts[0] * 60 + parts[1];
+    if (parts.length === 3)
+        return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    return 0;
+};
+const sortDownloadHistory = (a: DownloadHistoryItem, b: DownloadHistoryItem, sortBy: string) => {
+    switch (sortBy) {
+        case "default":
+        case "date_desc": return b.timestamp - a.timestamp;
+        case "date_asc": return a.timestamp - b.timestamp;
+        case "title_asc": return a.title.localeCompare(b.title);
+        case "title_desc": return b.title.localeCompare(a.title);
+        case "artist_asc": return a.artists.localeCompare(b.artists);
+        case "artist_desc": return b.artists.localeCompare(a.artists);
+        case "duration_asc": return parseDuration(a.duration_str) - parseDuration(b.duration_str);
+        case "duration_desc": return parseDuration(b.duration_str) - parseDuration(a.duration_str);
+        default: return 0;
+    }
+};
 export function HistoryPage({ onHistorySelect }: HistoryPageProps) {
     const [activeTab, setActiveTab] = useState("downloads");
     const [downloadHistory, setDownloadHistory] = useState<DownloadHistoryItem[]>([]);
-    const [filteredDownloadHistory, setFilteredDownloadHistory] = useState<DownloadHistoryItem[]>([]);
     const [showClearDownloadConfirm, setShowClearDownloadConfirm] = useState(false);
     const [downloadSearchQuery, setDownloadSearchQuery] = useState("");
     const [downloadSortBy, setDownloadSortBy] = useState("default");
@@ -56,7 +77,6 @@ export function HistoryPage({ onHistorySelect }: HistoryPageProps) {
     const [playingPreviewId, setPlayingPreviewId] = useState<string | null>(null);
     const audioRef = useRef<HTMLAudioElement | null>(null);
     const [fetchHistory, setFetchHistory] = useState<FetchHistoryItem[]>([]);
-    const [filteredFetchHistory, setFilteredFetchHistory] = useState<FetchHistoryItem[]>([]);
     const [showClearFetchConfirm, setShowClearFetchConfirm] = useState(false);
     const [fetchSearchQuery, setFetchSearchQuery] = useState("");
     const [fetchCurrentPage, setFetchCurrentPage] = useState(1);
@@ -99,42 +119,17 @@ export function HistoryPage({ onHistorySelect }: HistoryPageProps) {
             }
         };
     }, []);
-    useEffect(() => {
-        let result = [...downloadHistory];
+    const filteredDownloadHistory = useMemo(() => {
+        const result = [...downloadHistory];
         if (downloadSearchQuery) {
             const query = downloadSearchQuery.toLowerCase();
-            result = result.filter(item => item.title.toLowerCase().includes(query) ||
+            return result.filter(item => item.title.toLowerCase().includes(query) ||
                 item.artists.toLowerCase().includes(query) ||
-                item.album.toLowerCase().includes(query));
+                item.album.toLowerCase().includes(query)).sort((a, b) => sortDownloadHistory(a, b, downloadSortBy));
         }
-        const parseDuration = (str: string) => {
-            const parts = str.split(':').map(Number);
-            if (parts.length === 2)
-                return parts[0] * 60 + parts[1];
-            if (parts.length === 3)
-                return parts[0] * 3600 + parts[1] * 60 + parts[2];
-            return 0;
-        };
-        result.sort((a, b) => {
-            switch (downloadSortBy) {
-                case "default":
-                case "date_desc": return b.timestamp - a.timestamp;
-                case "date_asc": return a.timestamp - b.timestamp;
-                case "title_asc": return a.title.localeCompare(b.title);
-                case "title_desc": return b.title.localeCompare(a.title);
-                case "artist_asc": return a.artists.localeCompare(b.artists);
-                case "artist_desc": return b.artists.localeCompare(a.artists);
-                case "duration_asc": return parseDuration(a.duration_str) - parseDuration(b.duration_str);
-                case "duration_desc": return parseDuration(b.duration_str) - parseDuration(a.duration_str);
-                default: return 0;
-            }
-        });
-        setFilteredDownloadHistory(result);
+        return result.sort((a, b) => sortDownloadHistory(a, b, downloadSortBy));
     }, [downloadHistory, downloadSearchQuery, downloadSortBy]);
-    useEffect(() => {
-        setDownloadCurrentPage(1);
-    }, [downloadSearchQuery, downloadSortBy]);
-    useEffect(() => {
+    const filteredFetchHistory = useMemo(() => {
         let result = [...fetchHistory];
         result = result.filter(item => item.type === activeFetchTab);
         if (fetchSearchQuery) {
@@ -143,11 +138,24 @@ export function HistoryPage({ onHistorySelect }: HistoryPageProps) {
                 item.info.toLowerCase().includes(query));
         }
         result.sort((a, b) => b.timestamp - a.timestamp);
-        setFilteredFetchHistory(result);
+        return result;
     }, [fetchHistory, fetchSearchQuery, activeFetchTab]);
-    useEffect(() => {
+    const handleDownloadSearchChange = (value: string) => {
+        setDownloadSearchQuery(value);
+        setDownloadCurrentPage(1);
+    };
+    const handleDownloadSortChange = (value: string) => {
+        setDownloadSortBy(value);
+        setDownloadCurrentPage(1);
+    };
+    const handleFetchSearchChange = (value: string) => {
+        setFetchSearchQuery(value);
         setFetchCurrentPage(1);
-    }, [fetchSearchQuery, activeFetchTab]);
+    };
+    const handleFetchTabChange = (tab: string) => {
+        setActiveFetchTab(tab);
+        setFetchCurrentPage(1);
+    };
     const handlePreview = async (id: string, spotifyId: string) => {
         if (playingPreviewId === id) {
             audioRef.current?.pause();
@@ -237,9 +245,9 @@ export function HistoryPage({ onHistorySelect }: HistoryPageProps) {
                      <div className="flex items-center gap-2">
                         <div className="relative flex-1">
                             <Search className="absolute left-2 top-2.5 h-4 w-4 text-muted-foreground"/>
-                            <Input placeholder="Search downloads..." value={downloadSearchQuery} onChange={(e) => setDownloadSearchQuery(e.target.value)} className="pl-8 h-9"/>
+                            <Input placeholder="Search downloads..." value={downloadSearchQuery} onChange={(e) => handleDownloadSearchChange(e.target.value)} className="pl-8 h-9"/>
                         </div>
-                        <Select value={downloadSortBy} onValueChange={setDownloadSortBy}>
+                        <Select value={downloadSortBy} onValueChange={handleDownloadSortChange}>
                             <SelectTrigger className="w-[180px] h-9">
                                 <ArrowUpDown className="mr-2 h-4 w-4"/>
                                 <SelectValue placeholder="Sort by"/>
@@ -411,19 +419,19 @@ export function HistoryPage({ onHistorySelect }: HistoryPageProps) {
                     
                     <div className="flex flex-col gap-4">
                         <div className="flex gap-2 border-b shrink-0">
-                            <Button variant={activeFetchTab === "track" ? "default" : "ghost"} size="sm" onClick={() => setActiveFetchTab("track")} className="rounded-b-none">
+                            <Button variant={activeFetchTab === "track" ? "default" : "ghost"} size="sm" onClick={() => handleFetchTabChange("track")} className="rounded-b-none">
                                 <Music2 className="h-4 w-4"/>
                                 Tracks
                             </Button>
-                            <Button variant={activeFetchTab === "album" ? "default" : "ghost"} size="sm" onClick={() => setActiveFetchTab("album")} className="rounded-b-none">
+                            <Button variant={activeFetchTab === "album" ? "default" : "ghost"} size="sm" onClick={() => handleFetchTabChange("album")} className="rounded-b-none">
                                 <Disc3 className="h-4 w-4"/>
                                 Albums
                             </Button>
-                            <Button variant={activeFetchTab === "playlist" ? "default" : "ghost"} size="sm" onClick={() => setActiveFetchTab("playlist")} className="rounded-b-none">
+                            <Button variant={activeFetchTab === "playlist" ? "default" : "ghost"} size="sm" onClick={() => handleFetchTabChange("playlist")} className="rounded-b-none">
                                 <ListMusic className="h-4 w-4"/>
                                 Playlists
                             </Button>
-                            <Button variant={activeFetchTab === "artist" ? "default" : "ghost"} size="sm" onClick={() => setActiveFetchTab("artist")} className="rounded-b-none">
+                            <Button variant={activeFetchTab === "artist" ? "default" : "ghost"} size="sm" onClick={() => handleFetchTabChange("artist")} className="rounded-b-none">
                                 <UserRound className="h-4 w-4"/>
                                 Artists
                             </Button>
@@ -432,7 +440,7 @@ export function HistoryPage({ onHistorySelect }: HistoryPageProps) {
                         <div className="flex items-center gap-2">
                             <div className="relative flex-1">
                                 <Search className="absolute left-2 top-2.5 h-4 w-4 text-muted-foreground"/>
-                                <Input placeholder="Search fetch history..." value={fetchSearchQuery} onChange={(e) => setFetchSearchQuery(e.target.value)} className="pl-8 h-9"/>
+                                <Input placeholder="Search fetch history..." value={fetchSearchQuery} onChange={(e) => handleFetchSearchChange(e.target.value)} className="pl-8 h-9"/>
                             </div>
                         </div>
                     </div>

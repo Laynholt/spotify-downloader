@@ -8,7 +8,7 @@ interface DownloadProgressToastProps {
 export function DownloadProgressToast({ onClick }: DownloadProgressToastProps) {
     const progress = useDownloadProgress();
     const queueInfo = useDownloadQueueData();
-    const hasActiveDownloads = queueInfo.queue.some((item: any) => item.status === "queued" || item.status === "downloading");
+    const hasActiveDownloads = queueInfo.queue.some((item) => item.status === "queued" || item.status === "downloading");
     if (!hasActiveDownloads) {
         return null;
     }

@@ -1,31 +1,25 @@
-import { X, Minus, Maximize, Settings, Info } from "lucide-react";
+import { X, Minus, Maximize, Settings } from "lucide-react";
 import { WindowMinimise, WindowToggleMaximise, Quit } from "../../wailsjs/runtime/runtime";
-import { Menubar, MenubarContent, MenubarMenu, MenubarRadioGroup, MenubarRadioItem, MenubarSub, MenubarSubContent, MenubarSubTrigger, MenubarTrigger, MenubarLabel, MenubarSeparator, MenubarItem } from "@/components/ui/menubar";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { Menubar, MenubarContent, MenubarMenu, MenubarRadioGroup, MenubarRadioItem, MenubarSub, MenubarSubContent, MenubarSubTrigger, MenubarTrigger, MenubarLabel, MenubarSeparator } from "@/components/ui/menubar";
 import { getSettings, updateSettings } from "@/lib/settings";
 import { useState, useEffect } from "react";
 const TIMEOUT_OPTIONS = [15, 20, 25, 30, 45, 60];
 const RETRY_OPTIONS = [1, 2, 3, 4, 5];
+type SettingsUpdatedEvent = CustomEvent<{
+    tokenTimeout?: number;
+    tokenRetry?: number;
+}>;
 export function TitleBar() {
-    const [tokenTimeout, setTokenTimeout] = useState(15);
-    const [tokenRetry, setTokenRetry] = useState(1);
-    const [useSpotFetchAPI, setUseSpotFetchAPI] = useState(false);
+    const [tokenTimeout, setTokenTimeout] = useState(() => getSettings().tokenTimeout || 15);
+    const [tokenRetry, setTokenRetry] = useState(() => getSettings().tokenRetry || 1);
     useEffect(() => {
-        const settings = getSettings();
-        if (settings) {
-            setTokenTimeout(settings.tokenTimeout || 15);
-            setTokenRetry(settings.tokenRetry || 1);
-            setUseSpotFetchAPI(settings.useSpotFetchAPI || false);
-        }
-        const handleSettingsUpdate = (event: any) => {
-            const updatedSettings = event.detail;
+        const handleSettingsUpdate = (event: Event) => {
+            const { detail: updatedSettings } = event as SettingsUpdatedEvent;
             if (updatedSettings) {
                 if (typeof updatedSettings.tokenTimeout !== 'undefined')
                     setTokenTimeout(updatedSettings.tokenTimeout);
                 if (typeof updatedSettings.tokenRetry !== 'undefined')
                     setTokenRetry(updatedSettings.tokenRetry);
-                if (typeof updatedSettings.useSpotFetchAPI !== 'undefined')
-                    setUseSpotFetchAPI(updatedSettings.useSpotFetchAPI);
             }
         };
         window.addEventListener('settingsUpdated', handleSettingsUpdate);
@@ -40,11 +34,6 @@ export function TitleBar() {
         const retry = parseInt(value, 10);
         setTokenRetry(retry);
         updateSettings({ tokenRetry: retry });
-    };
-    const handleSpotFetchAPIToggle = () => {
-        const newValue = !useSpotFetchAPI;
-        setUseSpotFetchAPI(newValue);
-        updateSettings({ useSpotFetchAPI: newValue });
     };
     const handleMinimize = () => {
         WindowMinimise();
@@ -89,26 +78,6 @@ export function TitleBar() {
                             </MenubarRadioGroup>
                         </MenubarSubContent>
                     </MenubarSub>
-
-                    <MenubarSeparator />
-                    <div className="flex items-center gap-1.5 px-2 py-1.5">
-                        <MenubarLabel className="p-0">SpotFetch API</MenubarLabel>
-                        <TooltipProvider delayDuration={300}>
-                            <Tooltip>
-                                <TooltipTrigger asChild>
-                                    <Info className="w-3.5 h-3.5 cursor-help text-muted-foreground"/>
-                                </TooltipTrigger>
-                                <TooltipContent side="left" className="max-w-xs">
-                                    <p className="font-semibold mb-2">Spotify Blocked Countries:</p>
-                                    <p className="text-xs">Afghanistan, Antarctica, Central African Republic, China, Cuba, Eritrea, Iran, Myanmar, North Korea, Russia, Somalia, South Sudan, Sudan, Syria, Turkmenistan, Yemen</p>
-                                </TooltipContent>
-                            </Tooltip>
-                        </TooltipProvider>
-                    </div>
-                    <MenubarItem onClick={handleSpotFetchAPIToggle} className="justify-between">
-                        <span>Use SpotFetch API</span>
-                        <span className="ml-4">{useSpotFetchAPI ? "✓" : ""}</span>
-                    </MenubarItem>
                 </MenubarContent>
             </MenubarMenu>
         </Menubar>

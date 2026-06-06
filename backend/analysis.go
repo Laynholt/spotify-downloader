@@ -2,14 +2,11 @@ package backend
 
 import (
 	"fmt"
-	"math"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"time"
-
-	mewflac "github.com/mewkiz/flac"
 )
 
 type AnalysisResult struct {
@@ -120,74 +117,6 @@ func GetMetadataWithFFprobe(filePath string) (*AnalysisResult, error) {
 	}
 
 	return res, nil
-}
-
-func calculateRealAudioMetrics(result *AnalysisResult, filepath string) {
-	samples, err := decodeFLACForMetrics(filepath)
-	if err != nil {
-		return
-	}
-
-	var peak float64
-	var sumSquares float64
-
-	for _, sample := range samples {
-		absVal := sample
-		if absVal < 0 {
-			absVal = -absVal
-		}
-		if absVal > peak {
-			peak = absVal
-		}
-		sumSquares += sample * sample
-	}
-
-	peakDB := 20.0 * math.Log10(peak)
-	result.PeakAmplitude = peakDB
-
-	rms := math.Sqrt(sumSquares / float64(len(samples)))
-	rmsDB := 20.0 * math.Log10(rms)
-	result.RMSLevel = rmsDB
-
-	result.DynamicRange = peakDB - rmsDB
-}
-
-func decodeFLACForMetrics(filepath string) ([]float64, error) {
-	stream, err := mewflac.ParseFile(filepath)
-	if err != nil {
-		return nil, err
-	}
-	defer stream.Close()
-
-	maxSamples := 10000000
-	samples := make([]float64, 0, maxSamples)
-
-	for {
-		frame, err := stream.ParseNext()
-		if err != nil {
-			break
-		}
-
-		var channelSamples []int32
-		if len(frame.Subframes) > 0 {
-			channelSamples = frame.Subframes[0].Samples
-		}
-
-		maxVal := float64(int64(1) << (stream.Info.BitsPerSample - 1))
-		for _, sample := range channelSamples {
-			if len(samples) >= maxSamples {
-				return samples, nil
-			}
-			normalized := float64(sample) / maxVal
-			samples = append(samples, normalized)
-		}
-
-		if len(samples) >= maxSamples {
-			break
-		}
-	}
-
-	return samples, nil
 }
 
 func GetFileSize(filepath string) (int64, error) {

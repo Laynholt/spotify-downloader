@@ -4,7 +4,7 @@ import { Label } from "@/components/ui/label";
 import { ToggleGroup, ToggleGroupItem, } from "@/components/ui/toggle-group";
 import { Upload, X, CheckCircle2, AlertCircle, Trash2, FileMusic, WandSparkles, } from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
-import { ConvertAudio, SelectAudioFiles, SelectFolder, ListAudioFilesInDir, } from "../../wailsjs/go/main/App";
+import { ConvertAudio, GetFileSizes, SelectAudioFiles, SelectFolder, ListAudioFilesInDir, } from "../../wailsjs/go/main/App";
 import { toastWithSound as toast } from "@/lib/toast-with-sound";
 import { OnFileDrop, OnFileDropOff } from "../../wailsjs/runtime/runtime";
 interface AudioFile {
@@ -61,7 +61,8 @@ export function AudioConverterPage() {
                 }
             }
         }
-        catch (err) {
+        catch {
+            // Ignore invalid persisted converter settings.
         }
         return "mp3";
     });
@@ -75,7 +76,8 @@ export function AudioConverterPage() {
                 }
             }
         }
-        catch (err) {
+        catch {
+            // Ignore invalid persisted converter settings.
         }
         return "320k";
     });
@@ -89,7 +91,8 @@ export function AudioConverterPage() {
                 }
             }
         }
-        catch (err) {
+        catch {
+            // Ignore invalid persisted converter settings.
         }
         return "aac";
     });
@@ -186,7 +189,6 @@ export function AudioConverterPage() {
                 description: "Only FLAC and MP3 files are supported as input. Please convert M4A files first.",
             });
         }
-        const GetFileSizes = (files: string[]): Promise<Record<string, number>> => (window as any)["go"]["main"]["App"]["GetFileSizes"](files);
         const validPaths = paths.filter((path) => {
             const ext = path.toLowerCase().slice(path.lastIndexOf("."));
             return validExtensions.includes(ext);

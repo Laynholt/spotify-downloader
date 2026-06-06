@@ -153,26 +153,6 @@ func (a *App) GetSpotifyMetadata(req SpotifyMetadataRequest) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(req.Timeout*float64(time.Second)))
 	defer cancel()
 
-	settings, err := a.LoadSettings()
-	if err == nil && settings != nil {
-		if useAPI, ok := settings["useSpotFetchAPI"].(bool); ok && useAPI {
-			if apiURL, ok := settings["spotFetchAPIUrl"].(string); ok && apiURL != "" {
-
-				data, err := backend.GetSpotifyDataWithAPI(ctx, req.URL, true, apiURL, req.Batch, time.Duration(req.Delay*float64(time.Second)))
-				if err != nil {
-					return "", fmt.Errorf("failed to fetch metadata from API: %v", err)
-				}
-
-				jsonData, err := json.MarshalIndent(data, "", "  ")
-				if err != nil {
-					return "", fmt.Errorf("failed to encode response: %v", err)
-				}
-
-				return string(jsonData), nil
-			}
-		}
-	}
-
 	data, err := backend.GetFilteredSpotifyData(ctx, req.URL, req.Batch, time.Duration(req.Delay*float64(time.Second)))
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch metadata: %v", err)

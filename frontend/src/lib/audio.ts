@@ -2,7 +2,10 @@ class AudioManager {
     private audioContext: AudioContext | null = null;
     private getAudioContext(): AudioContext {
         if (!this.audioContext) {
-            this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+            const AudioContextCtor = window.AudioContext || (window as Window & typeof globalThis & {
+                webkitAudioContext: typeof AudioContext;
+            }).webkitAudioContext;
+            this.audioContext = new AudioContextCtor();
         }
         return this.audioContext;
     }

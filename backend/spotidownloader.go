@@ -561,13 +561,6 @@ func withTokenRetry[T any](s *SpotiDownloader, fn func() (T, error)) (T, error) 
 	return fn()
 }
 
-func withTokenRetryVoid(s *SpotiDownloader, fn func() error) error {
-	_, err := withTokenRetry(s, func() (struct{}, error) {
-		return struct{}{}, fn()
-	})
-	return err
-}
-
 func (s *SpotiDownloader) IsFlacAvailable(trackID string) (bool, error) {
 	return withTokenRetry(s, func() (bool, error) {
 		return s.isFlacAvailable(trackID)

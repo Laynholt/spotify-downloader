@@ -5,11 +5,10 @@ import { ActivityIcon } from "@/components/ui/activity";
 import { TerminalIcon } from "@/components/ui/terminal";
 import { FileMusicIcon } from "@/components/ui/file-music";
 import { FilePenIcon } from "@/components/ui/file-pen";
-import { CoffeeIcon } from "@/components/ui/coffee";
 import { BadgeAlertIcon } from "@/components/ui/badge-alert";
 import { Tooltip, TooltipContent, TooltipTrigger, } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
-import { openExternal } from "@/lib/utils";
+
 export type PageType = "main" | "settings" | "debug" | "audio-analysis" | "audio-converter" | "file-manager" | "about" | "history";
 interface SidebarProps {
     currentPage: PageType;
@@ -107,16 +106,6 @@ export function Sidebar({ currentPage, onPageChange }: SidebarProps) {
         </TooltipTrigger>
         <TooltipContent side="right">
           <p>About</p>
-        </TooltipContent>
-      </Tooltip>
-      <Tooltip delayDuration={0}>
-        <TooltipTrigger asChild>
-          <Button variant="ghost" size="icon" className="h-10 w-10 hover:bg-primary/10 hover:text-primary" onClick={() => openExternal("https://ko-fi.com/afkarxyz")}>
-            <CoffeeIcon size={20} loop={true}/>
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent side="right">
-          <p>Support me on Ko-fi</p>
         </TooltipContent>
       </Tooltip>
     </div>

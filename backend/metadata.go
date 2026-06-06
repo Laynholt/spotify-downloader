@@ -335,18 +335,6 @@ func replaceFileWithTemp(tempPath, filePath string) error {
 	return nil
 }
 
-func replaceFileWithTempLegacy(tempPath, filePath string) error {
-	if !fileExists(tempPath) {
-		return nil
-	}
-
-	if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-
-	return replaceFileWithTemp(tempPath, filePath)
-}
-
 func promoteMP3TagTempFile(tempPath, filePath string) error {
 	return replaceFileWithTemp(tempPath, filePath)
 }

@@ -11,6 +11,7 @@ interface DownloadQueueProps {
     onClose: () => void;
 }
 export function DownloadQueue({ isOpen, onClose }: DownloadQueueProps) {
+    const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000));
     const [queueInfo, setQueueInfo] = useState<backend.DownloadQueueInfo>(new backend.DownloadQueueInfo({
         is_downloading: false,
         queue: [],
@@ -36,7 +37,13 @@ export function DownloadQueue({ isOpen, onClose }: DownloadQueueProps) {
         };
         fetchQueue();
         const interval = setInterval(fetchQueue, 500);
-        return () => clearInterval(interval);
+        const clockInterval = setInterval(() => {
+            setNowSeconds(Math.floor(Date.now() / 1000));
+        }, 1000);
+        return () => {
+            clearInterval(interval);
+            clearInterval(clockInterval);
+        };
     }, [isOpen]);
     const handleClearHistory = async () => {
         try {
@@ -105,8 +112,7 @@ export function DownloadQueue({ isOpen, onClose }: DownloadQueueProps) {
     const formatDuration = (startTimestamp: number) => {
         if (startTimestamp === 0)
             return "—";
-        const now = Math.floor(Date.now() / 1000);
-        const durationSeconds = now - startTimestamp;
+        const durationSeconds = nowSeconds - startTimestamp;
         const hours = Math.floor(durationSeconds / 3600);
         const minutes = Math.floor((durationSeconds % 3600) / 60);
         const seconds = durationSeconds % 60;
@@ -124,7 +130,7 @@ export function DownloadQueue({ isOpen, onClose }: DownloadQueueProps) {
     const toggleFilter = (status: string) => {
         setFilterStatus((prev) => (prev === status ? "all" : status));
     };
-    const filteredQueue = queueInfo.queue.filter((item: any) => {
+    const filteredQueue = queueInfo.queue.filter((item) => {
         if (filterStatus === "all")
             return true;
         return item.status === filterStatus;
@@ -217,7 +223,7 @@ export function DownloadQueue({ isOpen, onClose }: DownloadQueueProps) {
                 <Button variant="link" onClick={() => setFilterStatus("all")}>
                   Clear filter
                 </Button>
-              </div>) : (filteredQueue.map((item: any) => (<div key={item.id} className="border rounded-lg p-3 hover:bg-muted/30 transition-colors">
+              </div>) : (filteredQueue.map((item) => (<div key={item.id} className="border rounded-lg p-3 hover:bg-muted/30 transition-colors">
                   <div className="flex items-start gap-3">
                     <div className="mt-1">{getStatusIcon(item.status)}</div>
 

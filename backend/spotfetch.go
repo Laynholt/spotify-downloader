@@ -309,16 +309,6 @@ func getFloat64(m map[string]interface{}, key string) float64 {
 	return 0
 }
 
-func getInt(m map[string]interface{}, key string) int {
-	if val, ok := m[key].(int); ok {
-		return val
-	}
-	if val, ok := m[key].(float64); ok {
-		return int(val)
-	}
-	return 0
-}
-
 func getBool(m map[string]interface{}, key string) bool {
 	if val, ok := m[key].(bool); ok {
 		return val

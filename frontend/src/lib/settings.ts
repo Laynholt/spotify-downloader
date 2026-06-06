@@ -25,8 +25,6 @@ export interface Settings {
     operatingSystem: "Windows" | "linux/MacOS";
     tokenTimeout: number;
     tokenRetry: number;
-    useSpotFetchAPI: boolean;
-    spotFetchAPIUrl: string;
     createPlaylistFolder: boolean;
     createM3u8File: boolean;
     useFirstArtistOnly: boolean;
@@ -107,8 +105,6 @@ export const DEFAULT_SETTINGS: Settings = {
     operatingSystem: detectOS(),
     tokenTimeout: 15,
     tokenRetry: 1,
-    useSpotFetchAPI: false,
-    spotFetchAPIUrl: "https://spotify.afkarxyz.fun/api",
     createPlaylistFolder: true,
     createM3u8File: false,
     useFirstArtistOnly: false,
@@ -163,6 +159,8 @@ type LegacySettings = Partial<Settings> & {
     darkMode?: boolean;
     artistSubfolder?: boolean;
     albumSubfolder?: boolean;
+    useSpotFetchAPI?: unknown;
+    spotFetchAPIUrl?: unknown;
 };
 function toBackendSettingsPayload(settings: Settings): { [key: string]: unknown } {
     return { ...settings };
@@ -173,6 +171,8 @@ function normalizeSettingsData(source: LegacySettings | null | undefined): Setti
         parsed.themeMode = parsed.darkMode ? "dark" : "light";
         delete parsed.darkMode;
     }
+    delete parsed.useSpotFetchAPI;
+    delete parsed.spotFetchAPIUrl;
     if (!("folderPreset" in parsed) && ("artistSubfolder" in parsed || "albumSubfolder" in parsed)) {
         const hasArtist = parsed.artistSubfolder;
         const hasAlbum = parsed.albumSubfolder;

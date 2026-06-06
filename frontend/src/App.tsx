@@ -3,7 +3,7 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, } from "@/components/ui/dialog";
 import { Search, X, ArrowUp } from "lucide-react";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { getSettings, getSettingsWithDefaults, loadSettings, saveSettings, applyThemeMode, applyFont, updateSettings } from "@/lib/settings";
+import { getSettings, getSettingsWithDefaults, loadSettings, saveSettings, applyThemeMode, applyFont } from "@/lib/settings";
 import { applyTheme } from "@/lib/themes";
 import { OpenFolder, CheckFFmpegInstalled, DownloadFFmpeg } from "../wailsjs/go/main/App";
 import { EventsOn, EventsOff, Quit } from "../wailsjs/runtime/runtime";
@@ -125,17 +125,6 @@ function App() {
             window.removeEventListener("chromeNotInstalled", handleChromeNotInstalled);
         };
     }, []);
-    const handleEnableSpotFetchApi = async () => {
-        try {
-            await updateSettings({ useSpotFetchAPI: true });
-            metadata.setShowApiModal(false);
-            toast.success("SpotFetch API enabled! You can now try fetching again.");
-        }
-        catch (err) {
-            console.error("Failed to enable SpotFetch API:", err);
-            toast.error("Failed to update settings");
-        }
-    };
     const scrollToTop = useCallback(() => {
         window.scrollTo({ top: 0, behavior: "smooth" });
     }, []);
@@ -150,7 +139,7 @@ function App() {
     }, [metadata.metadata]);
     const checkForUpdates = async () => {
         try {
-            const response = await fetch("https://api.github.com/repos/afkarxyz/SpotiDownloader/releases/latest");
+            const response = await fetch("https://api.github.com/repos/Laynholt/spotify-downloader/releases/latest");
             const data = await response.json();
             const latestVersion = data.tag_name?.replace(/^v/, "") || "";
             if (data.published_at) {
@@ -309,7 +298,7 @@ function App() {
     const toggleTrackSelection = (id: string) => {
         setSelectedTracks((prev) => prev.includes(id) ? prev.filter((prevId) => prevId !== id) : [...prev, id]);
     };
-    const toggleSelectAll = (tracks: any[]) => {
+    const toggleSelectAll = (tracks: Array<{ spotify_id?: string }>) => {
         const tracksWithId = tracks.filter((track) => track.spotify_id).map((track) => track.spotify_id || "");
         if (tracksWithId.length === 0)
             return;
@@ -592,25 +581,6 @@ function App() {
                             </Button>)}
                         <Button className={`${isInstallingFFmpeg ? 'w-full' : 'flex-1'} h-11 text-sm font-bold shadow-lg shadow-primary/10`} onClick={handleInstallFFmpeg} disabled={isInstallingFFmpeg}>
                             {isInstallingFFmpeg ? "Installing..." : "Install now"}
-                        </Button>
-                    </DialogFooter>
-                </DialogContent>
-            </Dialog>
-
-            <Dialog open={metadata.showApiModal} onOpenChange={metadata.setShowApiModal}>
-                <DialogContent className="sm:max-w-[425px]">
-                    <DialogHeader>
-                        <DialogTitle>SpotFetch API Recommended</DialogTitle>
-                        <DialogDescription>
-                            Direct fetch failed. This usually happens when your <span className="text-foreground font-bold">country is blocked</span> by Spotify or your IP is restricted. Would you like to enable the <span className="text-foreground font-bold">SpotFetch API</span> to bypass this?
-                        </DialogDescription>
-                    </DialogHeader>
-                    <DialogFooter>
-                        <Button variant="outline" onClick={() => metadata.setShowApiModal(false)}>
-                            Cancel
-                        </Button>
-                        <Button onClick={handleEnableSpotFetchApi}>
-                            Enable SpotFetch API
                         </Button>
                     </DialogFooter>
                 </DialogContent>

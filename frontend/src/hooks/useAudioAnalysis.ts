@@ -33,7 +33,8 @@ export function useAudioAnalysis() {
                 return parsed.filePath || "";
             }
         }
-        catch (err) {
+        catch {
+            // Ignore invalid persisted analysis state.
         }
         return "";
     });
@@ -48,7 +49,8 @@ export function useAudioAnalysis() {
                 }
             }
         }
-        catch (err) {
+        catch {
+            // Ignore invalid persisted analysis state.
         }
         return false;
     });
@@ -71,7 +73,7 @@ export function useAudioAnalysis() {
             if (analysisResult.spectrum) {
                 setSpectrumCache(filePath, analysisResult.spectrum);
             }
-            const { spectrum, ...detailResult } = analysisResult;
+            const detailResult = { ...analysisResult, spectrum: undefined };
             try {
                 sessionStorage.setItem(STORAGE_KEY, JSON.stringify({
                     filePath,
@@ -105,7 +107,8 @@ export function useAudioAnalysis() {
         try {
             sessionStorage.removeItem(STORAGE_KEY);
         }
-        catch (err) {
+        catch {
+            // Ignore unavailable sessionStorage cleanup.
         }
         clearSpectrumCache();
     }, []);

@@ -242,7 +242,7 @@ export function ArtistInfo({ artistInfo, albumList, trackList, searchQuery, sort
                         failCount++;
                     }
                 }
-                catch (error) {
+                catch {
                     failCount++;
                 }
             }

@@ -17,6 +17,7 @@ interface DragDropMediaProps {
     onChange: (value: string) => void;
     className?: string;
 }
+const getErrorMessage = (err: unknown, fallback: string) => err instanceof Error ? err.message : fallback;
 export function DragDropMedia({ value, onChange, className }: DragDropMediaProps) {
     const [isDragging, setIsDragging] = useState(false);
     const [files, setFiles] = useState<UploadedFile[]>(() => {
@@ -50,7 +51,7 @@ export function DragDropMedia({ value, onChange, className }: DragDropMediaProps
         if (newValue !== value) {
             onChange(newValue);
         }
-    }, [files]);
+    }, [files, onChange, value]);
     const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
         e.preventDefault();
         e.stopPropagation();
@@ -89,10 +90,10 @@ export function DragDropMedia({ value, onChange, className }: DragDropMediaProps
                     ? { ...f, status: 'done', url: result }
                     : f));
             }
-            catch (err: any) {
+            catch (err) {
                 console.error("Upload failed", err);
                 setFiles(prev => prev.map(f => f.id === fileId
-                    ? { ...f, status: 'error', error: err.message || "Upload failed" }
+                    ? { ...f, status: 'error', error: getErrorMessage(err, "Upload failed") }
                     : f));
             }
         }
@@ -119,15 +120,15 @@ export function DragDropMedia({ value, onChange, className }: DragDropMediaProps
                             ? { ...f, status: 'done', url: result }
                             : f));
                     }
-                    catch (err: any) {
+                    catch (err) {
                         setFiles(prev => prev.map(f => f.id === fileId
-                            ? { ...f, status: 'error', error: err.message }
+                            ? { ...f, status: 'error', error: getErrorMessage(err, "Upload failed") }
                             : f));
                     }
                 }
             }
         }
-        catch (err: any) {
+        catch (err) {
             console.error("Select file failed", err);
         }
     };
