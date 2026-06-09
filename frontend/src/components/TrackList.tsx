@@ -1,11 +1,16 @@
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Download, CheckCircle, XCircle, FileCheck, FileText, ImageDown, Play, Pause } from "lucide-react";
+import { Download, CheckCircle, XCircle, FileCheck, FileText, ImageDown, Play, Pause, AlertTriangle } from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Pagination, PaginationContent, PaginationEllipsis, PaginationItem, PaginationLink, PaginationNext, PaginationPrevious, } from "@/components/ui/pagination";
 import type { TrackMetadata } from "@/types/api";
 import { usePreview } from "@/hooks/usePreview";
+interface SuspiciousTrackInfo {
+    expectedDurationSeconds?: number;
+    actualDurationSeconds?: number;
+    durationDeltaSeconds?: number;
+}
 interface TrackListProps {
     tracks: TrackMetadata[];
     searchQuery: string;
@@ -14,6 +19,7 @@ interface TrackListProps {
     downloadedTracks: Set<string>;
     failedTracks: Set<string>;
     skippedTracks: Set<string>;
+    suspiciousTracks?: Map<string, SuspiciousTrackInfo>;
     downloadingTrack: string | null;
     isDownloading: boolean;
     currentPage: number;
@@ -49,7 +55,7 @@ interface TrackListProps {
     }) => void;
     onTrackClick?: (track: TrackMetadata) => void;
 }
-export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloadedTracks, failedTracks, skippedTracks, downloadingTrack, isDownloading, currentPage, itemsPerPage, showCheckboxes = false, hideAlbumColumn = false, folderName, isArtistDiscography = false, isAlbum = false, downloadedLyrics, failedLyrics, skippedLyrics, downloadingLyricsTrack, downloadedCovers, failedCovers, skippedCovers, downloadingCoverTrack, onToggleTrack, onToggleSelectAll, onDownloadTrack, onDownloadLyrics, onDownloadCover, onPageChange, onAlbumClick, onArtistClick, onTrackClick, }: TrackListProps) {
+export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloadedTracks, failedTracks, skippedTracks, suspiciousTracks, downloadingTrack, isDownloading, currentPage, itemsPerPage, showCheckboxes = false, hideAlbumColumn = false, folderName, isArtistDiscography = false, isAlbum = false, downloadedLyrics, failedLyrics, skippedLyrics, downloadingLyricsTrack, downloadedCovers, failedCovers, skippedCovers, downloadingCoverTrack, onToggleTrack, onToggleSelectAll, onDownloadTrack, onDownloadLyrics, onDownloadCover, onPageChange, onAlbumClick, onArtistClick, onTrackClick, }: TrackListProps) {
     const { playPreview, loadingPreview, playingTrack } = usePreview();
     let filteredTracks = tracks.filter((track) => {
         if (!searchQuery)
@@ -169,6 +175,22 @@ export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloa
             return plays;
         return num.toLocaleString();
     };
+    const formatSuspiciousTooltip = (info?: SuspiciousTrackInfo) => {
+        if (!info) {
+            return "Suspicious duration";
+        }
+        const parts = [];
+        if (info.expectedDurationSeconds !== undefined) {
+            parts.push(`expected ${info.expectedDurationSeconds.toFixed(1)}s`);
+        }
+        if (info.actualDurationSeconds !== undefined) {
+            parts.push(`actual ${info.actualDurationSeconds.toFixed(1)}s`);
+        }
+        if (info.durationDeltaSeconds !== undefined) {
+            parts.push(`delta ${info.durationDeltaSeconds.toFixed(1)}s`);
+        }
+        return parts.length > 0 ? parts.join(", ") : "Suspicious duration";
+    };
     return (<div className="space-y-4">
     <div className="rounded-md border">
       <div className="overflow-x-auto">
@@ -199,7 +221,10 @@ export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloa
             </tr>
           </thead>
           <tbody>
-            {paginatedTracks.map((track, index) => (<tr key={index} className="border-b transition-colors hover:bg-muted/50">
+            {paginatedTracks.map((track, index) => {
+            const suspiciousInfo = track.spotify_id ? suspiciousTracks?.get(track.spotify_id) : undefined;
+            const isSuspicious = !!suspiciousInfo;
+            return (<tr key={index} className="border-b transition-colors hover:bg-muted/50">
               {showCheckboxes && (<td className="p-4 align-middle">
                 {track.spotify_id && (<Checkbox checked={selectedTracks.includes(track.spotify_id)} onCheckedChange={() => onToggleTrack(track.spotify_id!)}/>)}
               </td>)}
@@ -226,7 +251,14 @@ export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloa
                         {track.name}
                       </span>) : (<span className="font-medium">{track.name}</span>)}
                       {track.is_explicit && (<span className="inline-flex items-center justify-center bg-red-600 text-white text-[10px] h-4 w-4 rounded shrink-0" title="Explicit">E</span>)}
-                      {track.spotify_id && skippedTracks.has(track.spotify_id) ? (<FileCheck className="h-4 w-4 text-yellow-500 shrink-0"/>) : track.spotify_id && downloadedTracks.has(track.spotify_id) ? (<CheckCircle className="h-4 w-4 text-green-500 shrink-0"/>) : track.spotify_id && failedTracks.has(track.spotify_id) ? (<XCircle className="h-4 w-4 text-red-500 shrink-0"/>) : null}
+                      {isSuspicious ? (<Tooltip>
+                        <TooltipTrigger asChild>
+                          <AlertTriangle className="h-4 w-4 text-yellow-500 shrink-0"/>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          <p>{formatSuspiciousTooltip(suspiciousInfo)}</p>
+                        </TooltipContent>
+                      </Tooltip>) : track.spotify_id && skippedTracks.has(track.spotify_id) ? (<FileCheck className="h-4 w-4 text-yellow-500 shrink-0"/>) : track.spotify_id && downloadedTracks.has(track.spotify_id) ? (<CheckCircle className="h-4 w-4 text-green-500 shrink-0"/>) : track.spotify_id && failedTracks.has(track.spotify_id) ? (<XCircle className="h-4 w-4 text-red-500 shrink-0"/>) : null}
                     </div>
                     <span className="text-sm text-muted-foreground">
                       {track.artists_data && track.artists_data.length > 0 ? ((() => {
@@ -276,11 +308,11 @@ export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloa
                   {(track.spotify_id) && (<Tooltip>
                     <TooltipTrigger asChild>
                       <Button onClick={() => onDownloadTrack(track, folderName, isArtistDiscography, isAlbum, startIndex + index + 1)} size="icon" disabled={isDownloading || (track.spotify_id ? downloadingTrack === track.spotify_id : false)}>
-                        {track.spotify_id && downloadingTrack === track.spotify_id ? (<Spinner />) : track.spotify_id && skippedTracks.has(track.spotify_id) ? (<FileCheck className="h-4 w-4"/>) : track.spotify_id && downloadedTracks.has(track.spotify_id) ? (<CheckCircle className="h-4 w-4"/>) : track.spotify_id && failedTracks.has(track.spotify_id) ? (<XCircle className="h-4 w-4"/>) : (<Download className="h-4 w-4"/>)}
+                        {track.spotify_id && downloadingTrack === track.spotify_id ? (<Spinner />) : isSuspicious ? (<AlertTriangle className="h-4 w-4"/>) : track.spotify_id && skippedTracks.has(track.spotify_id) ? (<FileCheck className="h-4 w-4"/>) : track.spotify_id && downloadedTracks.has(track.spotify_id) ? (<CheckCircle className="h-4 w-4"/>) : track.spotify_id && failedTracks.has(track.spotify_id) ? (<XCircle className="h-4 w-4"/>) : (<Download className="h-4 w-4"/>)}
                       </Button>
                     </TooltipTrigger>
                     <TooltipContent>
-                      {track.spotify_id && downloadingTrack === track.spotify_id ? (<p>Downloading...</p>) : track.spotify_id && skippedTracks.has(track.spotify_id) ? (<p>Already exists</p>) : track.spotify_id && downloadedTracks.has(track.spotify_id) ? (<p>Downloaded</p>) : track.spotify_id && failedTracks.has(track.spotify_id) ? (<p>Failed</p>) : (<p>Download Track</p>)}
+                      {track.spotify_id && downloadingTrack === track.spotify_id ? (<p>Downloading...</p>) : isSuspicious ? (<p>{formatSuspiciousTooltip(suspiciousInfo)}</p>) : track.spotify_id && skippedTracks.has(track.spotify_id) ? (<p>Already exists</p>) : track.spotify_id && downloadedTracks.has(track.spotify_id) ? (<p>Downloaded</p>) : track.spotify_id && failedTracks.has(track.spotify_id) ? (<p>Failed</p>) : (<p>Download Track</p>)}
                     </TooltipContent>
                   </Tooltip>)}
                   {track.spotify_id && (<Tooltip>
@@ -318,7 +350,8 @@ export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloa
                   </Tooltip>)}
                 </div>
               </td>
-            </tr>))}
+            </tr>);
+        })}
           </tbody>
         </table>
       </div>

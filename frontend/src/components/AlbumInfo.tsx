@@ -1,6 +1,6 @@
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { Download, FolderOpen, ImageDown, FileText, XCircle } from "lucide-react";
+import { Download, FolderOpen, ImageDown, FileText, XCircle, RefreshCw } from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { SearchAndSort } from "./SearchAndSort";
@@ -42,6 +42,7 @@ interface AlbumInfoProps {
     downloadingCoverTrack?: string | null;
     isBulkDownloadingCovers?: boolean;
     isBulkDownloadingLyrics?: boolean;
+    isBulkUpdatingMetadata?: boolean;
     currentPage: number;
     itemsPerPage: number;
     onSearchChange: (value: string) => void;
@@ -53,6 +54,7 @@ interface AlbumInfoProps {
     onDownloadCover?: (coverUrl: string, trackName: string, artistName: string, albumName: string, folderName?: string, isArtistDiscography?: boolean, position?: number, trackId?: string, albumArtist?: string, releaseDate?: string, discNumber?: number) => void;
     onDownloadAllLyrics?: () => void;
     onDownloadAllCovers?: () => void;
+    onUpdateAllMetadata?: () => void;
     onDownloadAll: () => void;
     onDownloadSelected: () => void;
     onStopDownload: () => void;
@@ -66,7 +68,7 @@ interface AlbumInfoProps {
     onTrackClick?: (track: TrackMetadata) => void;
     onBack?: () => void;
 }
-export function AlbumInfo({ albumInfo, trackList, searchQuery, sortBy, selectedTracks, downloadedTracks, failedTracks, skippedTracks, downloadingTrack, isDownloading, bulkDownloadType, downloadProgress, currentDownloadInfo, downloadingLyricsTrack, downloadedLyrics, failedLyrics, skippedLyrics, downloadedCovers, failedCovers, skippedCovers, downloadingCoverTrack, isBulkDownloadingCovers, isBulkDownloadingLyrics, currentPage, itemsPerPage, onSearchChange, onSortChange, onToggleTrack, onToggleSelectAll, onDownloadTrack, onDownloadLyrics, onDownloadCover, onDownloadAllLyrics, onDownloadAllCovers, onDownloadAll, onDownloadSelected, onStopDownload, onOpenFolder, onPageChange, onArtistClick, onTrackClick, onBack, }: AlbumInfoProps) {
+export function AlbumInfo({ albumInfo, trackList, searchQuery, sortBy, selectedTracks, downloadedTracks, failedTracks, skippedTracks, downloadingTrack, isDownloading, bulkDownloadType, downloadProgress, currentDownloadInfo, downloadingLyricsTrack, downloadedLyrics, failedLyrics, skippedLyrics, downloadedCovers, failedCovers, skippedCovers, downloadingCoverTrack, isBulkDownloadingCovers, isBulkDownloadingLyrics, isBulkUpdatingMetadata, currentPage, itemsPerPage, onSearchChange, onSortChange, onToggleTrack, onToggleSelectAll, onDownloadTrack, onDownloadLyrics, onDownloadCover, onDownloadAllLyrics, onDownloadAllCovers, onUpdateAllMetadata, onDownloadAll, onDownloadSelected, onStopDownload, onOpenFolder, onPageChange, onArtistClick, onTrackClick, onBack, }: AlbumInfoProps) {
     const resolvedAlbumArtist = (() => {
         if (albumInfo.artist_id && albumInfo.artist_url) {
             return {
@@ -156,6 +158,16 @@ export function AlbumInfo({ albumInfo, trackList, searchQuery, sortBy, selectedT
                     </TooltipTrigger>
                     <TooltipContent>
                       <p>Download All Covers</p>
+                    </TooltipContent>
+                  </Tooltip>)}
+                {onUpdateAllMetadata && (<Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button onClick={onUpdateAllMetadata} variant="outline" disabled={isBulkUpdatingMetadata || isDownloading}>
+                        {isBulkUpdatingMetadata ? <Spinner /> : <RefreshCw className="h-4 w-4"/>}
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      <p>Update All Metadata</p>
                     </TooltipContent>
                   </Tooltip>)}
                 {downloadedTracks.size > 0 && (<Button onClick={onOpenFolder} variant="outline">
