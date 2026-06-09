@@ -2,40 +2,59 @@ package backend
 
 import (
 	"fmt"
-	"os/exec"
 	"runtime"
 	"strings"
-	"syscall"
+
+	"golang.org/x/sys/windows/registry"
 )
 
 func GetOSInfo() (string, error) {
 	arch := runtime.GOARCH
 
-	cmd := exec.Command("wmic", "os", "get", "Caption,Version", "/value")
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	out, err := cmd.Output()
+	key, err := registry.OpenKey(
+		registry.LOCAL_MACHINE,
+		`SOFTWARE\Microsoft\Windows NT\CurrentVersion`,
+		registry.QUERY_VALUE,
+	)
 	if err != nil {
-		cmdVer := exec.Command("cmd", "/c", "ver")
-		cmdVer.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-		outVer, errVer := cmdVer.Output()
-		if errVer != nil {
-			return fmt.Sprintf("Windows %s", arch), nil
-		}
-		return strings.TrimSpace(string(outVer)), nil
+		return fmt.Sprintf("Windows %s", arch), nil
+	}
+	defer key.Close()
+
+	productName := readRegistryString(key, "ProductName")
+	if productName == "" {
+		productName = "Windows"
 	}
 
-	lines := strings.Split(string(out), "\n")
-	var caption, version string
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "Caption=") {
-			caption = strings.TrimPrefix(line, "Caption=")
-		} else if strings.HasPrefix(line, "Version=") {
-			version = strings.TrimPrefix(line, "Version=")
-		}
+	version := readWindowsVersion(key)
+	build := readRegistryString(key, "CurrentBuildNumber")
+	if version != "" && build != "" {
+		return fmt.Sprintf("%s (%s.%s, %s)", productName, version, build, arch), nil
 	}
-	if caption != "" && version != "" {
-		return fmt.Sprintf("%s (%s, %s)", caption, version, arch), nil
+	if build != "" {
+		return fmt.Sprintf("%s (build %s, %s)", productName, build, arch), nil
 	}
-	return strings.TrimSpace(string(out)), nil
+	return fmt.Sprintf("%s (%s)", productName, arch), nil
+}
+
+func readRegistryString(key registry.Key, name string) string {
+	value, _, err := key.GetStringValue(name)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(value)
+}
+
+func readWindowsVersion(key registry.Key) string {
+	major, _, majorErr := key.GetIntegerValue("CurrentMajorVersionNumber")
+	minor, _, minorErr := key.GetIntegerValue("CurrentMinorVersionNumber")
+	if majorErr == nil && minorErr == nil {
+		return fmt.Sprintf("%d.%d", major, minor)
+	}
+
+	version := readRegistryString(key, "CurrentVersion")
+	if version != "" {
+		return version
+	}
+	return ""
 }

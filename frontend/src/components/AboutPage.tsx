@@ -8,7 +8,7 @@ import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
-import { Bug, Lightbulb, ExternalLink, CircleHelp, Github } from "lucide-react";
+import { Bug, Lightbulb, ExternalLink, CircleHelp, Github, Users } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 
 interface AboutPageProps {
@@ -173,6 +173,10 @@ ${contextContent}`;
                 <CircleHelp className="h-4 w-4"/>
                 FAQ
             </Button>
+            <Button variant={activeTab === "authors" ? "default" : "ghost"} size="sm" onClick={() => setActiveTab("authors")} className="rounded-b-none">
+                <Users className="h-4 w-4"/>
+                Authors
+            </Button>
         </div>
 
         <div className={`flex-1 min-h-0 ${activeTab === "faq" ? "overflow-hidden" : ""}`}>
@@ -253,25 +257,32 @@ ${contextContent}`;
                                     <h3 className="font-medium text-base text-foreground/90">{faq.q}</h3>
                                     <p className="text-sm text-muted-foreground leading-relaxed">{faq.a}</p>
                                 </div>))}
-                                <div className="border-t pt-6 space-y-3">
-                                    <h3 className="font-medium text-base text-foreground/90">Authors</h3>
-                                    <div className="grid gap-3 sm:grid-cols-2">
-                                        {authors.map(author => (<button key={author.url} type="button" onClick={() => openExternal(author.url)} className="flex items-center justify-between gap-3 rounded-md border bg-background px-4 py-3 text-left transition-colors hover:bg-muted/50 hover:border-primary/50">
-                                            <span className="flex min-w-0 items-center gap-3">
-                                                <Github className="h-5 w-5 shrink-0"/>
-                                                <span className="min-w-0">
-                                                    <span className="block truncate font-medium">{author.name}</span>
-                                                    <span className="block truncate text-sm text-muted-foreground">{author.role}</span>
-                                                </span>
-                                            </span>
-                                            <ExternalLink className="h-4 w-4 shrink-0 text-muted-foreground"/>
-                                        </button>))}
-                                    </div>
-                                </div>
                             </CardContent>
                         </Card>
                     </div>
                 </ScrollArea>)}
+
+            {activeTab === "authors" && (<div className="p-1 pr-2">
+                    <Card>
+                        <CardHeader>
+                            <CardTitle>Authors</CardTitle>
+                        </CardHeader>
+                        <CardContent>
+                            <div className="grid gap-3 sm:grid-cols-2">
+                                {authors.map(author => (<button key={author.url} type="button" onClick={() => openExternal(author.url)} className="flex items-center justify-between gap-3 rounded-md border bg-background px-4 py-3 text-left transition-colors hover:bg-muted/50 hover:border-primary/50">
+                                    <span className="flex min-w-0 items-center gap-3">
+                                        <Github className="h-5 w-5 shrink-0"/>
+                                        <span className="min-w-0">
+                                            <span className="block truncate font-medium">{author.name}</span>
+                                            <span className="block truncate text-sm text-muted-foreground">{author.role}</span>
+                                        </span>
+                                    </span>
+                                    <ExternalLink className="h-4 w-4 shrink-0 text-muted-foreground"/>
+                                </button>))}
+                            </div>
+                        </CardContent>
+                    </Card>
+                </div>)}
         </div>
     </div>);
 }
