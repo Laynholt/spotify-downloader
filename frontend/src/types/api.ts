@@ -123,6 +123,7 @@ export interface DownloadRequest {
     spotify_total_discs?: number;
     copyright?: string;
     publisher?: string;
+    duration?: number;
     output_dir?: string;
     audio_format?: string;
     filename_format?: string;
