@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -69,5 +70,36 @@ func TestStartLyricsFetchDisabledClosesChannel(t *testing.T) {
 		}
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("timed out waiting for closed lyrics channel")
+	}
+}
+
+func TestBuildDownloadValidationResultMarksSuspiciousDelta(t *testing.T) {
+	got := buildDownloadValidationResult(180000, 184.25, nil)
+
+	if !got.Suspicious {
+		t.Fatalf("expected suspicious result for >3s delta: %#v", got)
+	}
+	if got.ExpectedDurationSeconds != 180 {
+		t.Fatalf("expected duration = %v, want 180", got.ExpectedDurationSeconds)
+	}
+	if got.ActualDurationSeconds != 184.25 {
+		t.Fatalf("actual duration = %v, want 184.25", got.ActualDurationSeconds)
+	}
+	if got.DurationDeltaSeconds != 4.25 {
+		t.Fatalf("delta = %v, want 4.25", got.DurationDeltaSeconds)
+	}
+}
+
+func TestBuildDownloadValidationResultKeepsProbeFailureAsWarning(t *testing.T) {
+	got := buildDownloadValidationResult(180000, 0, errors.New("ffprobe failed"))
+
+	if got.Suspicious {
+		t.Fatalf("probe failure should not be suspicious: %#v", got)
+	}
+	if got.ExpectedDurationSeconds != 180 {
+		t.Fatalf("expected duration = %v, want 180", got.ExpectedDurationSeconds)
+	}
+	if got.ValidationWarning == "" {
+		t.Fatalf("expected validation warning")
 	}
 }

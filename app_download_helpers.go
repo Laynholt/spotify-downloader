@@ -221,3 +221,33 @@ func addHistoryItemAsync(req DownloadRequest, filename string) {
 		}
 	}()
 }
+
+func validateDownloadedFileDuration(filename string, expectedDurationMs int) DownloadResponse {
+	if expectedDurationMs <= 0 || filename == "" {
+		return DownloadResponse{}
+	}
+
+	actualSeconds, err := backend.GetAudioDuration(filename)
+	return buildDownloadValidationResult(expectedDurationMs, actualSeconds, err)
+}
+
+func buildDownloadValidationResult(expectedDurationMs int, actualSeconds float64, probeErr error) DownloadResponse {
+	if expectedDurationMs <= 0 {
+		return DownloadResponse{}
+	}
+
+	expectedSeconds := float64(expectedDurationMs) / 1000.0
+	result := DownloadResponse{
+		ExpectedDurationSeconds: expectedSeconds,
+	}
+
+	if probeErr != nil {
+		result.ValidationWarning = fmt.Sprintf("failed to probe audio duration: %v", probeErr)
+		return result
+	}
+
+	result.ActualDurationSeconds = actualSeconds
+	result.DurationDeltaSeconds = actualSeconds - expectedSeconds
+	result.Suspicious = backend.IsSuspiciousDuration(expectedSeconds, actualSeconds)
+	return result
+}

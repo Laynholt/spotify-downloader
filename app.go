@@ -130,12 +130,17 @@ type DownloadRequest struct {
 }
 
 type DownloadResponse struct {
-	Success       bool   `json:"success"`
-	Message       string `json:"message"`
-	File          string `json:"file,omitempty"`
-	Error         string `json:"error,omitempty"`
-	AlreadyExists bool   `json:"already_exists,omitempty"`
-	ItemID        string `json:"item_id,omitempty"`
+	Success                 bool    `json:"success"`
+	Message                 string  `json:"message"`
+	File                    string  `json:"file,omitempty"`
+	Error                   string  `json:"error,omitempty"`
+	AlreadyExists           bool    `json:"already_exists,omitempty"`
+	ItemID                  string  `json:"item_id,omitempty"`
+	ExpectedDurationSeconds float64 `json:"expected_duration_seconds,omitempty"`
+	ActualDurationSeconds   float64 `json:"actual_duration_seconds,omitempty"`
+	DurationDeltaSeconds    float64 `json:"duration_delta_seconds,omitempty"`
+	Suspicious              bool    `json:"suspicious,omitempty"`
+	ValidationWarning       string  `json:"validation_warning,omitempty"`
 }
 
 func (a *App) GetSpotifyMetadata(req SpotifyMetadataRequest) (string, error) {
@@ -276,12 +281,22 @@ func (a *App) DownloadTrack(req DownloadRequest) (DownloadResponse, error) {
 		addHistoryItemAsync(req, filename)
 	}
 
+	validation := DownloadResponse{}
+	if !alreadyExists {
+		validation = validateDownloadedFileDuration(filename, req.Duration)
+	}
+
 	return DownloadResponse{
-		Success:       true,
-		Message:       message,
-		File:          filename,
-		AlreadyExists: alreadyExists,
-		ItemID:        itemID,
+		Success:                 true,
+		Message:                 message,
+		File:                    filename,
+		AlreadyExists:           alreadyExists,
+		ItemID:                  itemID,
+		ExpectedDurationSeconds: validation.ExpectedDurationSeconds,
+		ActualDurationSeconds:   validation.ActualDurationSeconds,
+		DurationDeltaSeconds:    validation.DurationDeltaSeconds,
+		Suspicious:              validation.Suspicious,
+		ValidationWarning:       validation.ValidationWarning,
 	}, nil
 }
 

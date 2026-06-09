@@ -144,6 +144,11 @@ export interface DownloadResponse {
     error?: string;
     already_exists?: boolean;
     item_id?: string;
+    expected_duration_seconds?: number;
+    actual_duration_seconds?: number;
+    duration_delta_seconds?: number;
+    suspicious?: boolean;
+    validation_warning?: string;
 }
 export interface HealthResponse {
     status: string;
