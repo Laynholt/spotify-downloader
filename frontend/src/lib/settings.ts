@@ -30,6 +30,7 @@ export interface Settings {
     useFirstArtistOnly: boolean;
     useSingleGenre: boolean;
     embedGenre: boolean;
+    updateMetadataForExistingFiles: boolean;
 }
 export const FOLDER_PRESETS: Record<FolderPreset, {
     label: string;
@@ -109,7 +110,8 @@ export const DEFAULT_SETTINGS: Settings = {
     createM3u8File: false,
     useFirstArtistOnly: false,
     useSingleGenre: false,
-    embedGenre: true
+    embedGenre: true,
+    updateMetadataForExistingFiles: false
 };
 export const FONT_OPTIONS: {
     value: FontFamily;
@@ -222,6 +224,9 @@ function normalizeSettingsData(source: LegacySettings | null | undefined): Setti
     }
     if (!("embedGenre" in parsed)) {
         parsed.embedGenre = true;
+    }
+    if (!("updateMetadataForExistingFiles" in parsed)) {
+        parsed.updateMetadataForExistingFiles = false;
     }
     if (!parsed.tokenTimeout || parsed.tokenTimeout < 15) {
         parsed.tokenTimeout = 15;

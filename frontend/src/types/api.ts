@@ -266,3 +266,72 @@ export interface AudioMetadata {
     disc_number: number;
     year: string;
 }
+
+export interface TrackMetadataUpdateRequest {
+    file_path: string;
+    track_id?: string;
+    track_name?: string;
+    artist_name?: string;
+    album_name?: string;
+    album_artist?: string;
+    release_date?: string;
+    cover_url?: string;
+    track_number?: number;
+    total_tracks?: number;
+    disc_number?: number;
+    total_discs?: number;
+    copyright?: string;
+    publisher?: string;
+    isrc?: string;
+    genre?: string;
+    duration?: number;
+    embed_lyrics?: boolean;
+    embed_max_quality_cover?: boolean;
+    use_single_genre?: boolean;
+    embed_genre?: boolean;
+}
+
+export interface TrackMetadataUpdateResult {
+    success: boolean;
+    message: string;
+    file_path?: string;
+    error?: string;
+    track_id?: string;
+    expected_duration_seconds?: number;
+    actual_duration_seconds?: number;
+    duration_delta_seconds?: number;
+    suspicious?: boolean;
+    validation_warning?: string;
+}
+
+export interface SuspiciousRedownloadRequest {
+    original_file_path: string;
+    collection_dir?: string;
+    audio_format?: string;
+    metadata: TrackMetadataUpdateRequest;
+}
+
+export interface SuspiciousRedownloadResult {
+    success: boolean;
+    status: string;
+    track_id?: string;
+    original_file_path?: string;
+    moved_original_path?: string;
+    replacement_path?: string;
+    error?: string;
+    expected_duration_seconds?: number;
+    actual_duration_seconds?: number;
+    duration_delta_seconds?: number;
+    suspicious?: boolean;
+    validation_warning?: string;
+}
+
+export interface YtDlpStatus {
+    installed: boolean;
+    path?: string;
+    version?: string;
+    latest?: string;
+    updated?: boolean;
+    warning?: string;
+    error?: string;
+}

@@ -242,6 +242,10 @@ export function SettingsPage({ onUnsavedChangesChange, onResetRequest }: Setting
                         <Switch id="embed-genre" checked={tempSettings.embedGenre} onCheckedChange={(checked) => setTempSettings(prev => ({ ...prev, embedGenre: checked }))}/>
                         <Label htmlFor="embed-genre" className="cursor-pointer text-sm font-normal">Embed Genre</Label>
                       </div>
+                      <div className="flex items-center gap-3">
+                        <Switch id="update-metadata-existing" checked={tempSettings.updateMetadataForExistingFiles} onCheckedChange={(checked) => setTempSettings(prev => ({ ...prev, updateMetadataForExistingFiles: checked }))}/>
+                        <Label htmlFor="update-metadata-existing" className="cursor-pointer text-sm font-normal">Update Existing Metadata</Label>
+                      </div>
                       {tempSettings.embedGenre && (<div className="flex items-center gap-3">
                           <Switch id="use-single-genre" checked={tempSettings.useSingleGenre} onCheckedChange={(checked) => setTempSettings(prev => ({ ...prev, useSingleGenre: checked }))}/>
                           <Label htmlFor="use-single-genre" className="cursor-pointer text-sm font-normal">Use Single Genre</Label>
