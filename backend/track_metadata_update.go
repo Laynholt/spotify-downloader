@@ -44,6 +44,28 @@ type TrackMetadataUpdateResult struct {
 	ValidationWarning       string  `json:"validation_warning,omitempty"`
 }
 
+type SuspiciousRedownloadRequest struct {
+	OriginalFilePath string                     `json:"original_file_path"`
+	CollectionDir    string                     `json:"collection_dir,omitempty"`
+	AudioFormat      string                     `json:"audio_format,omitempty"`
+	Metadata         TrackMetadataUpdateRequest `json:"metadata"`
+}
+
+type SuspiciousRedownloadResult struct {
+	Success                 bool    `json:"success"`
+	Status                  string  `json:"status"`
+	TrackID                 string  `json:"track_id,omitempty"`
+	OriginalFilePath        string  `json:"original_file_path,omitempty"`
+	MovedOriginalPath       string  `json:"moved_original_path,omitempty"`
+	ReplacementPath         string  `json:"replacement_path,omitempty"`
+	Error                   string  `json:"error,omitempty"`
+	ExpectedDurationSeconds float64 `json:"expected_duration_seconds,omitempty"`
+	ActualDurationSeconds   float64 `json:"actual_duration_seconds,omitempty"`
+	DurationDeltaSeconds    float64 `json:"duration_delta_seconds,omitempty"`
+	Suspicious              bool    `json:"suspicious,omitempty"`
+	ValidationWarning       string  `json:"validation_warning,omitempty"`
+}
+
 func BuildTrackMetadataPayload(req TrackMetadataUpdateRequest) Metadata {
 	metadata := Metadata{
 		Title:       strings.TrimSpace(req.TrackName),
@@ -67,6 +89,10 @@ func BuildTrackMetadataPayload(req TrackMetadataUpdateRequest) Metadata {
 	}
 
 	return metadata
+}
+
+func BuildYtDlpSearchQuery(artistName, trackName string) string {
+	return fmt.Sprintf("ytsearch1:%s - %s audio", strings.TrimSpace(artistName), strings.TrimSpace(trackName))
 }
 
 func UpdateTrackMetadata(req TrackMetadataUpdateRequest) TrackMetadataUpdateResult {
@@ -145,6 +171,79 @@ func UpdateTracksMetadata(reqs []TrackMetadataUpdateRequest) []TrackMetadataUpda
 	results := make([]TrackMetadataUpdateResult, len(reqs))
 	for i, req := range reqs {
 		results[i] = UpdateTrackMetadata(req)
+	}
+	return results
+}
+
+func RedownloadSuspiciousTrackFromYouTube(req SuspiciousRedownloadRequest) SuspiciousRedownloadResult {
+	result := SuspiciousRedownloadResult{
+		TrackID:          req.Metadata.TrackID,
+		OriginalFilePath: req.OriginalFilePath,
+	}
+
+	originalPath := strings.TrimSpace(req.OriginalFilePath)
+	if originalPath == "" {
+		result.Status = "failed"
+		result.Error = "original file path is required"
+		return result
+	}
+
+	collectionDir := strings.TrimSpace(req.CollectionDir)
+	if collectionDir == "" {
+		collectionDir = filepath.Dir(originalPath)
+	}
+	suspiciousDir := filepath.Join(collectionDir, "Suspicious")
+
+	movedPath, err := MoveSuspiciousOriginal(originalPath, suspiciousDir)
+	if err != nil {
+		result.Status = "failed"
+		result.Error = fmt.Sprintf("failed to move suspicious original: %v", err)
+		return result
+	}
+	result.MovedOriginalPath = movedPath
+
+	outputBase := strings.TrimSuffix(originalPath, filepath.Ext(originalPath))
+	query := BuildYtDlpSearchQuery(req.Metadata.ArtistName, req.Metadata.TrackName)
+	downloadResult := DownloadWithYtDlp(YtDlpDownloadRequest{
+		Query:        query,
+		OutputBase:  outputBase,
+		AudioFormat: req.AudioFormat,
+	})
+	if !downloadResult.Success {
+		result.Status = "failed"
+		result.Error = downloadResult.Error
+		return result
+	}
+
+	metadataReq := req.Metadata
+	metadataReq.FilePath = downloadResult.File
+	updateResult := UpdateTrackMetadata(metadataReq)
+	result.ReplacementPath = downloadResult.File
+	result.ExpectedDurationSeconds = updateResult.ExpectedDurationSeconds
+	result.ActualDurationSeconds = updateResult.ActualDurationSeconds
+	result.DurationDeltaSeconds = updateResult.DurationDeltaSeconds
+	result.ValidationWarning = updateResult.ValidationWarning
+	result.Suspicious = updateResult.Suspicious
+
+	if !updateResult.Success {
+		result.Status = "failed"
+		result.Error = updateResult.Error
+		return result
+	}
+
+	result.Success = true
+	if updateResult.Suspicious {
+		result.Status = "still_suspicious"
+	} else {
+		result.Status = "replaced"
+	}
+	return result
+}
+
+func RedownloadSuspiciousTracksFromYouTube(reqs []SuspiciousRedownloadRequest) []SuspiciousRedownloadResult {
+	results := make([]SuspiciousRedownloadResult, len(reqs))
+	for i, req := range reqs {
+		results[i] = RedownloadSuspiciousTrackFromYouTube(req)
 	}
 	return results
 }

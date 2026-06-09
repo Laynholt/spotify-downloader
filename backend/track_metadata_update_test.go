@@ -35,3 +35,11 @@ func TestBuildTrackMetadataPayloadMapsRequestFields(t *testing.T) {
 		t.Fatalf("extended metadata mismatch: %#v", got)
 	}
 }
+
+func TestBuildYtDlpSearchQueryUsesArtistAndTitle(t *testing.T) {
+	got := BuildYtDlpSearchQuery("Artist", "Song")
+	want := "ytsearch1:Artist - Song audio"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
