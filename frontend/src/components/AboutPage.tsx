@@ -82,7 +82,7 @@ export function AboutPage({ version }: AboutPageProps) {
         },
         {
             q: "Why does metadata fetching sometimes fail?",
-            a: "This usually happens because your IP address has been rate-limited. You can wait and try again later, or use a VPN to bypass the rate limit."
+            a: "This usually happens because your IP address has been rate-limited. You can wait and try again later, or try again from another network."
         },
         {
             q: "Why does Windows Defender or antivirus flag or delete the file?",
@@ -90,7 +90,7 @@ export function AboutPage({ version }: AboutPageProps) {
         },
         {
             q: "Why does the app sometimes fail to obtain a token?",
-            a: "The target website uses Cloudflare protection. The app attempts to bypass it using ChromeDriver, which may require multiple retries."
+            a: "The target website uses Cloudflare protection. The app opens the target website in an installed Chromium browser to request a session token. If the target website blocks session creation, wait and try again later."
         },
         {
             q: "Why do I get a 500 error when a download fails?",

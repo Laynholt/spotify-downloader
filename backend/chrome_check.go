@@ -124,11 +124,11 @@ func isChromeInstalledLinux() (bool, string, error) {
 func GetChromeInstallationMessage() string {
 	switch runtime.GOOS {
 	case "windows":
-		return "Chrome or Microsoft Edge is required but not found. Please install Google Chrome from https://www.google.com/chrome/ or Microsoft Edge from https://www.microsoft.com/edge/\n\nChromeDriver will be automatically managed."
+		return "Chrome or Microsoft Edge is required but not found. Please install Google Chrome from https://www.google.com/chrome/ or Microsoft Edge from https://www.microsoft.com/edge/"
 	case "darwin":
-		return "ChromeDriver is required for token fetching. Please install:\n\nbrew install --cask chromedriver\n\nAfter installation, you may need to allow ChromeDriver in System Preferences > Security & Privacy."
+		return "Chrome is required for token fetching. Please install Google Chrome from https://www.google.com/chrome/"
 	case "linux":
-		return "Chrome or Chromium is required but not found. Please install:\n\nUbuntu/Debian:\nsudo apt install chromium-browser chromium-chromedriver\n\nArch Linux:\nsudo pacman -S chromium\n\nFedora:\nsudo dnf install chromium chromedriver"
+		return "Chrome or Chromium is required but not found. Please install:\n\nUbuntu/Debian:\nsudo apt install chromium-browser\n\nArch Linux:\nsudo pacman -S chromium\n\nFedora:\nsudo dnf install chromium"
 	default:
 		return "Chrome browser is required but not found. Please install Google Chrome from https://www.google.com/chrome/"
 	}

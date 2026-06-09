@@ -6,25 +6,11 @@ Get Spotify tracks in MP3 and FLAC via spotidownloader.com
 ![macOS](https://img.shields.io/badge/macOS-10.13%2B-000000?style=for-the-badge&logo=apple&logoColor=white)
 ![Linux](https://img.shields.io/badge/Linux-Any-FCC624?style=for-the-badge&logo=linux&logoColor=white)
 
-### [Download](https://github.com/afkarxyz/SpotiDownloader/releases)
+### [Download](https://github.com/Laynholt/spotify-downloader/releases)
 
 ## Screenshot
 
 ![Image](https://github.com/user-attachments/assets/0559e531-4daf-46d1-82c7-3938cba5e94a)
-
-## Other projects
-
-### [SpotiFLAC](https://github.com/afkarxyz/SpotiFLAC)
-
-Get Spotify tracks in true FLAC from Tidal, Qobuz, Amazon Music & Deezer — no account required.
-
-### [SpotiFLAC Next](https://github.com/spotiverse/SpotiFLAC-Next)
-
-Get Spotify tracks in Hi-Res lossless FLACs — no account required.
-
-### [SpotubeDL](https://spotubedl.com)
-
-Download Spotify Tracks, Albums, Playlists as MP3/OGG/Opus with High Quality.
 
 ## FAQ
 
@@ -47,7 +33,7 @@ _The audio is fetched using third-party APIs._
 ### Why does metadata fetching sometimes fail?
 
 _This usually happens because your IP address has been rate-limited.
-You can wait and try again later, or use a VPN to bypass the rate limit._
+You can wait and try again later, or try again from another network._
 
 ### Why does Windows Defender or antivirus flag or delete the file?
 
@@ -59,20 +45,18 @@ _If you are concerned, you can fork the repository and build the software yourse
 ### Why does the app sometimes fail to obtain a token?
 
 _The target website uses Cloudflare protection.
-The app attempts to bypass it using ChromeDriver, which may require multiple retries._
+The app opens the target website in an installed Chromium browser to request a session token.
+If the target website blocks session creation, wait and try again later._
 
 ### Why do I get a 500 error when a download fails?
 
 _A 500 error indicates a server-side issue.
 This is outside of my control._
 
-### Want to support the project?
+## Authors
 
-_If this software is useful and brings you value,
-consider supporting the project by buying me a coffee.
-Your support helps keep development going._
-
-[![Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/afkarxyz)
+- [Laynholt](https://github.com/Laynholt) - current maintainer.
+- [afkarxyz](https://github.com/afkarxyz/) - original project author.
 
 ## Disclaimer
 
