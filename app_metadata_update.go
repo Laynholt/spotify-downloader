@@ -9,3 +9,11 @@ func (a *App) UpdateTrackMetadata(req backend.TrackMetadataUpdateRequest) (backe
 func (a *App) UpdateTracksMetadata(reqs []backend.TrackMetadataUpdateRequest) ([]backend.TrackMetadataUpdateResult, error) {
 	return backend.UpdateTracksMetadata(reqs), nil
 }
+
+func (a *App) CheckYtDlpInstalled() (backend.YtDlpStatus, error) {
+	return backend.CheckYtDlpInstalled()
+}
+
+func (a *App) EnsureYtDlpInstalledOrUpdated() (backend.YtDlpStatus, error) {
+	return backend.EnsureYtDlpInstalledOrUpdated()
+}
