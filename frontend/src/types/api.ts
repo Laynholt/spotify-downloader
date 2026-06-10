@@ -190,6 +190,16 @@ export interface SpectrumData {
     duration: number;
     max_freq: number;
 }
+export interface QualityAssessment {
+    format: string;
+    declared_bitrate_kbps?: number;
+    estimated_bitrate_kbps?: number;
+    cutoff_frequency_hz?: number;
+    confidence: number;
+    verdict_code: "likely_genuine" | "suspicious" | "inconclusive" | "spectrum_limited" | "lossless_container" | string;
+    verdict: string;
+    details: string;
+}
 export interface AnalysisResult {
     file_path: string;
     file_size: number;
@@ -198,11 +208,13 @@ export interface AnalysisResult {
     bits_per_sample: number;
     total_samples: number;
     duration: number;
+    bit_rate: number;
     bit_depth: string;
     dynamic_range: number;
     peak_amplitude: number;
     rms_level: number;
     spectrum?: SpectrumData;
+    quality?: QualityAssessment;
 }
 export interface CoverDownloadRequest {
     cover_url: string;

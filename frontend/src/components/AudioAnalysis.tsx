@@ -1,7 +1,8 @@
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { Spinner } from "@/components/ui/spinner";
 import { Button } from "@/components/ui/button";
-import { Activity, Waves, Radio, TrendingUp, FileAudio, Clock, Gauge, HardDrive } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import { Activity, Waves, Radio, TrendingUp, FileAudio, Clock, Gauge, HardDrive, ShieldCheck, AlertTriangle, HelpCircle } from "lucide-react";
 import type { AnalysisResult } from "@/types/api";
 interface AudioAnalysisProps {
     result: AnalysisResult | null;
@@ -48,6 +49,11 @@ export function AudioAnalysis({ result, analyzing, onAnalyze, showAnalyzeButton 
         return `${mins}:${secs.toString().padStart(2, '0')}`;
     };
     const formatNumber = (num: number) => num.toFixed(2);
+    const formatBitrate = (bitsPerSecond?: number): string => {
+        if (!bitsPerSecond || bitsPerSecond <= 0)
+            return "Unknown";
+        return `${Math.round(bitsPerSecond / 1000)} kbps`;
+    };
     const formatFileSize = (bytes: number): string => {
         if (bytes === 0)
             return "0 B";
@@ -56,10 +62,45 @@ export function AudioAnalysis({ result, analyzing, onAnalyze, showAnalyzeButton 
         const i = Math.floor(Math.log(bytes) / Math.log(k));
         return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
     };
+    const getQualityIcon = () => {
+        switch (result.quality?.verdict_code) {
+            case "likely_genuine":
+            case "lossless_container":
+                return <ShieldCheck className="h-3.5 w-3.5"/>;
+            case "suspicious":
+            case "spectrum_limited":
+                return <AlertTriangle className="h-3.5 w-3.5"/>;
+            default:
+                return <HelpCircle className="h-3.5 w-3.5"/>;
+        }
+    };
+    const getQualityClassName = () => {
+        switch (result.quality?.verdict_code) {
+            case "likely_genuine":
+            case "lossless_container":
+                return "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300";
+            case "suspicious":
+            case "spectrum_limited":
+                return "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300";
+            default:
+                return "border-muted-foreground/30 bg-muted text-muted-foreground";
+        }
+    };
     const nyquistFreq = result.sample_rate / 2;
     return (<Card className="gap-2">
       <CardHeader>
-        {filePath && (<p className="text-sm font-mono break-all">{filePath}</p>)}
+        <div className="flex flex-col gap-2">
+          {filePath && (<p className="text-sm font-mono break-all">{filePath}</p>)}
+          {result.quality && (<div className="flex flex-wrap items-center gap-2">
+              <Badge variant="outline" className={getQualityClassName()}>
+                {getQualityIcon()}
+                {result.quality.verdict}
+              </Badge>
+              <span className="text-xs text-muted-foreground">
+                Confidence {Math.round(result.quality.confidence * 100)}%
+              </span>
+            </div>)}
+        </div>
       </CardHeader>
 
       <CardContent className="space-y-2">
@@ -90,12 +131,32 @@ export function AudioAnalysis({ result, analyzing, onAnalyze, showAnalyzeButton 
             <span className="text-muted-foreground">Nyquist:</span>
             <span className="font-semibold">{(nyquistFreq / 1000).toFixed(1)} kHz</span>
           </div>
+          <div className="flex items-center gap-1">
+            <span className="text-muted-foreground">Declared Bitrate:</span>
+            <span className="font-semibold">{formatBitrate(result.bit_rate)}</span>
+          </div>
           {result.file_size > 0 && (<div className="flex items-center gap-1">
               <HardDrive className="h-3 w-3 text-muted-foreground"/>
               <span className="text-muted-foreground">Size:</span>
               <span className="font-semibold">{formatFileSize(result.file_size)}</span>
             </div>)}
         </div>
+
+        {result.quality && (<div className="grid gap-2 rounded-md border bg-muted/30 p-3 text-xs sm:grid-cols-3">
+          <div>
+            <p className="text-muted-foreground">Estimated Source Tier</p>
+            <p className="font-semibold">{result.quality.estimated_bitrate_kbps ? `${result.quality.estimated_bitrate_kbps} kbps` : "Unknown"}</p>
+          </div>
+          <div>
+            <p className="text-muted-foreground">High-Frequency Cutoff</p>
+            <p className="font-semibold">{result.quality.cutoff_frequency_hz ? `${(result.quality.cutoff_frequency_hz / 1000).toFixed(1)} kHz` : "Unknown"}</p>
+          </div>
+          <div>
+            <p className="text-muted-foreground">Format</p>
+            <p className="font-semibold uppercase">{result.quality.format || "Unknown"}</p>
+          </div>
+          <p className="text-muted-foreground sm:col-span-3">{result.quality.details}</p>
+        </div>)}
 
         
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs border-t pt-2">

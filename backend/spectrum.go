@@ -1,11 +1,12 @@
 package backend
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math"
 	"math/cmplx"
-
-	"github.com/mewkiz/flac"
+	"os/exec"
+	"strconv"
 )
 
 type SpectrumData struct {
@@ -22,19 +23,19 @@ type TimeSlice struct {
 }
 
 func AnalyzeSpectrum(filepath string) (*SpectrumData, error) {
-	stream, err := flac.ParseFile(filepath)
+	metadata, err := GetMetadataWithFFprobe(filepath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse FLAC: %w", err)
+		return nil, fmt.Errorf("failed to read metadata for spectrum: %w", err)
 	}
-	defer stream.Close()
 
-	info := stream.Info
-	sampleRate := int(info.SampleRate)
-	channels := int(info.NChannels)
+	sampleRate := int(metadata.SampleRate)
+	if sampleRate <= 0 {
+		sampleRate = 44100
+	}
 
-	samples, err := readSamples(stream, channels)
+	samples, err := decodeMonoPCMWithFFmpeg(filepath, sampleRate)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read samples: %w", err)
+		return nil, err
 	}
 
 	if len(samples) == 0 {
@@ -44,31 +45,49 @@ func AnalyzeSpectrum(filepath string) (*SpectrumData, error) {
 	return calculateSpectrum(samples, sampleRate), nil
 }
 
-func readSamples(stream *flac.Stream, channels int) ([]float64, error) {
-	var allSamples []float64
-	maxSamples := 10 * 1024 * 1024
-
-	for {
-		frame, err := stream.ParseNext()
-		if err != nil {
-			break
-		}
-
-		for i := 0; i < frame.Subframes[0].NSamples; i++ {
-			var sample float64
-			for ch := 0; ch < channels; ch++ {
-				sample += float64(frame.Subframes[ch].Samples[i])
-			}
-			sample /= float64(channels)
-			allSamples = append(allSamples, sample)
-
-			if len(allSamples) >= maxSamples {
-				return allSamples, nil
-			}
-		}
+func decodeMonoPCMWithFFmpeg(filepath string, sampleRate int) ([]float64, error) {
+	ffmpegPath, err := GetFFmpegPath()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get ffmpeg path: %w", err)
 	}
 
-	return allSamples, nil
+	maxSamples := 10 * 1024 * 1024
+	maxSeconds := float64(maxSamples) / float64(sampleRate)
+	args := []string{
+		"-v", "error",
+		"-i", filepath,
+		"-vn",
+		"-map", "0:a:0",
+		"-ac", "1",
+		"-ar", strconv.Itoa(sampleRate),
+		"-t", fmt.Sprintf("%.3f", maxSeconds),
+		"-f", "s16le",
+		"-acodec", "pcm_s16le",
+		"pipe:1",
+	}
+
+	cmd := exec.Command(ffmpegPath, args...)
+	setHideWindow(cmd)
+	output, err := cmd.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("ffmpeg spectrum decode failed: %v - %s", err, string(exitErr.Stderr))
+		}
+		return nil, fmt.Errorf("ffmpeg spectrum decode failed: %w", err)
+	}
+
+	sampleCount := len(output) / 2
+	if sampleCount > maxSamples {
+		sampleCount = maxSamples
+	}
+
+	samples := make([]float64, sampleCount)
+	for i := 0; i < sampleCount; i++ {
+		raw := int16(binary.LittleEndian.Uint16(output[i*2 : i*2+2]))
+		samples[i] = float64(raw) / 32768.0
+	}
+
+	return samples, nil
 }
 
 func calculateSpectrum(samples []float64, sampleRate int) *SpectrumData {
