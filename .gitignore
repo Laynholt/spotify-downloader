@@ -76,3 +76,7 @@ helper/get_token.spec
 # BUILD_NOTES.md
 push.bat
 get_token.spec
+
+# Local agent planning artifacts
+docs/superpowers/
+superpowers/
