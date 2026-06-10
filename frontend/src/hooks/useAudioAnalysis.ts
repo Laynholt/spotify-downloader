@@ -1,150 +1,152 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useMemo } from "react";
 import { AnalyzeTrack } from "../../wailsjs/go/main/App";
 import type { AnalysisResult } from "@/types/api";
 import { logger } from "@/lib/logger";
 import { toastWithSound as toast } from "@/lib/toast-with-sound";
-import { setSpectrumCache, getSpectrumCache, clearSpectrumCache } from "@/lib/spectrum-cache";
-const STORAGE_KEY = "spotidownloader_audio_analysis_state";
+
+export type AudioAnalysisStatus = "pending" | "analyzing" | "success" | "error";
+
+export interface AudioAnalysisItem {
+    path: string;
+    name: string;
+    format: string;
+    status: AudioAnalysisStatus;
+    result?: AnalysisResult;
+    error?: string;
+}
+
+const SUPPORTED_EXTENSIONS = [".mp3", ".flac"];
+
+function getFileName(path: string): string {
+    return path.split(/[/\\]/).pop() || path;
+}
+
+function getExtension(path: string): string {
+    const name = getFileName(path);
+    const index = name.lastIndexOf(".");
+    return index >= 0 ? name.slice(index).toLowerCase() : "";
+}
+
+function createAnalysisItem(path: string): AudioAnalysisItem {
+    const ext = getExtension(path);
+    return {
+        path,
+        name: getFileName(path),
+        format: ext.replace(".", "").toUpperCase(),
+        status: "pending",
+    };
+}
+
 export function useAudioAnalysis() {
+    const [items, setItems] = useState<AudioAnalysisItem[]>([]);
+    const [selectedFilePath, setSelectedFilePath] = useState("");
     const [analyzing, setAnalyzing] = useState(false);
-    const [result, setResult] = useState<AnalysisResult | null>(() => {
-        try {
-            const saved = sessionStorage.getItem(STORAGE_KEY);
-            if (saved) {
-                const parsed = JSON.parse(saved);
-                if (parsed.filePath && parsed.result) {
-                    return {
-                        ...parsed.result,
-                        spectrum: undefined,
-                    };
-                }
-            }
+
+    const selectedItem = useMemo(() => {
+        if (!selectedFilePath) {
+            return items.find((item) => item.status === "success") || items[0] || null;
         }
-        catch (err) {
-            console.error("Failed to load saved analysis state:", err);
-        }
-        return null;
-    });
-    const [selectedFilePath, setSelectedFilePath] = useState<string>(() => {
-        try {
-            const saved = sessionStorage.getItem(STORAGE_KEY);
-            if (saved) {
-                const parsed = JSON.parse(saved);
-                return parsed.filePath || "";
-            }
-        }
-        catch {
-            // Ignore invalid persisted analysis state.
-        }
-        return "";
-    });
-    const [error, setError] = useState<string | null>(null);
-    const [spectrumLoading, setSpectrumLoading] = useState(() => {
-        try {
-            const saved = sessionStorage.getItem(STORAGE_KEY);
-            if (saved) {
-                const parsed = JSON.parse(saved);
-                if (parsed.filePath && parsed.result) {
-                    return true;
-                }
-            }
-        }
-        catch {
-            // Ignore invalid persisted analysis state.
-        }
-        return false;
-    });
-    const analyzeFile = useCallback(async (filePath: string) => {
-        if (!filePath) {
-            setError("No file path provided");
-            return null;
-        }
-        setAnalyzing(true);
-        setError(null);
-        setResult(null);
-        setSelectedFilePath(filePath);
-        try {
-            logger.info(`Analyzing audio file: ${filePath}`);
-            const startTime = Date.now();
-            const response = await AnalyzeTrack(filePath);
-            const analysisResult: AnalysisResult = JSON.parse(response);
-            const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
-            logger.success(`Audio analysis completed in ${elapsed}s`);
-            if (analysisResult.spectrum) {
-                setSpectrumCache(filePath, analysisResult.spectrum);
-            }
-            const detailResult = { ...analysisResult, spectrum: undefined };
-            try {
-                sessionStorage.setItem(STORAGE_KEY, JSON.stringify({
-                    filePath,
-                    result: detailResult,
-                }));
-            }
-            catch (err) {
-                console.error("Failed to save analysis state:", err);
-            }
-            setResult(analysisResult);
-            setSpectrumLoading(false);
-            return analysisResult;
-        }
-        catch (err) {
-            const errorMessage = err instanceof Error ? err.message : "Failed to analyze audio file";
-            logger.error(`Analysis error: ${errorMessage}`);
-            setError(errorMessage);
-            toast.error("Audio Analysis Failed", {
-                description: errorMessage,
+        return items.find((item) => item.path === selectedFilePath) || null;
+    }, [items, selectedFilePath]);
+
+    const selectedResult = selectedItem?.result || null;
+
+    const analyzeFiles = useCallback(async (paths: string[]) => {
+        const validPaths = paths.filter((path) => SUPPORTED_EXTENSIONS.includes(getExtension(path)));
+        const skipped = paths.length - validPaths.length;
+
+        if (skipped > 0) {
+            toast.info("Some files skipped", {
+                description: `${skipped} file(s) were skipped. Supported formats: MP3, FLAC.`,
             });
-            return null;
+        }
+
+        const existing = new Set(items.map((item) => item.path.toLowerCase()));
+        const uniqueNewItems = validPaths
+            .filter((path, index) => validPaths.indexOf(path) === index)
+            .map(createAnalysisItem)
+            .filter((item) => !existing.has(item.path.toLowerCase()));
+
+        if (uniqueNewItems.length === 0) {
+            if (paths.length > 0 && skipped === 0) {
+                toast.info("No new files added", {
+                    description: "All selected files are already in the analyzer list.",
+                });
+            }
+            return;
+        }
+
+        const queuedItems = uniqueNewItems;
+        setItems((prev) => [...prev, ...queuedItems]);
+
+        if (queuedItems.length === 0) {
+            toast.info("No new files added", {
+                description: "All selected files are already in the analyzer list.",
+            });
+            return;
+        }
+
+        if (!selectedFilePath) {
+            setSelectedFilePath(queuedItems[0].path);
+        }
+
+        setAnalyzing(true);
+        try {
+            for (const item of queuedItems) {
+                setItems((prev) => prev.map((current) => current.path === item.path
+                    ? { ...current, status: "analyzing", error: undefined }
+                    : current));
+
+                try {
+                    logger.info(`Analyzing audio file: ${item.path}`);
+                    const startTime = Date.now();
+                    const response = await AnalyzeTrack(item.path);
+                    const result: AnalysisResult = JSON.parse(response);
+                    const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+                    logger.success(`Audio analysis completed in ${elapsed}s`);
+
+                    setItems((prev) => prev.map((current) => current.path === item.path
+                        ? { ...current, status: "success", result, error: undefined }
+                        : current));
+                }
+                catch (err) {
+                    const errorMessage = err instanceof Error ? err.message : "Failed to analyze audio file";
+                    logger.error(`Analysis error: ${errorMessage}`);
+                    setItems((prev) => prev.map((current) => current.path === item.path
+                        ? { ...current, status: "error", error: errorMessage }
+                        : current));
+                }
+            }
         }
         finally {
             setAnalyzing(false);
         }
-    }, []);
+    }, [items, selectedFilePath]);
+
     const clearResult = useCallback(() => {
-        setResult(null);
-        setError(null);
+        setItems([]);
         setSelectedFilePath("");
-        try {
-            sessionStorage.removeItem(STORAGE_KEY);
-        }
-        catch {
-            // Ignore unavailable sessionStorage cleanup.
-        }
-        clearSpectrumCache();
     }, []);
-    useEffect(() => {
-        if (!result || !selectedFilePath || result.spectrum || !spectrumLoading) {
-            return;
-        }
-        let rafId: number;
-        const loadSpectrum = () => {
-            rafId = requestAnimationFrame(() => {
-                const cachedSpectrum = getSpectrumCache(selectedFilePath);
-                if (cachedSpectrum) {
-                    setResult(prev => prev ? { ...prev, spectrum: cachedSpectrum } : null);
-                    setSpectrumLoading(false);
-                }
-                else {
-                    setSpectrumLoading(false);
-                }
-            });
-        };
-        requestAnimationFrame(() => {
-            requestAnimationFrame(loadSpectrum);
-        });
-        return () => {
-            if (rafId) {
-                cancelAnimationFrame(rafId);
-            }
-        };
-    }, [result, selectedFilePath, spectrumLoading]);
+
+    const removeFile = useCallback((path: string) => {
+        setItems((prev) => prev.filter((item) => item.path !== path));
+        setSelectedFilePath((current) => current === path ? "" : current);
+    }, []);
+
+    const selectFile = useCallback((path: string) => {
+        setSelectedFilePath(path);
+    }, []);
+
     return {
         analyzing,
-        result,
-        error,
-        selectedFilePath,
-        spectrumLoading,
-        analyzeFile,
+        items,
+        selectedItem,
+        selectedResult,
+        selectedFilePath: selectedItem?.path || "",
+        spectrumLoading: false,
+        analyzeFiles,
         clearResult,
+        removeFile,
+        selectFile,
     };
 }

@@ -4,25 +4,27 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	pathpkg "path/filepath"
 	"strconv"
 	"strings"
 	"time"
 )
 
 type AnalysisResult struct {
-	FilePath      string        `json:"file_path"`
-	FileSize      int64         `json:"file_size"`
-	SampleRate    uint32        `json:"sample_rate"`
-	Channels      uint8         `json:"channels"`
-	BitsPerSample uint8         `json:"bits_per_sample"`
-	TotalSamples  uint64        `json:"total_samples"`
-	Duration      float64       `json:"duration"`
-	Bitrate       int           `json:"bit_rate"`
-	BitDepth      string        `json:"bit_depth"`
-	DynamicRange  float64       `json:"dynamic_range"`
-	PeakAmplitude float64       `json:"peak_amplitude"`
-	RMSLevel      float64       `json:"rms_level"`
-	Spectrum      *SpectrumData `json:"spectrum,omitempty"`
+	FilePath      string             `json:"file_path"`
+	FileSize      int64              `json:"file_size"`
+	SampleRate    uint32             `json:"sample_rate"`
+	Channels      uint8              `json:"channels"`
+	BitsPerSample uint8              `json:"bits_per_sample"`
+	TotalSamples  uint64             `json:"total_samples"`
+	Duration      float64            `json:"duration"`
+	Bitrate       int                `json:"bit_rate"`
+	BitDepth      string             `json:"bit_depth"`
+	DynamicRange  float64            `json:"dynamic_range"`
+	PeakAmplitude float64            `json:"peak_amplitude"`
+	RMSLevel      float64            `json:"rms_level"`
+	Spectrum      *SpectrumData      `json:"spectrum,omitempty"`
+	Quality       *QualityAssessment `json:"quality,omitempty"`
 }
 
 func AnalyzeTrack(filepath string) (*AnalysisResult, error) {
@@ -30,7 +32,33 @@ func AnalyzeTrack(filepath string) (*AnalysisResult, error) {
 		return nil, fmt.Errorf("file does not exist: %s", filepath)
 	}
 
-	return GetMetadataWithFFprobe(filepath)
+	result, err := GetMetadataWithFFprobe(filepath)
+	if err != nil {
+		return nil, err
+	}
+
+	format := strings.TrimPrefix(strings.ToLower(pathpkg.Ext(filepath)), ".")
+	declaredKbps := 0
+	if result.Bitrate > 0 {
+		declaredKbps = (result.Bitrate + 500) / 1000
+	}
+
+	spectrum, err := AnalyzeSpectrum(filepath)
+	if err != nil {
+		result.Quality = &QualityAssessment{
+			Format:              format,
+			DeclaredBitrateKbps: declaredKbps,
+			Confidence:          0,
+			VerdictCode:         "inconclusive",
+			Verdict:             "Inconclusive",
+			Details:             fmt.Sprintf("Could not decode spectrum for quality estimation: %v", err),
+		}
+		return result, nil
+	}
+
+	result.Spectrum = spectrum
+	result.Quality = assessSpectralQuality(format, declaredKbps, spectrum)
+	return result, nil
 }
 
 func GetTrackMetadata(filepath string) (*AnalysisResult, error) {
