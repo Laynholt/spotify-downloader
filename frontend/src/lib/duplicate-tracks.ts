@@ -61,6 +61,27 @@ function describeDuplicateTrack(entry: DuplicateTrackEntry): string {
     return `#${entry.index}: ${track.name || "Unknown title"} - ${track.artists || "Unknown artist"}${albumInfo}${trackId}`;
 }
 
+export function findDuplicateTrackEntriesByTitle(tracks: TrackMetadata[]): DuplicateTrackEntry[] {
+    const seenTitles = new Set<string>();
+    const duplicates: DuplicateTrackEntry[] = [];
+
+    tracks.forEach((track, index) => {
+        const key = normalizeDuplicateToken(track.name);
+        if (!key) {
+            return;
+        }
+
+        if (seenTitles.has(key)) {
+            duplicates.push({ index: index + 1, track });
+            return;
+        }
+
+        seenTitles.add(key);
+    });
+
+    return duplicates;
+}
+
 export function logDuplicateTracks(logger: DuplicateTrackLogger, tracks: TrackMetadata[], scopeLabel: string) {
     const exactGroups = buildDuplicateTrackGroups(tracks, buildExactDuplicateTrackKey);
     const exactEntrySets = new Set(exactGroups.map((entries) => entries.map((entry) => entry.index).join(",")));

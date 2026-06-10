@@ -125,6 +125,7 @@ export interface DownloadRequest {
     publisher?: string;
     duration?: number;
     output_dir?: string;
+    collection_dir?: string;
     audio_format?: string;
     filename_format?: string;
     track_number?: boolean;
@@ -145,6 +146,8 @@ export interface DownloadResponse {
     error?: string;
     already_exists?: boolean;
     item_id?: string;
+    moved_original_path?: string;
+    replacement_path?: string;
     expected_duration_seconds?: number;
     actual_duration_seconds?: number;
     duration_delta_seconds?: number;
@@ -307,6 +310,7 @@ export interface TrackMetadataUpdateResult {
 
 export interface SuspiciousRedownloadRequest {
     original_file_path: string;
+    replacement_file_path?: string;
     collection_dir?: string;
     audio_format?: string;
     metadata: TrackMetadataUpdateRequest;

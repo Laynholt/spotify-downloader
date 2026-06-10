@@ -251,3 +251,23 @@ func buildDownloadValidationResult(expectedDurationMs int, actualSeconds float64
 	result.Suspicious = backend.IsSuspiciousDuration(expectedSeconds, actualSeconds)
 	return result
 }
+
+func moveSuspiciousDownloadIfNeeded(filename, collectionDir string, validation DownloadResponse) (DownloadResponse, error) {
+	if !validation.Suspicious {
+		return validation, nil
+	}
+
+	if collectionDir == "" {
+		collectionDir = filepath.Dir(filename)
+	}
+
+	movedPath, err := backend.MoveSuspiciousOriginal(filename, filepath.Join(collectionDir, backend.SuspiciousTracksDirName))
+	if err != nil {
+		return validation, err
+	}
+
+	validation.File = movedPath
+	validation.MovedOriginalPath = movedPath
+	validation.ReplacementPath = filename
+	return validation, nil
+}

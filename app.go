@@ -111,6 +111,7 @@ type DownloadRequest struct {
 	Copyright           string `json:"copyright,omitempty"`
 	Publisher           string `json:"publisher,omitempty"`
 	OutputDir           string `json:"output_dir,omitempty"`
+	CollectionDir       string `json:"collection_dir,omitempty"`
 	AudioFormat         string `json:"audio_format,omitempty"`
 	FilenameFormat      string `json:"filename_format,omitempty"`
 	TrackNumber         bool   `json:"track_number,omitempty"`
@@ -136,6 +137,8 @@ type DownloadResponse struct {
 	Error                   string  `json:"error,omitempty"`
 	AlreadyExists           bool    `json:"already_exists,omitempty"`
 	ItemID                  string  `json:"item_id,omitempty"`
+	MovedOriginalPath       string  `json:"moved_original_path,omitempty"`
+	ReplacementPath         string  `json:"replacement_path,omitempty"`
 	ExpectedDurationSeconds float64 `json:"expected_duration_seconds,omitempty"`
 	ActualDurationSeconds   float64 `json:"actual_duration_seconds,omitempty"`
 	DurationDeltaSeconds    float64 `json:"duration_delta_seconds,omitempty"`
@@ -277,26 +280,50 @@ func (a *App) DownloadTrack(req DownloadRequest) (DownloadResponse, error) {
 		message = "File already exists"
 		backend.SkipDownloadItem(itemID, filename)
 	} else {
+		validation := validateDownloadedFileDuration(filename, req.Duration)
+		if validation.Suspicious {
+			movedValidation, moveErr := moveSuspiciousDownloadIfNeeded(filename, req.CollectionDir, validation)
+			if moveErr != nil {
+				backend.FailDownloadItem(itemID, fmt.Sprintf("Failed to move suspicious download: %v", moveErr))
+				return DownloadResponse{
+					Success:                 false,
+					Error:                   fmt.Sprintf("Failed to move suspicious download: %v", moveErr),
+					File:                    filename,
+					ItemID:                  itemID,
+					ExpectedDurationSeconds: validation.ExpectedDurationSeconds,
+					ActualDurationSeconds:   validation.ActualDurationSeconds,
+					DurationDeltaSeconds:    validation.DurationDeltaSeconds,
+					Suspicious:              validation.Suspicious,
+					ValidationWarning:       validation.ValidationWarning,
+				}, moveErr
+			}
+			validation = movedValidation
+			filename = validation.File
+		}
 		completeDownloadTracking(itemID, filename)
 		addHistoryItemAsync(req, filename)
-	}
-
-	validation := DownloadResponse{}
-	if !alreadyExists {
-		validation = validateDownloadedFileDuration(filename, req.Duration)
+		return DownloadResponse{
+			Success:                 true,
+			Message:                 message,
+			File:                    filename,
+			AlreadyExists:           alreadyExists,
+			ItemID:                  itemID,
+			MovedOriginalPath:       validation.MovedOriginalPath,
+			ReplacementPath:         validation.ReplacementPath,
+			ExpectedDurationSeconds: validation.ExpectedDurationSeconds,
+			ActualDurationSeconds:   validation.ActualDurationSeconds,
+			DurationDeltaSeconds:    validation.DurationDeltaSeconds,
+			Suspicious:              validation.Suspicious,
+			ValidationWarning:       validation.ValidationWarning,
+		}, nil
 	}
 
 	return DownloadResponse{
-		Success:                 true,
-		Message:                 message,
-		File:                    filename,
-		AlreadyExists:           alreadyExists,
-		ItemID:                  itemID,
-		ExpectedDurationSeconds: validation.ExpectedDurationSeconds,
-		ActualDurationSeconds:   validation.ActualDurationSeconds,
-		DurationDeltaSeconds:    validation.DurationDeltaSeconds,
-		Suspicious:              validation.Suspicious,
-		ValidationWarning:       validation.ValidationWarning,
+		Success:       true,
+		Message:       message,
+		File:          filename,
+		AlreadyExists: alreadyExists,
+		ItemID:        itemID,
 	}, nil
 }
 

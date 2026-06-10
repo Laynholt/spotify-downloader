@@ -9,6 +9,7 @@ import (
 )
 
 const SuspiciousDurationThresholdSeconds = 3.0
+const SuspiciousTracksDirName = "Suspicious"
 
 func IsSuspiciousDuration(expectedSeconds, actualSeconds float64) bool {
 	if expectedSeconds <= 0 || actualSeconds <= 0 {
@@ -43,4 +44,20 @@ func MoveSuspiciousOriginal(srcPath, suspiciousDir string) (string, error) {
 		return "", err
 	}
 	return targetPath, nil
+}
+
+func IsPathInsideDir(path, dir string) bool {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(absDir, absPath)
+	if err != nil {
+		return false
+	}
+	return rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }

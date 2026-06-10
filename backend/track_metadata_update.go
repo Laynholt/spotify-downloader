@@ -45,10 +45,11 @@ type TrackMetadataUpdateResult struct {
 }
 
 type SuspiciousRedownloadRequest struct {
-	OriginalFilePath string                     `json:"original_file_path"`
-	CollectionDir    string                     `json:"collection_dir,omitempty"`
-	AudioFormat      string                     `json:"audio_format,omitempty"`
-	Metadata         TrackMetadataUpdateRequest `json:"metadata"`
+	OriginalFilePath    string                     `json:"original_file_path"`
+	ReplacementFilePath string                     `json:"replacement_file_path,omitempty"`
+	CollectionDir       string                     `json:"collection_dir,omitempty"`
+	AudioFormat         string                     `json:"audio_format,omitempty"`
+	Metadata            TrackMetadataUpdateRequest `json:"metadata"`
 }
 
 type SuspiciousRedownloadResult struct {
@@ -93,6 +94,19 @@ func BuildTrackMetadataPayload(req TrackMetadataUpdateRequest) Metadata {
 
 func BuildYtDlpSearchQuery(artistName, trackName string) string {
 	return fmt.Sprintf("ytsearch1:%s - %s audio", strings.TrimSpace(artistName), strings.TrimSpace(trackName))
+}
+
+var downloadWithYtDlp = DownloadWithYtDlp
+var updateTrackMetadata = UpdateTrackMetadata
+
+func normalizeYouTubeFallbackMetadata(req TrackMetadataUpdateRequest) TrackMetadataUpdateRequest {
+	if req.TrackNumber <= 0 || req.TrackNumber > 99 {
+		req.TrackNumber = 1
+	}
+	if req.DiscNumber <= 0 || req.DiscNumber > 99 {
+		req.DiscNumber = 1
+	}
+	return req
 }
 
 func UpdateTrackMetadata(req TrackMetadataUpdateRequest) TrackMetadataUpdateResult {
@@ -182,30 +196,48 @@ func RedownloadSuspiciousTrackFromYouTube(req SuspiciousRedownloadRequest) Suspi
 	}
 
 	originalPath := strings.TrimSpace(req.OriginalFilePath)
-	if originalPath == "" {
+	replacementPath := strings.TrimSpace(req.ReplacementFilePath)
+	if originalPath == "" && replacementPath == "" {
 		result.Status = "failed"
-		result.Error = "original file path is required"
+		result.Error = "original or replacement file path is required"
 		return result
 	}
 
 	collectionDir := strings.TrimSpace(req.CollectionDir)
-	if collectionDir == "" {
+	if collectionDir == "" && originalPath != "" {
 		collectionDir = filepath.Dir(originalPath)
+	} else if collectionDir == "" {
+		collectionDir = filepath.Dir(replacementPath)
 	}
-	suspiciousDir := filepath.Join(collectionDir, "Suspicious")
+	suspiciousDir := filepath.Join(collectionDir, SuspiciousTracksDirName)
 
-	movedPath, err := MoveSuspiciousOriginal(originalPath, suspiciousDir)
-	if err != nil {
-		result.Status = "failed"
-		result.Error = fmt.Sprintf("failed to move suspicious original: %v", err)
-		return result
+	movedPath := ""
+	if originalPath != "" && replacementPath == "" {
+		var err error
+		replacementPath = originalPath
+		movedPath, err = MoveSuspiciousOriginal(originalPath, suspiciousDir)
+		if err != nil {
+			result.Status = "failed"
+			result.Error = fmt.Sprintf("failed to move suspicious original: %v", err)
+			return result
+		}
+	} else if originalPath != "" && !IsPathInsideDir(originalPath, suspiciousDir) {
+		var err error
+		movedPath, err = MoveSuspiciousOriginal(originalPath, suspiciousDir)
+		if err != nil {
+			result.Status = "failed"
+			result.Error = fmt.Sprintf("failed to move suspicious original: %v", err)
+			return result
+		}
+	} else if originalPath != "" {
+		movedPath = originalPath
 	}
 	result.MovedOriginalPath = movedPath
 
-	outputBase := strings.TrimSuffix(originalPath, filepath.Ext(originalPath))
+	outputBase := strings.TrimSuffix(replacementPath, filepath.Ext(replacementPath))
 	query := BuildYtDlpSearchQuery(req.Metadata.ArtistName, req.Metadata.TrackName)
-	downloadResult := DownloadWithYtDlp(YtDlpDownloadRequest{
-		Query:        query,
+	downloadResult := downloadWithYtDlp(YtDlpDownloadRequest{
+		Query:       query,
 		OutputBase:  outputBase,
 		AudioFormat: req.AudioFormat,
 	})
@@ -215,9 +247,9 @@ func RedownloadSuspiciousTrackFromYouTube(req SuspiciousRedownloadRequest) Suspi
 		return result
 	}
 
-	metadataReq := req.Metadata
+	metadataReq := normalizeYouTubeFallbackMetadata(req.Metadata)
 	metadataReq.FilePath = downloadResult.File
-	updateResult := UpdateTrackMetadata(metadataReq)
+	updateResult := updateTrackMetadata(metadataReq)
 	result.ReplacementPath = downloadResult.File
 	result.ExpectedDurationSeconds = updateResult.ExpectedDurationSeconds
 	result.ActualDurationSeconds = updateResult.ActualDurationSeconds

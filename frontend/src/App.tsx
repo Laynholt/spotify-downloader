@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useLayoutEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, } from "@/components/ui/dialog";
-import { Search, X, ArrowUp } from "lucide-react";
+import { Search, X, ArrowUp, ListChecks } from "lucide-react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { getSettings, getSettingsWithDefaults, loadSettings, saveSettings, applyThemeMode, applyFont } from "@/lib/settings";
 import { applyTheme } from "@/lib/themes";
@@ -498,7 +498,13 @@ function App() {
 
             <DownloadQueue isOpen={downloadQueue.isOpen} onClose={downloadQueue.closeQueue}/>
 
-            <BatchDownloadSummaryDialog open={download.isBatchSummaryOpen} summary={download.batchSummary} isRedownloadingSuspicious={download.isRedownloadingSuspicious} onOpenChange={download.setIsBatchSummaryOpen} onRedownloadSuspicious={download.handleRedownloadSuspiciousFromYouTube}/>
+            <BatchDownloadSummaryDialog open={download.isBatchSummaryOpen} summary={download.batchSummary} isRedownloadingSuspicious={download.isRedownloadingSuspicious} redownloadProgress={download.downloadProgress} redownloadCurrentTrack={download.currentDownloadInfo} onMinimize={download.minimizeBatchSummary} onClose={download.closeBatchSummary} onRedownloadSuspicious={download.handleRedownloadSuspiciousFromYouTube}/>
+
+
+            {download.isBatchSummaryMinimized && download.batchSummary && (<Button onClick={download.restoreBatchSummary} className="fixed bottom-20 right-6 z-50 gap-2 shadow-lg">
+                <ListChecks className="h-4 w-4"/>
+                Summary
+            </Button>)}
 
 
             {showScrollTop && (<Button onClick={scrollToTop} className="fixed bottom-6 right-6 z-50 h-10 w-10 rounded-full shadow-lg" size="icon">

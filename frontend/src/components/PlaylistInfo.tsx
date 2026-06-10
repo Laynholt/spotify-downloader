@@ -84,7 +84,27 @@ interface PlaylistInfoProps {
     onTrackClick: (track: TrackMetadata) => void;
     onBack?: () => void;
 }
+function decodeHtmlEntities(value?: string): string {
+    if (!value) {
+        return "";
+    }
+
+    if (typeof document === "undefined") {
+        return value
+            .replace(/&#x2F;/gi, "/")
+            .replace(/&lt;/gi, "<")
+            .replace(/&gt;/gi, ">")
+            .replace(/&amp;/gi, "&")
+            .replace(/&quot;/gi, "\"")
+            .replace(/&#39;/g, "'");
+    }
+
+    const textarea = document.createElement("textarea");
+    textarea.innerHTML = value;
+    return textarea.value;
+}
 export function PlaylistInfo({ playlistInfo, trackList, searchQuery, sortBy, selectedTracks, downloadedTracks, failedTracks, skippedTracks, suspiciousTracks, downloadingTrack, isDownloading, bulkDownloadType, downloadProgress, currentDownloadInfo, downloadingLyricsTrack, downloadedLyrics, failedLyrics, skippedLyrics, downloadedCovers, failedCovers, skippedCovers, downloadingCoverTrack, isBulkDownloadingCovers, isBulkDownloadingLyrics, isBulkUpdatingMetadata, currentPage, itemsPerPage, onSearchChange, onSortChange, onToggleTrack, onToggleSelectAll, onDownloadTrack, onDownloadLyrics, onDownloadCover, onDownloadAllLyrics, onDownloadAllCovers, onUpdateAllMetadata, onDownloadAll, onDownloadSelected, onStopDownload, onOpenFolder, onPageChange, onAlbumClick, onArtistClick, onTrackClick, onBack, }: PlaylistInfoProps) {
+    const decodedDescription = decodeHtmlEntities(playlistInfo.description);
     return (<div className="space-y-6">
       <Card className="relative">
       {onBack && (<div className="absolute top-4 right-4 z-10">
@@ -99,7 +119,7 @@ export function PlaylistInfo({ playlistInfo, trackList, searchQuery, sortBy, sel
               <div className="space-y-2">
                 <p className="text-sm font-medium">Playlist</p>
                 <h2 className="text-4xl font-bold">{playlistInfo.owner.name}</h2>
-                {playlistInfo.description && (<p className="text-sm text-muted-foreground">{playlistInfo.description}</p>)}
+                {decodedDescription && (<p className="text-sm text-muted-foreground">{decodedDescription}</p>)}
                 <div className="flex items-center gap-2 text-sm">
                   <div className="flex items-center gap-2">
                     {playlistInfo.owner.images && (<img src={playlistInfo.owner.images} alt={playlistInfo.owner.display_name} className="w-5 h-5 rounded-full object-cover"/>)}

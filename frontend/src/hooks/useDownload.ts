@@ -6,7 +6,7 @@ import { ensureValidToken } from "@/lib/token-manager";
 import { toastWithSound as toast } from "@/lib/toast-with-sound";
 import { joinPath, sanitizePath, getFirstArtist } from "@/lib/utils";
 import { logger } from "@/lib/logger";
-import { logDuplicateTracks } from "@/lib/duplicate-tracks";
+import { findDuplicateTrackEntriesByTitle, logDuplicateTracks, type DuplicateTrackEntry } from "@/lib/duplicate-tracks";
 import { addBatchResult, createEmptyBatchSummary, type BatchDownloadSummary, type BatchTrackResult, type BatchTrackStatus } from "@/lib/batch-summary";
 import type { DownloadResponse, SuspiciousRedownloadRequest, SuspiciousRedownloadResult, TrackMetadata, TrackMetadataUpdateRequest, TrackMetadataUpdateResult } from "@/types/api";
 interface CheckFileExistenceRequest {
@@ -38,6 +38,17 @@ export interface SuspiciousTrackInfo {
     expectedDurationSeconds?: number;
     actualDurationSeconds?: number;
     durationDeltaSeconds?: number;
+}
+
+function extensionForAudioFormat(audioFormat: string): string {
+    switch (audioFormat.toLowerCase()) {
+        case "flac":
+            return ".flac";
+        case "m4a":
+            return ".m4a";
+        default:
+            return ".mp3";
+    }
 }
 
 function splitRelativePath(relativePath: string): string[] {
@@ -205,6 +216,21 @@ function buildMetadataUpdateRequest(track: TrackMetadata, settings: Settings, pa
         embed_genre: settings.embedGenre,
     };
 }
+function buildExpectedReplacementFilePath(track: TrackMetadata, settings: Settings, pathInfo: BatchTrackPathInfo): string {
+    const filenameTemplate = settings.filenameTemplate || "{title} - {artist}";
+    const templateData: TemplateData = {
+        artist: pathInfo.displayArtist || track.artists || "",
+        album: track.album_name || "",
+        album_artist: pathInfo.displayAlbumArtist || track.album_artist || track.artists || "",
+        title: track.name || "",
+        track: pathInfo.trackPosition,
+        disc: track.disc_number || 1,
+        year: getReleaseYear(track.release_date),
+        date: normalizeReleaseDate(track.release_date),
+    };
+    const filenameBase = sanitizePath(parseTemplate(filenameTemplate, templateData), settings.operatingSystem);
+    return joinPath(settings.operatingSystem, pathInfo.targetOutputDir, `${filenameBase}${extensionForAudioFormat(settings.audioFormat)}`);
+}
 function durationInfoFromDownload(response: DownloadResponse): SuspiciousTrackInfo {
     return {
         expectedDurationSeconds: response.expected_duration_seconds,
@@ -228,6 +254,11 @@ function batchResult(track: TrackMetadata, status: BatchTrackStatus, details: Pa
         ...details,
     };
 }
+function duplicateTrackResult(entry: DuplicateTrackEntry): BatchTrackResult {
+    return batchResult(entry.track, "duplicate_skipped", {
+        reason: `Duplicate title in this batch at position #${entry.index}`,
+    });
+}
 function downloadResultToBatch(track: TrackMetadata, response: DownloadResponse): BatchTrackResult {
     return batchResult(track, response.already_exists ? "skipped" : "downloaded", {
         file: response.file,
@@ -237,6 +268,8 @@ function downloadResultToBatch(track: TrackMetadata, response: DownloadResponse)
 function suspiciousDownloadResult(track: TrackMetadata, response: DownloadResponse): BatchTrackResult {
     return batchResult(track, "suspicious", {
         file: response.file,
+        movedOriginalPath: response.moved_original_path,
+        replacementPath: response.replacement_path,
         validationWarning: response.validation_warning,
         ...durationInfoFromDownload(response),
     });
@@ -301,17 +334,35 @@ export function useDownload() {
     const [suspiciousTracks, setSuspiciousTracks] = useState<Map<string, SuspiciousTrackInfo>>(new Map());
     const [batchSummary, setBatchSummary] = useState<BatchDownloadSummary | null>(null);
     const [isBatchSummaryOpen, setIsBatchSummaryOpen] = useState(false);
+    const [isBatchSummaryMinimized, setIsBatchSummaryMinimized] = useState(false);
     const [isBulkUpdatingMetadata, setIsBulkUpdatingMetadata] = useState(false);
     const [isRedownloadingSuspicious, setIsRedownloadingSuspicious] = useState(false);
     const shouldStopDownloadRef = useRef(false);
     const suspiciousRedownloadRequestsRef = useRef<SuspiciousRedownloadRequest[]>([]);
+    const failedRedownloadRequestsRef = useRef<SuspiciousRedownloadRequest[]>([]);
     const isUnauthorizedDownloadError = (error?: string) => {
         const msg = (error || "").toLowerCase();
         return msg.includes("unauthorized") || msg.includes("403") || msg.includes("401") || msg.includes("err_unauthorized");
     };
     const openBatchSummary = (summary: BatchDownloadSummary) => {
         setBatchSummary(summary);
+        setIsBatchSummaryMinimized(false);
         setIsBatchSummaryOpen(true);
+    };
+    const minimizeBatchSummary = () => {
+        setIsBatchSummaryOpen(false);
+        setIsBatchSummaryMinimized(batchSummary !== null);
+    };
+    const restoreBatchSummary = () => {
+        if (!batchSummary) {
+            return;
+        }
+        setIsBatchSummaryMinimized(false);
+        setIsBatchSummaryOpen(true);
+    };
+    const closeBatchSummary = () => {
+        setIsBatchSummaryOpen(false);
+        setIsBatchSummaryMinimized(false);
     };
     const recordSuspiciousTrack = (trackID: string, info: SuspiciousTrackInfo) => {
         if (!trackID) {
@@ -333,15 +384,27 @@ export function useDownload() {
             return next;
         });
     };
-    const queueSuspiciousRedownload = (track: TrackMetadata, settings: Settings, pathInfo: BatchTrackPathInfo, filePath?: string) => {
+    const queueSuspiciousRedownload = (track: TrackMetadata, settings: Settings, pathInfo: BatchTrackPathInfo, filePath?: string, replacementPath?: string) => {
         if (!filePath) {
             return;
         }
+        const metadataFilePath = replacementPath || filePath;
         suspiciousRedownloadRequestsRef.current.push({
             original_file_path: filePath,
+            replacement_file_path: replacementPath,
             collection_dir: pathInfo.baseOutputDir,
             audio_format: settings.audioFormat,
-            metadata: buildMetadataUpdateRequest(track, settings, pathInfo, filePath),
+            metadata: buildMetadataUpdateRequest(track, settings, pathInfo, metadataFilePath),
+        });
+    };
+    const queueFailedRedownload = (track: TrackMetadata, settings: Settings, pathInfo: BatchTrackPathInfo) => {
+        const replacementPath = buildExpectedReplacementFilePath(track, settings, pathInfo);
+        failedRedownloadRequestsRef.current.push({
+            original_file_path: "",
+            replacement_file_path: replacementPath,
+            collection_dir: pathInfo.baseOutputDir,
+            audio_format: settings.audioFormat,
+            metadata: buildMetadataUpdateRequest(track, settings, pathInfo, replacementPath),
         });
     };
     const downloadWithSpotiDownloader = async (track: TrackMetadata, settings: Settings, playlistName?: string, position?: number, retryCount: number = 0, isAlbum?: boolean, releaseYear?: string) => {
@@ -424,6 +487,7 @@ export function useDownload() {
             publisher: track.publisher,
             duration: track.duration_ms || 0,
             output_dir: outputDir,
+            collection_dir: pathInfo.baseOutputDir,
             audio_format: settings.audioFormat,
             filename_format: settings.filenameTemplate,
             use_first_artist_only: settings.useFirstArtistOnly,
@@ -461,6 +525,8 @@ export function useDownload() {
         const settings = await getSettingsWithDefaults();
         const displayArtist = settings.useFirstArtistOnly && track.artists ? getFirstArtist(track.artists) : track.artists;
         logger.info(`starting download: ${track.name} - ${displayArtist}`);
+        suspiciousRedownloadRequestsRef.current = [];
+        failedRedownloadRequestsRef.current = [];
         setDownloadingTrack(id);
         try {
             const response = await downloadWithSpotiDownloader(track, settings, playlistName, position, 0, isAlbum);
@@ -474,7 +540,13 @@ export function useDownload() {
                     logger.success(`downloaded: ${track.name} - ${displayArtist}`);
                     if (response.suspicious) {
                         recordSuspiciousTrack(id, durationInfoFromDownload(response));
+                        const pathInfo = buildBatchTrackPathInfo(track, settings, playlistName, isAlbum, position || 0);
+                        queueSuspiciousRedownload(track, settings, pathInfo, response.file, response.replacement_path);
                         toast.warning(response.validation_warning || "Downloaded track is suspicious");
+                        let summary = createEmptyBatchSummary(`${track.name || "Track"} download summary`);
+                        summary = addBatchResult(summary, suspiciousDownloadResult(track, response));
+                        suspiciousRedownloadRequestsRef.current = suspiciousRedownloadRequestsRef.current.slice(-1);
+                        openBatchSummary(summary);
                     }
                     else {
                         toast.success(response.message);
@@ -490,12 +562,16 @@ export function useDownload() {
             else {
                 logger.error(`failed: ${track.name} - ${displayArtist} - ${response.error}`);
                 toast.error(response.error || "Download failed");
+                const pathInfo = buildBatchTrackPathInfo(track, settings, playlistName, isAlbum, position || 0);
+                queueFailedRedownload(track, settings, pathInfo);
                 setFailedTracks((prev) => new Set(prev).add(id));
             }
         }
         catch (err) {
             logger.error(`error: ${track.name} - ${err}`);
             toast.error(err instanceof Error ? err.message : "Download failed");
+            const pathInfo = buildBatchTrackPathInfo(track, settings, playlistName, isAlbum, position || 0);
+            queueFailedRedownload(track, settings, pathInfo);
             setFailedTracks((prev) => new Set(prev).add(id));
         }
         finally {
@@ -521,6 +597,7 @@ export function useDownload() {
             .map((id) => allTracks.find((t) => t.spotify_id === id))
             .filter((t): t is TrackMetadata => t !== undefined), settings);
         logDuplicateTracks(logger, selectedTrackObjects, playlistName ? `selection for ${playlistName}` : "selected tracks");
+        const duplicateTrackEntries = findDuplicateTrackEntriesByTitle(selectedTrackObjects);
         const selectedTrackPathInfo = selectedTrackObjects.map((track, index) => ({
             track,
             pathInfo: buildBatchTrackPathInfo(track, settings, playlistName, isAlbum, index + 1),
@@ -560,7 +637,11 @@ export function useDownload() {
         }
         logger.info(`found ${existingSpotifyIDs.size} existing files`);
         let summary = createEmptyBatchSummary(`${playlistName || "Selected tracks"} download summary`);
+        for (const entry of duplicateTrackEntries) {
+            summary = addBatchResult(summary, duplicateTrackResult(entry));
+        }
         suspiciousRedownloadRequestsRef.current = [];
+        failedRedownloadRequestsRef.current = [];
         let successCount = 0;
         let errorCount = 0;
         let skippedCount = 0;
@@ -649,9 +730,9 @@ export function useDownload() {
             const displayArtist = settings.useFirstArtistOnly && track.artists ? getFirstArtist(track.artists) : track.artists;
             setDownloadingTrack(id);
             setCurrentDownloadInfo({ name: track.name, artists: displayArtist || "" });
+            const playlistIndex = selectedTracks.indexOf(id) + 1;
+            const pathInfo = buildBatchTrackPathInfo(track, settings, playlistName, isAlbum, playlistIndex);
             try {
-                const playlistIndex = selectedTracks.indexOf(id) + 1;
-                const pathInfo = buildBatchTrackPathInfo(track, settings, playlistName, isAlbum, playlistIndex);
                 let response = await downloadTrack({
                     track_id: id,
                     session_token: sessionToken,
@@ -669,6 +750,7 @@ export function useDownload() {
                     publisher: track.publisher,
                     duration: track.duration_ms || 0,
                     output_dir: pathInfo.targetOutputDir,
+                    collection_dir: pathInfo.baseOutputDir,
                     audio_format: settings.audioFormat,
                     filename_format: settings.filenameTemplate,
                     track_number: settings.trackNumber,
@@ -700,6 +782,7 @@ export function useDownload() {
                         publisher: track.publisher,
                         duration: track.duration_ms || 0,
                         output_dir: pathInfo.targetOutputDir,
+                        collection_dir: pathInfo.baseOutputDir,
                         audio_format: settings.audioFormat,
                         filename_format: settings.filenameTemplate,
                         track_number: settings.trackNumber,
@@ -725,14 +808,14 @@ export function useDownload() {
                         logger.success(`downloaded: ${track.name} - ${displayArtist}`);
                         if (response.suspicious) {
                             recordSuspiciousTrack(id, durationInfoFromDownload(response));
-                            queueSuspiciousRedownload(track, settings, pathInfo, response.file);
+                            queueSuspiciousRedownload(track, settings, pathInfo, response.file, response.replacement_path);
                             summary = addBatchResult(summary, suspiciousDownloadResult(track, response));
                         }
                         else {
                             clearSuspiciousTrack(id);
                         }
                     }
-                    if (response.file) {
+                    if (response.file && !response.suspicious) {
                         finalFilePaths.set(id, response.file);
                         finalFilePaths.set(track.spotify_id || id, response.file);
                     }
@@ -747,6 +830,7 @@ export function useDownload() {
                     errorCount++;
                     summary = addBatchResult(summary, batchResult(track, "failed", { error: response.error || "Download failed" }));
                     logger.error(`failed: ${track.name} - ${displayArtist}`);
+                    queueFailedRedownload(track, settings, pathInfo);
                     setFailedTracks((prev) => new Set(prev).add(id));
                 }
             }
@@ -754,6 +838,7 @@ export function useDownload() {
                 errorCount++;
                 summary = addBatchResult(summary, batchResult(track, "failed", { error: err instanceof Error ? err.message : String(err) }));
                 logger.error(`error: ${track.name} - ${err}`);
+                queueFailedRedownload(track, settings, pathInfo);
                 setFailedTracks((prev) => new Set(prev).add(id));
             }
             const completedCount = skippedCount + successCount + errorCount + metadataUpdatedCount;
@@ -801,6 +886,7 @@ export function useDownload() {
         setDownloadProgress(0);
         const enrichedTracksWithId = await enrichTracksReleaseDates(tracksWithId, settings);
         logDuplicateTracks(logger, enrichedTracksWithId, playlistName ? `${isAlbum ? "album" : "playlist"} ${playlistName}` : "batch download");
+        const duplicateTrackEntries = findDuplicateTrackEntriesByTitle(enrichedTracksWithId);
         const trackPathInfo = enrichedTracksWithId.map((track, index) => ({
             track,
             pathInfo: buildBatchTrackPathInfo(track, settings, playlistName, isAlbum, index + 1),
@@ -841,7 +927,11 @@ export function useDownload() {
         }
         logger.info(`found ${existingSpotifyIDs.size} existing files`);
         let summary = createEmptyBatchSummary(`${playlistName || "All tracks"} download summary`);
+        for (const entry of duplicateTrackEntries) {
+            summary = addBatchResult(summary, duplicateTrackResult(entry));
+        }
         suspiciousRedownloadRequestsRef.current = [];
+        failedRedownloadRequestsRef.current = [];
         let successCount = 0;
         let errorCount = 0;
         let skippedCount = 0;
@@ -930,9 +1020,9 @@ export function useDownload() {
             const displayArtist = settings.useFirstArtistOnly && track.artists ? getFirstArtist(track.artists) : track.artists;
             setDownloadingTrack(id);
             setCurrentDownloadInfo({ name: track.name, artists: displayArtist || "" });
+            const playlistIndex = enrichedTracksWithId.findIndex((t) => t.spotify_id === id) + 1;
+            const pathInfo = buildBatchTrackPathInfo(track, settings, playlistName, isAlbum, playlistIndex);
             try {
-                const playlistIndex = enrichedTracksWithId.findIndex((t) => t.spotify_id === id) + 1;
-                const pathInfo = buildBatchTrackPathInfo(track, settings, playlistName, isAlbum, playlistIndex);
                 let response = await downloadTrack({
                     track_id: id,
                     session_token: sessionToken,
@@ -950,6 +1040,7 @@ export function useDownload() {
                     publisher: track.publisher || "",
                     duration: track.duration_ms || 0,
                     output_dir: pathInfo.targetOutputDir,
+                    collection_dir: pathInfo.baseOutputDir,
                     audio_format: settings.audioFormat,
                     filename_format: settings.filenameTemplate,
                     track_number: settings.trackNumber,
@@ -981,6 +1072,7 @@ export function useDownload() {
                         publisher: track.publisher || "",
                         duration: track.duration_ms || 0,
                         output_dir: pathInfo.targetOutputDir,
+                        collection_dir: pathInfo.baseOutputDir,
                         audio_format: settings.audioFormat,
                         filename_format: settings.filenameTemplate,
                         track_number: settings.trackNumber,
@@ -1006,7 +1098,7 @@ export function useDownload() {
                         logger.success(`downloaded: ${track.name} - ${displayArtist}`);
                         if (response.suspicious) {
                             recordSuspiciousTrack(id, durationInfoFromDownload(response));
-                            queueSuspiciousRedownload(track, settings, pathInfo, response.file);
+                            queueSuspiciousRedownload(track, settings, pathInfo, response.file, response.replacement_path);
                             summary = addBatchResult(summary, suspiciousDownloadResult(track, response));
                         }
                         else {
@@ -1019,7 +1111,7 @@ export function useDownload() {
                         newSet.delete(id);
                         return newSet;
                     });
-                    if (response.file) {
+                    if (response.file && !response.suspicious) {
                         finalFilePaths[playlistIndex - 1] = response.file;
                     }
                 }
@@ -1027,6 +1119,7 @@ export function useDownload() {
                     errorCount++;
                     summary = addBatchResult(summary, batchResult(track, "failed", { error: response.error || "Download failed" }));
                     logger.error(`failed: ${track.name} - ${displayArtist}`);
+                    queueFailedRedownload(track, settings, pathInfo);
                     setFailedTracks((prev) => new Set(prev).add(id));
                 }
             }
@@ -1034,6 +1127,7 @@ export function useDownload() {
                 errorCount++;
                 summary = addBatchResult(summary, batchResult(track, "failed", { error: err instanceof Error ? err.message : String(err) }));
                 logger.error(`error: ${track.name} - ${err}`);
+                queueFailedRedownload(track, settings, pathInfo);
                 setFailedTracks((prev) => new Set(prev).add(id));
             }
             const completedCount = skippedCount + successCount + errorCount + metadataUpdatedCount;
@@ -1069,6 +1163,7 @@ export function useDownload() {
         setIsBulkUpdatingMetadata(true);
         setDownloadProgress(0);
         suspiciousRedownloadRequestsRef.current = [];
+        failedRedownloadRequestsRef.current = [];
         let summary = createEmptyBatchSummary(`${playlistName || "Tracks"} metadata update summary`);
         try {
             const enrichedTracks = await enrichTracksReleaseDates(tracksWithId, settings);
@@ -1152,13 +1247,23 @@ export function useDownload() {
             setIsBulkUpdatingMetadata(false);
         }
     };
-    const handleRedownloadSuspiciousFromYouTube = async () => {
-        const requests = suspiciousRedownloadRequestsRef.current;
-        if (requests.length === 0) {
-            toast.info("No suspicious tracks available for YouTube redownload");
+    const handleRedownloadSuspiciousFromYouTube = async (includeFailedTracks: boolean = false) => {
+        const queuedRequests = [
+            ...suspiciousRedownloadRequestsRef.current.map((request) => ({ request, source: "suspicious" as const })),
+            ...(includeFailedTracks
+                ? failedRedownloadRequestsRef.current.map((request) => ({ request, source: "failed" as const }))
+                : []),
+        ];
+        if (queuedRequests.length === 0) {
+            toast.info(includeFailedTracks ? "No tracks available for YouTube redownload" : "No suspicious tracks available for YouTube redownload");
             return;
         }
         setIsRedownloadingSuspicious(true);
+        setIsDownloading(true);
+        setBulkDownloadType(null);
+        setDownloadProgress(0);
+        setCurrentDownloadInfo({ name: "Preparing yt-dlp", artists: "" });
+        shouldStopDownloadRef.current = false;
         try {
             toast.info("Preparing yt-dlp...");
             const status = await ensureYtDlpInstalledOrUpdated();
@@ -1166,11 +1271,27 @@ export function useDownload() {
                 toast.error(status.error);
                 return;
             }
-            const results = await redownloadSuspiciousTracksFromYouTube(requests);
             let nextSummary = batchSummary || createEmptyBatchSummary("YouTube redownload summary");
-            for (let i = 0; i < results.length; i++) {
-                const request = requests[i];
-                const result = results[i];
+            const results: SuspiciousRedownloadResult[] = [];
+            for (let i = 0; i < queuedRequests.length; i++) {
+                if (shouldStopDownloadRef.current) {
+                    toast.info(`YouTube redownload stopped. ${i} of ${queuedRequests.length} processed.`);
+                    break;
+                }
+                const { request } = queuedRequests[i];
+                setCurrentDownloadInfo({
+                    name: request.metadata.track_name || "Unknown track",
+                    artists: request.metadata.artist_name || "YouTube redownload",
+                });
+                setDownloadProgress(Math.round((i / queuedRequests.length) * 100));
+                const [backendResult] = await redownloadSuspiciousTracksFromYouTube([request]);
+                const result = backendResult || {
+                    success: false,
+                    status: "failed",
+                    track_id: request.metadata.track_id,
+                    error: "YouTube redownload returned no result",
+                };
+                results.push(result);
                 nextSummary = addBatchResult(nextSummary, redownloadResultToBatch(request, result));
                 const trackID = request.metadata.track_id || result.track_id || "";
                 if (result.success && result.status === "replaced") {
@@ -1192,11 +1313,26 @@ export function useDownload() {
                 else {
                     setFailedTracks((prev) => new Set(prev).add(trackID));
                 }
+                setDownloadProgress(Math.round(((i + 1) / queuedRequests.length) * 100));
             }
-            suspiciousRedownloadRequestsRef.current = requests.filter((_request, index) => {
+            suspiciousRedownloadRequestsRef.current = suspiciousRedownloadRequestsRef.current.filter((request) => {
+                const index = queuedRequests.findIndex((queued) => queued.source === "suspicious" && queued.request === request);
+                if (index < 0) {
+                    return true;
+                }
                 const result = results[index];
                 return !(result?.success && result.status === "replaced");
             });
+            if (includeFailedTracks) {
+                failedRedownloadRequestsRef.current = failedRedownloadRequestsRef.current.filter((request) => {
+                    const index = queuedRequests.findIndex((queued) => queued.source === "failed" && queued.request === request);
+                    if (index < 0) {
+                        return true;
+                    }
+                    const result = results[index];
+                    return !(result?.success && result.status === "replaced");
+                });
+            }
             openBatchSummary(nextSummary);
         }
         catch (err) {
@@ -1204,6 +1340,11 @@ export function useDownload() {
         }
         finally {
             setIsRedownloadingSuspicious(false);
+            setIsDownloading(false);
+            setBulkDownloadType(null);
+            setDownloadingTrack(null);
+            setCurrentDownloadInfo(null);
+            shouldStopDownloadRef.current = false;
         }
     };
     const handleStopDownload = () => {
@@ -1217,6 +1358,7 @@ export function useDownload() {
         setSkippedTracks(new Set());
         setSuspiciousTracks(new Map());
         suspiciousRedownloadRequestsRef.current = [];
+        failedRedownloadRequestsRef.current = [];
     };
     return {
         downloadProgress,
@@ -1229,10 +1371,13 @@ export function useDownload() {
         suspiciousTracks,
         batchSummary,
         isBatchSummaryOpen,
+        isBatchSummaryMinimized,
         isBulkUpdatingMetadata,
         isRedownloadingSuspicious,
         currentDownloadInfo,
-        setIsBatchSummaryOpen,
+        minimizeBatchSummary,
+        restoreBatchSummary,
+        closeBatchSummary,
         handleDownloadTrack,
         handleDownloadSelected,
         handleDownloadAll,

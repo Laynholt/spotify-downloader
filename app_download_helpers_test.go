@@ -103,3 +103,44 @@ func TestBuildDownloadValidationResultKeepsProbeFailureAsWarning(t *testing.T) {
 		t.Fatalf("expected validation warning")
 	}
 }
+
+func TestMoveSuspiciousDownloadIfNeededMovesFileToSuspiciousDir(t *testing.T) {
+	dir := t.TempDir()
+	collectionDir := filepath.Join(dir, "Playlist")
+	if err := os.MkdirAll(collectionDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	originalPath := filepath.Join(collectionDir, "Song.mp3")
+	if err := os.WriteFile(originalPath, []byte("audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	validation := DownloadResponse{
+		Suspicious:              true,
+		ExpectedDurationSeconds: 180,
+		ActualDurationSeconds:   184.5,
+		DurationDeltaSeconds:    4.5,
+	}
+
+	got, err := moveSuspiciousDownloadIfNeeded(originalPath, collectionDir, validation)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantMovedPath := filepath.Join(collectionDir, "Suspicious", "Song.mp3")
+	if got.File != wantMovedPath {
+		t.Fatalf("File = %q, want moved suspicious path %q", got.File, wantMovedPath)
+	}
+	if got.MovedOriginalPath != wantMovedPath {
+		t.Fatalf("MovedOriginalPath = %q, want %q", got.MovedOriginalPath, wantMovedPath)
+	}
+	if got.ReplacementPath != originalPath {
+		t.Fatalf("ReplacementPath = %q, want original path %q", got.ReplacementPath, originalPath)
+	}
+	if _, err := os.Stat(originalPath); !os.IsNotExist(err) {
+		t.Fatalf("original path still exists or stat failed unexpectedly: %v", err)
+	}
+	if _, err := os.Stat(wantMovedPath); err != nil {
+		t.Fatalf("moved suspicious file missing: %v", err)
+	}
+}
