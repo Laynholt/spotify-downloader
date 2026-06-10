@@ -6,7 +6,8 @@ build/
 
 # Binary files (except get_token.exe in backend/bin for Windows dev)
 *.exe
-backend/bin/get_token.exe
+!backend/bin/
+!backend/bin/get_token.exe
 
 # Token fetcher binary for unix (built by CI)
 backend/bin/get_token
@@ -22,6 +23,8 @@ go.work.sum
 
 # Python
 .venv/
+__pycache__/
+*/__pycache__/
 
 # Node / Frontend
 node_modules/
@@ -65,9 +68,11 @@ temp/
 *.tmp
 *.bak
 *.old
+helper/build/
+helper/dist/
+helper/get_token.spec
 
 # Build notes (optional - uncomment if you don't want to commit)
 # BUILD_NOTES.md
 push.bat
-build.ps1
 get_token.spec

@@ -1,7 +1,7 @@
 import { useState, useRef } from "react";
 import { downloadTrack, ensureYtDlpInstalledOrUpdated, fetchSpotifyMetadata, redownloadSuspiciousTracksFromYouTube, updateTrackMetadata } from "@/lib/api";
-import { CheckFilesExistence, CreateM3U8File, SkipDownloadItem } from "../../wailsjs/go/main/App";
-import { getSettingsWithDefaults, parseTemplate, type Settings, type TemplateData } from "@/lib/settings";
+import { CheckFilesExistence, ClearAllDownloads, CreateM3U8File, SkipDownloadItem } from "../../wailsjs/go/main/App";
+import { getSettingsWithDefaults, isLikelySessionToken, parseTemplate, type Settings, type TemplateData } from "@/lib/settings";
 import { ensureValidToken } from "@/lib/token-manager";
 import { toastWithSound as toast } from "@/lib/toast-with-sound";
 import { joinPath, sanitizePath, getFirstArtist } from "@/lib/utils";
@@ -269,6 +269,23 @@ function redownloadResultToBatch(request: SuspiciousRedownloadRequest, result: S
         durationDeltaSeconds: result.duration_delta_seconds,
     };
 }
+function logExistencePrecheck(context: string, outputDir: string, rootDir: string, results: Array<{ exists: boolean; track_name?: string; artist_name?: string; file_path?: string }>) {
+    const existing = results.filter((result) => result.exists);
+    logger.info(`${context}: precheck found ${existing.length}/${results.length} existing files`);
+    logger.debug(`${context}: outputDir=${outputDir || "(empty)"}, rootDir=${rootDir || "(empty)"}`);
+    for (const result of existing.slice(0, 5)) {
+        logger.debug(`${context}: existing ${result.track_name || "Unknown track"} - ${result.artist_name || ""} -> ${result.file_path || "(no path)"}`);
+    }
+    if (existing.length > 5) {
+        logger.debug(`${context}: ${existing.length - 5} more existing matches omitted`);
+    }
+}
+function requireSessionToken(sessionToken: string): string {
+    if (!isLikelySessionToken(sessionToken)) {
+        throw new Error("Session token is missing or invalid");
+    }
+    return sessionToken;
+}
 export function useDownload() {
     const [downloadProgress, setDownloadProgress] = useState<number>(0);
     const [isDownloading, setIsDownloading] = useState(false);
@@ -492,6 +509,11 @@ export function useDownload() {
         }
         logger.info(`starting batch download: ${selectedTracks.length} selected tracks`);
         const settings = await getSettingsWithDefaults();
+        await ClearAllDownloads();
+        setDownloadedTracks(new Set());
+        setFailedTracks(new Set());
+        setSkippedTracks(new Set());
+        setSuspiciousTracks(new Map());
         setIsDownloading(true);
         setBulkDownloadType("selected");
         setDownloadProgress(0);
@@ -525,6 +547,7 @@ export function useDownload() {
             };
         });
         const existenceResults = await CheckFilesExistence(outputDir, existenceRootDir, settings.audioFormat, existenceChecks);
+        logExistencePrecheck("selected download", outputDir, existenceRootDir, existenceResults);
         const existingSpotifyIDs = new Set<string>();
         const existingFilePathsBySpotifyID = new Map<string, string>();
         const finalFilePaths = new Map<string, string>();
@@ -602,6 +625,7 @@ export function useDownload() {
         if (tracksToDownload.length > 0) {
             try {
                 sessionToken = await ensureValidToken();
+                requireSessionToken(sessionToken);
             }
             catch (err) {
                 logger.error(`failed to fetch session token for batch: ${err}`);
@@ -658,6 +682,7 @@ export function useDownload() {
                 });
                 if (!response.success && isUnauthorizedDownloadError(response.error)) {
                     sessionToken = await ensureValidToken(true);
+                    requireSessionToken(sessionToken);
                     response = await downloadTrack({
                         track_id: id,
                         session_token: sessionToken,
@@ -766,6 +791,11 @@ export function useDownload() {
         }
         logger.info(`starting batch download: ${tracksWithId.length} tracks`);
         const settings = await getSettingsWithDefaults();
+        await ClearAllDownloads();
+        setDownloadedTracks(new Set());
+        setFailedTracks(new Set());
+        setSkippedTracks(new Set());
+        setSuspiciousTracks(new Map());
         setIsDownloading(true);
         setBulkDownloadType("all");
         setDownloadProgress(0);
@@ -797,6 +827,7 @@ export function useDownload() {
             };
         });
         const existenceResults = await CheckFilesExistence(outputDir, existenceRootDir, settings.audioFormat, existenceChecks);
+        logExistencePrecheck("all download", outputDir, existenceRootDir, existenceResults);
         const finalFilePaths: string[] = new Array(enrichedTracksWithId.length).fill("");
         const existingSpotifyIDs = new Set<string>();
         const existingFilePaths = new Map<string, string>();
@@ -875,6 +906,7 @@ export function useDownload() {
         if (tracksToDownload.length > 0) {
             try {
                 sessionToken = await ensureValidToken();
+                requireSessionToken(sessionToken);
             }
             catch (err) {
                 logger.error(`failed to fetch session token for batch: ${err}`);
@@ -931,6 +963,7 @@ export function useDownload() {
                 });
                 if (!response.success && isUnauthorizedDownloadError(response.error)) {
                     sessionToken = await ensureValidToken(true);
+                    requireSessionToken(sessionToken);
                     response = await downloadTrack({
                         track_id: id,
                         session_token: sessionToken,

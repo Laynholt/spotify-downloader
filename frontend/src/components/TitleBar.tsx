@@ -1,17 +1,17 @@
 import { X, Minus, Maximize, Settings } from "lucide-react";
 import { WindowMinimise, WindowToggleMaximise, Quit } from "../../wailsjs/runtime/runtime";
 import { Menubar, MenubarContent, MenubarMenu, MenubarRadioGroup, MenubarRadioItem, MenubarSub, MenubarSubContent, MenubarSubTrigger, MenubarTrigger, MenubarLabel, MenubarSeparator } from "@/components/ui/menubar";
-import { getSettings, updateSettings } from "@/lib/settings";
+import { getSettings, MIN_TOKEN_TIMEOUT, updateSettings } from "@/lib/settings";
 import { useState, useEffect } from "react";
-const TIMEOUT_OPTIONS = [15, 20, 25, 30, 45, 60];
-const RETRY_OPTIONS = [1, 2, 3, 4, 5];
+const TIMEOUT_OPTIONS = [MIN_TOKEN_TIMEOUT, 180, 240, 300];
+const RETRY_OPTIONS = [0, 1, 2, 3, 4, 5];
 type SettingsUpdatedEvent = CustomEvent<{
     tokenTimeout?: number;
     tokenRetry?: number;
 }>;
 export function TitleBar() {
-    const [tokenTimeout, setTokenTimeout] = useState(() => getSettings().tokenTimeout || 15);
-    const [tokenRetry, setTokenRetry] = useState(() => getSettings().tokenRetry || 1);
+    const [tokenTimeout, setTokenTimeout] = useState(() => getSettings().tokenTimeout || MIN_TOKEN_TIMEOUT);
+    const [tokenRetry, setTokenRetry] = useState(() => getSettings().tokenRetry ?? 0);
     useEffect(() => {
         const handleSettingsUpdate = (event: Event) => {
             const { detail: updatedSettings } = event as SettingsUpdatedEvent;

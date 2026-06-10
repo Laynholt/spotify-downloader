@@ -32,6 +32,7 @@ export interface Settings {
     embedGenre: boolean;
     updateMetadataForExistingFiles: boolean;
 }
+export const MIN_TOKEN_TIMEOUT = 120;
 export const FOLDER_PRESETS: Record<FolderPreset, {
     label: string;
     template: string;
@@ -104,8 +105,8 @@ export const DEFAULT_SETTINGS: Settings = {
     embedLyrics: false,
     embedMaxQualityCover: false,
     operatingSystem: detectOS(),
-    tokenTimeout: 15,
-    tokenRetry: 1,
+    tokenTimeout: MIN_TOKEN_TIMEOUT,
+    tokenRetry: 0,
     createPlaylistFolder: true,
     createM3u8File: false,
     useFirstArtistOnly: false,
@@ -228,8 +229,8 @@ function normalizeSettingsData(source: LegacySettings | null | undefined): Setti
     if (!("updateMetadataForExistingFiles" in parsed)) {
         parsed.updateMetadataForExistingFiles = false;
     }
-    if (!parsed.tokenTimeout || parsed.tokenTimeout < 15) {
-        parsed.tokenTimeout = 15;
+    if (!parsed.tokenTimeout || parsed.tokenTimeout < MIN_TOKEN_TIMEOUT) {
+        parsed.tokenTimeout = MIN_TOKEN_TIMEOUT;
     }
     parsed.operatingSystem = detectOS();
     return { ...DEFAULT_SETTINGS, ...parsed };
@@ -364,9 +365,13 @@ export function applyThemeMode(mode: "auto" | "light" | "dark"): void {
     }
 }
 export function isTokenExpired(settings: Settings): boolean {
-    if (!settings.sessionToken || !settings.sessionTokenExpiry) {
+    if (!isLikelySessionToken(settings.sessionToken) || !settings.sessionTokenExpiry) {
         return true;
     }
     const now = Math.floor(Date.now() / 1000);
     return settings.sessionTokenExpiry - now < 30;
+}
+export function isLikelySessionToken(token: string | null | undefined): boolean {
+    const value = (token || "").trim();
+    return value.startsWith("eyJ") && value.length > 20;
 }
