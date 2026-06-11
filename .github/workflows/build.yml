@@ -7,8 +7,10 @@ on:
   workflow_dispatch:
 
 env:
-  GO_VERSION: "1.26"
+  GO_VERSION: "1.26.4"
   NODE_VERSION: "24"
+  PNPM_VERSION: "10.30.2"
+  WAILS_VERSION: "v2.11.0"
   PYTHON_VERSION: "3.12"
   APP_NAME: "SpotiDownloader"
 
@@ -60,7 +62,7 @@ jobs:
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: ${{ env.PNPM_VERSION }}
 
       - name: Get pnpm store directory
         shell: bash
@@ -77,12 +79,12 @@ jobs:
             ${{ runner.os }}-pnpm-store-
 
       - name: Install Wails CLI
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_VERSION }}
 
       - name: Install frontend dependencies
         working-directory: frontend
         run: |
-          pnpm install
+          pnpm install --frozen-lockfile
           pnpm run generate-icon
 
       - name: Install UPX
@@ -152,7 +154,7 @@ jobs:
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: ${{ env.PNPM_VERSION }}
 
       - name: Get pnpm store directory
         run: |
@@ -168,12 +170,12 @@ jobs:
             ${{ runner.os }}-intel-pnpm-store-
 
       - name: Install Wails CLI
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_VERSION }}
 
       - name: Install frontend dependencies
         working-directory: frontend
         run: |
-          pnpm install
+          pnpm install --frozen-lockfile
           pnpm run generate-icon
 
       - name: Build application
@@ -249,7 +251,7 @@ jobs:
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: ${{ env.PNPM_VERSION }}
 
       - name: Get pnpm store directory
         run: |
@@ -265,12 +267,12 @@ jobs:
             ${{ runner.os }}-arm-pnpm-store-
 
       - name: Install Wails CLI
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_VERSION }}
 
       - name: Install frontend dependencies
         working-directory: frontend
         run: |
-          pnpm install
+          pnpm install --frozen-lockfile
           pnpm run generate-icon
 
       - name: Build application
@@ -351,7 +353,7 @@ jobs:
       - name: Install pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 9
+          version: ${{ env.PNPM_VERSION }}
 
       - name: Get pnpm store directory
         run: |
@@ -372,12 +374,12 @@ jobs:
           sudo ln -sf /usr/lib/x86_64-linux-gnu/pkgconfig/webkit2gtk-4.1.pc /usr/lib/x86_64-linux-gnu/pkgconfig/webkit2gtk-4.0.pc
 
       - name: Install Wails CLI
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_VERSION }}
 
       - name: Install frontend dependencies
         working-directory: frontend
         run: |
-          pnpm install
+          pnpm install --frozen-lockfile
           pnpm run generate-icon
 
       - name: Build application

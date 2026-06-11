@@ -1,10 +1,13 @@
 package backend
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,7 +39,7 @@ type YtDlpStatus struct {
 }
 
 type YtDlpDownloadRequest struct {
-	Query        string `json:"query"`
+	Query       string `json:"query"`
 	OutputBase  string `json:"output_base"`
 	AudioFormat string `json:"audio_format"`
 }
@@ -48,15 +51,32 @@ type YtDlpDownloadResult struct {
 	Output  string `json:"output,omitempty"`
 }
 
-func SelectYtDlpAsset(goos string, assets []GitHubReleaseAsset) (GitHubReleaseAsset, bool) {
-	wantName := "yt-dlp"
-	if strings.EqualFold(goos, "windows") {
-		wantName = "yt-dlp.exe"
+func SelectYtDlpAsset(goos, goarch string, assets []GitHubReleaseAsset) (GitHubReleaseAsset, bool) {
+	candidates := []string{"yt-dlp"}
+	switch strings.ToLower(goos) {
+	case "windows":
+		if strings.EqualFold(goarch, "arm64") {
+			candidates = []string{"yt-dlp_arm64.exe", "yt-dlp.exe"}
+		} else if strings.EqualFold(goarch, "386") {
+			candidates = []string{"yt-dlp_x86.exe", "yt-dlp.exe"}
+		} else {
+			candidates = []string{"yt-dlp.exe"}
+		}
+	case "linux":
+		if strings.EqualFold(goarch, "arm64") {
+			candidates = []string{"yt-dlp_linux_aarch64", "yt-dlp"}
+		} else {
+			candidates = []string{"yt-dlp_linux", "yt-dlp"}
+		}
+	case "darwin":
+		candidates = []string{"yt-dlp_macos", "yt-dlp"}
 	}
 
-	for _, asset := range assets {
-		if asset.Name == wantName {
-			return asset, true
+	for _, candidate := range candidates {
+		for _, asset := range assets {
+			if asset.Name == candidate {
+				return asset, true
+			}
 		}
 	}
 
@@ -125,7 +145,7 @@ func EnsureYtDlpInstalledOrUpdated() (YtDlpStatus, error) {
 		return current, nil
 	}
 
-	asset, ok := SelectYtDlpAsset(runtime.GOOS, release.Assets)
+	asset, ok := SelectYtDlpAsset(runtime.GOOS, runtime.GOARCH, release.Assets)
 	if !ok {
 		err := fmt.Errorf("yt-dlp release has no asset for %s", runtime.GOOS)
 		if current.Installed {
@@ -136,7 +156,7 @@ func EnsureYtDlpInstalledOrUpdated() (YtDlpStatus, error) {
 		return current, err
 	}
 
-	path, err := downloadYtDlpAsset(asset)
+	path, err := downloadYtDlpAsset(asset, release.Assets)
 	if err != nil {
 		if current.Installed {
 			current.Warning = fmt.Sprintf("failed to update yt-dlp: %v", err)
@@ -227,12 +247,15 @@ func fetchLatestYtDlpRelease() (ytDlpRelease, error) {
 	return release, nil
 }
 
-func downloadYtDlpAsset(asset GitHubReleaseAsset) (string, error) {
+func downloadYtDlpAsset(asset GitHubReleaseAsset, releaseAssets []GitHubReleaseAsset) (string, error) {
 	path, err := GetYtDlpPath()
 	if err != nil {
 		return "", err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return "", err
+	}
+	if err := validateGitHubReleaseDownloadURL(asset.BrowserDownloadURL); err != nil {
 		return "", err
 	}
 
@@ -253,7 +276,8 @@ func downloadYtDlpAsset(asset GitHubReleaseAsset) (string, error) {
 		return "", err
 	}
 	copyErr := error(nil)
-	if _, err := io.Copy(out, resp.Body); err != nil {
+	hasher := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(out, hasher), resp.Body); err != nil {
 		copyErr = err
 	}
 	closeErr := out.Close()
@@ -265,6 +289,10 @@ func downloadYtDlpAsset(asset GitHubReleaseAsset) (string, error) {
 		_ = os.Remove(tmpPath)
 		return "", closeErr
 	}
+	if err := verifyDownloadedAssetChecksum(asset.Name, hex.EncodeToString(hasher.Sum(nil)), releaseAssets); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", err
+	}
 	if runtime.GOOS != "windows" {
 		_ = os.Chmod(tmpPath, 0755)
 	}
@@ -273,6 +301,70 @@ func downloadYtDlpAsset(asset GitHubReleaseAsset) (string, error) {
 		return "", err
 	}
 	return path, nil
+}
+
+func validateGitHubReleaseDownloadURL(rawURL string) error {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return err
+	}
+	if parsed.Scheme != "https" || parsed.Hostname() != "github.com" {
+		return fmt.Errorf("unexpected release asset host: %s", rawURL)
+	}
+	return nil
+}
+
+func verifyDownloadedAssetChecksum(assetName, actualHash string, releaseAssets []GitHubReleaseAsset) error {
+	checksumAsset, ok := findReleaseAsset("SHA2-256SUMS", releaseAssets)
+	if !ok {
+		return fmt.Errorf("yt-dlp release does not include SHA2-256SUMS")
+	}
+	if err := validateGitHubReleaseDownloadURL(checksumAsset.BrowserDownloadURL); err != nil {
+		return err
+	}
+	resp, err := newHTTPClient(30 * time.Second).Get(checksumAsset.BrowserDownloadURL)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("failed to download yt-dlp checksums: HTTP %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	if err != nil {
+		return err
+	}
+	expectedHash := parseSHA256Sums(body)[assetName]
+	if expectedHash == "" {
+		return fmt.Errorf("yt-dlp checksum missing for %s", assetName)
+	}
+	if !strings.EqualFold(expectedHash, actualHash) {
+		return fmt.Errorf("yt-dlp checksum mismatch for %s", assetName)
+	}
+	return nil
+}
+
+func findReleaseAsset(name string, assets []GitHubReleaseAsset) (GitHubReleaseAsset, bool) {
+	for _, asset := range assets {
+		if asset.Name == name {
+			return asset, true
+		}
+	}
+	return GitHubReleaseAsset{}, false
+}
+
+func parseSHA256Sums(data []byte) map[string]string {
+	hashes := make(map[string]string)
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		name := strings.TrimPrefix(fields[1], "*")
+		hashes[name] = fields[0]
+	}
+	return hashes
 }
 
 func normalizeYtDlpAudioFormat(audioFormat string) string {

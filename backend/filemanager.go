@@ -15,11 +15,14 @@ import (
 )
 
 type FileInfo struct {
-	Name     string     `json:"name"`
-	Path     string     `json:"path"`
-	IsDir    bool       `json:"is_dir"`
-	Size     int64      `json:"size"`
-	Children []FileInfo `json:"children,omitempty"`
+	Name       string     `json:"name"`
+	Path       string     `json:"path"`
+	IsDir      bool       `json:"is_dir"`
+	Size       int64      `json:"size"`
+	TrackCount int        `json:"track_count,omitempty"`
+	LyricCount int        `json:"lyric_count,omitempty"`
+	CoverCount int        `json:"cover_count,omitempty"`
+	Children   []FileInfo `json:"children,omitempty"`
 }
 
 type AudioMetadata struct {
@@ -67,18 +70,49 @@ func ListDirectory(dirPath string) ([]FileInfo, error) {
 			IsDir: entry.IsDir(),
 			Size:  info.Size(),
 		}
-
 		if entry.IsDir() {
-			children, err := ListDirectory(fileInfo.Path)
-			if err == nil {
-				fileInfo.Children = children
-			}
+			fileInfo.TrackCount, fileInfo.LyricCount, fileInfo.CoverCount = countDirectoryMedia(fileInfo.Path)
+		} else {
+			track, lyric, cover := mediaTypeCounts(fileInfo.Name)
+			fileInfo.TrackCount = track
+			fileInfo.LyricCount = lyric
+			fileInfo.CoverCount = cover
 		}
 
 		result = append(result, fileInfo)
 	}
 
 	return result, nil
+}
+
+func countDirectoryMedia(dirPath string) (int, int, int) {
+	trackCount := 0
+	lyricCount := 0
+	coverCount := 0
+	_ = filepath.WalkDir(dirPath, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return nil
+		}
+		track, lyric, cover := mediaTypeCounts(entry.Name())
+		trackCount += track
+		lyricCount += lyric
+		coverCount += cover
+		return nil
+	})
+	return trackCount, lyricCount, coverCount
+}
+
+func mediaTypeCounts(name string) (int, int, int) {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".flac", ".mp3", ".m4a":
+		return 1, 0, 0
+	case ".lrc":
+		return 0, 1, 0
+	case ".jpg", ".jpeg", ".png":
+		return 0, 0, 1
+	default:
+		return 0, 0, 0
+	}
 }
 
 func ListAudioFiles(dirPath string) ([]FileInfo, error) {

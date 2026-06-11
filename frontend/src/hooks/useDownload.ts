@@ -1,6 +1,6 @@
 import { useState, useRef } from "react";
 import { downloadTrack, ensureYtDlpInstalledOrUpdated, fetchSpotifyMetadata, redownloadSuspiciousTracksFromYouTube, updateTrackMetadata } from "@/lib/api";
-import { CheckFilesExistence, ClearAllDownloads, CreateM3U8File, SkipDownloadItem } from "../../wailsjs/go/main/App";
+import { AddToDownloadQueue, CheckFilesExistence, ClearAllDownloads, CreateM3U8File, MarkDownloadItemFailed, SkipDownloadItem } from "../../wailsjs/go/main/App";
 import { getSettingsWithDefaults, isLikelySessionToken, parseTemplate, type Settings, type TemplateData } from "@/lib/settings";
 import { ensureValidToken } from "@/lib/token-manager";
 import { toastWithSound as toast } from "@/lib/toast-with-sound";
@@ -468,7 +468,6 @@ export function useDownload() {
             }
         }
         const sessionToken = await ensureValidToken();
-        const { AddToDownloadQueue } = await import("../../wailsjs/go/main/App");
         const itemID = await AddToDownloadQueue(track.spotify_id || "", track.name || "", pathInfo.displayArtist || "", track.album_name || "");
         const response = await downloadTrack({
             track_id: track.spotify_id || "",
@@ -511,7 +510,6 @@ export function useDownload() {
             }
         }
         if (!response.success && response.item_id) {
-            const { MarkDownloadItemFailed } = await import("../../wailsjs/go/main/App");
             await MarkDownloadItemFailed(response.item_id, response.error || "Download failed");
         }
         return response;
@@ -647,7 +645,6 @@ export function useDownload() {
         let skippedCount = 0;
         let metadataUpdatedCount = 0;
         const total = selectedTracks.length;
-        const { AddToDownloadQueue } = await import("../../wailsjs/go/main/App");
         for (const { track, pathInfo } of selectedTrackPathInfo) {
             const trackID = track.spotify_id || "";
             if (existingSpotifyIDs.has(trackID)) {
@@ -702,7 +699,7 @@ export function useDownload() {
             const trackID = track.spotify_id || "";
             return !existingSpotifyIDs.has(trackID);
         });
-        let sessionToken = settings.sessionToken || "";
+        let sessionToken = "";
         if (tracksToDownload.length > 0) {
             try {
                 sessionToken = await ensureValidToken();
@@ -937,7 +934,6 @@ export function useDownload() {
         let skippedCount = 0;
         let metadataUpdatedCount = 0;
         const total = enrichedTracksWithId.length;
-        const { AddToDownloadQueue } = await import("../../wailsjs/go/main/App");
         for (const { track, pathInfo } of trackPathInfo) {
             const trackID = track.spotify_id || "";
             if (existingSpotifyIDs.has(trackID)) {
@@ -992,7 +988,7 @@ export function useDownload() {
             const trackID = track.spotify_id || "";
             return !existingSpotifyIDs.has(trackID);
         });
-        let sessionToken = settings.sessionToken || "";
+        let sessionToken = "";
         if (tracksToDownload.length > 0) {
             try {
                 sessionToken = await ensureValidToken();

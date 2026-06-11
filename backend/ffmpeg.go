@@ -3,10 +3,13 @@ package backend
 import (
 	"archive/tar"
 	"archive/zip"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -58,9 +61,15 @@ func ValidateExecutable(path string) error {
 }
 
 const (
-	ffmpegWindowsURL = "https://github.com/afkarxyz/ffmpeg-binaries/releases/download/v8.0/ffmpeg-windows-amd64.zip"
-	ffmpegLinuxURL   = "https://github.com/afkarxyz/ffmpeg-binaries/releases/download/v8.0/ffmpeg-linux-amd64.tar.xz"
+	ffmpegBtbNLatestReleaseURL = "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest"
+	evermeetFFmpegReleaseURL   = "https://evermeet.cx/ffmpeg/getrelease/zip"
+	evermeetFFprobeReleaseURL  = "https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip"
 )
+
+type ffmpegRelease struct {
+	TagName string               `json:"tag_name"`
+	Assets  []GitHubReleaseAsset `json:"assets"`
+}
 
 func GetFFmpegDir() (string, error) {
 	homeDir, err := os.UserHomeDir()
@@ -167,57 +176,139 @@ func DownloadFFmpeg(progressCallback func(int)) error {
 		ffmpegInstalled, _ := IsFFmpegInstalled()
 		ffprobeInstalled, _ := IsFFprobeInstalled()
 
-		isARM := runtime.GOARCH == "arm64"
-
-		var macFFmpegURLs []string
-		var macFFprobeURLs []string
-
-		if isARM {
-
-			macFFmpegURLs = []string{"https://github.com/afkarxyz/ffmpeg-binaries/releases/download/v8.0/ffmpeg-macos-arm64.zip"}
-			macFFprobeURLs = []string{"https://github.com/afkarxyz/ffmpeg-binaries/releases/download/v8.0/ffprobe-macos-arm64.zip"}
-		} else {
-
-			macFFmpegURLs = []string{"https://github.com/afkarxyz/ffmpeg-binaries/releases/download/v8.0/ffmpeg-macos-intel.zip"}
-			macFFprobeURLs = []string{"https://github.com/afkarxyz/ffmpeg-binaries/releases/download/v8.0/ffprobe-macos-intel.zip"}
-		}
-
 		if !ffmpegInstalled && !ffprobeInstalled {
-			if err := downloadWithFallback(macFFmpegURLs, ffmpegDir, progressCallback, 0, 50); err != nil {
+			if err := downloadAndExtract(evermeetFFmpegReleaseURL, ffmpegDir, progressCallback, 0, 50); err != nil {
 				return err
 			}
-			if err := downloadWithFallback(macFFprobeURLs, ffmpegDir, progressCallback, 50, 100); err != nil {
+			if err := downloadAndExtract(evermeetFFprobeReleaseURL, ffmpegDir, progressCallback, 50, 100); err != nil {
 				return err
 			}
 		} else if !ffmpegInstalled {
-			if err := downloadWithFallback(macFFmpegURLs, ffmpegDir, progressCallback, 0, 100); err != nil {
+			if err := downloadAndExtract(evermeetFFmpegReleaseURL, ffmpegDir, progressCallback, 0, 100); err != nil {
 				return err
 			}
 		} else if !ffprobeInstalled {
-			if err := downloadWithFallback(macFFprobeURLs, ffmpegDir, progressCallback, 0, 100); err != nil {
+			if err := downloadAndExtract(evermeetFFprobeReleaseURL, ffmpegDir, progressCallback, 0, 100); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 
-	var url string
-	switch runtime.GOOS {
-	case "windows":
-		url = ffmpegWindowsURL
-	case "linux":
-		url = ffmpegLinuxURL
-	default:
+	release, err := fetchLatestFFmpegRelease()
+	if err != nil {
+		return err
+	}
+	asset, ok := SelectFFmpegAsset(runtime.GOOS, runtime.GOARCH, release.Assets)
+	if !ok {
 		return fmt.Errorf("unsupported operating system: %s", runtime.GOOS)
 	}
+	checksumAsset, ok := findReleaseAsset("checksums.sha256", release.Assets)
+	if !ok {
+		return fmt.Errorf("ffmpeg release does not include checksums.sha256")
+	}
+	expectedHash, err := fetchReleaseAssetChecksum(asset.Name, checksumAsset)
+	if err != nil {
+		return err
+	}
 
-	fmt.Printf("[FFmpeg] Downloading from: %s\n", url)
+	fmt.Printf("[FFmpeg] Downloading from: %s\n", asset.BrowserDownloadURL)
 
-	if err := downloadAndExtract(url, ffmpegDir, progressCallback, 0, 100); err != nil {
+	if err := downloadAndExtractVerified(asset.BrowserDownloadURL, expectedHash, ffmpegDir, progressCallback, 0, 100); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func SelectFFmpegAsset(goos, goarch string, assets []GitHubReleaseAsset) (GitHubReleaseAsset, bool) {
+	osPart := ""
+	switch strings.ToLower(goos) {
+	case "windows":
+		if strings.EqualFold(goarch, "arm64") {
+			osPart = "-winarm64-"
+		} else {
+			osPart = "-win64-"
+		}
+	case "linux":
+		if strings.EqualFold(goarch, "arm64") {
+			osPart = "-linuxarm64-"
+		} else {
+			osPart = "-linux64-"
+		}
+	default:
+		return GitHubReleaseAsset{}, false
+	}
+
+	archiveSuffix := ".tar.xz"
+	if strings.EqualFold(goos, "windows") {
+		archiveSuffix = ".zip"
+	}
+	for _, asset := range assets {
+		name := strings.ToLower(asset.Name)
+		if strings.HasPrefix(name, "ffmpeg-n-") &&
+			strings.Contains(name, osPart) &&
+			strings.Contains(name, "-gpl") &&
+			!strings.Contains(name, "-shared") &&
+			strings.HasSuffix(name, archiveSuffix) {
+			return asset, true
+		}
+	}
+	for _, asset := range assets {
+		name := strings.ToLower(asset.Name)
+		if strings.Contains(name, osPart) &&
+			strings.Contains(name, "-gpl") &&
+			!strings.Contains(name, "-shared") &&
+			strings.HasSuffix(name, archiveSuffix) {
+			return asset, true
+		}
+	}
+	return GitHubReleaseAsset{}, false
+}
+
+func fetchLatestFFmpegRelease() (ffmpegRelease, error) {
+	client := newHTTPClient(30 * time.Second)
+	resp, err := client.Get(ffmpegBtbNLatestReleaseURL)
+	if err != nil {
+		return ffmpegRelease{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return ffmpegRelease{}, fmt.Errorf("GitHub returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var release ffmpegRelease
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		return ffmpegRelease{}, err
+	}
+	if len(release.Assets) == 0 {
+		return ffmpegRelease{}, fmt.Errorf("GitHub release response did not include assets")
+	}
+	return release, nil
+}
+
+func fetchReleaseAssetChecksum(assetName string, checksumAsset GitHubReleaseAsset) (string, error) {
+	if err := validateGitHubReleaseDownloadURL(checksumAsset.BrowserDownloadURL); err != nil {
+		return "", err
+	}
+	resp, err := newHTTPClient(30 * time.Second).Get(checksumAsset.BrowserDownloadURL)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", fmt.Errorf("failed to download ffmpeg checksums: HTTP %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	if err != nil {
+		return "", err
+	}
+	expectedHash := parseSHA256Sums(body)[assetName]
+	if expectedHash == "" {
+		return "", fmt.Errorf("ffmpeg checksum missing for %s", assetName)
+	}
+	return expectedHash, nil
 }
 
 func downloadWithFallback(urls []string, destDir string, progressCallback func(int), start, end int) error {
@@ -235,7 +326,10 @@ func downloadWithFallback(urls []string, destDir string, progressCallback func(i
 }
 
 func downloadAndExtract(url, destDir string, progressCallback func(int), progressStart, progressEnd int) error {
+	return downloadAndExtractVerified(url, "", destDir, progressCallback, progressStart, progressEnd)
+}
 
+func downloadAndExtractVerified(rawURL, expectedSHA256, destDir string, progressCallback func(int), progressStart, progressEnd int) error {
 	tmpFile, err := os.CreateTemp("", "ffmpeg-*")
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %w", err)
@@ -244,7 +338,10 @@ func downloadAndExtract(url, destDir string, progressCallback func(int), progres
 	defer tmpFile.Close()
 
 	client := newHTTPClient(0)
-	req, err := http.NewRequest("GET", url, nil)
+	if err := validateFFmpegDownloadURL(rawURL); err != nil {
+		return err
+	}
+	req, err := http.NewRequest("GET", rawURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
@@ -273,12 +370,16 @@ func downloadAndExtract(url, destDir string, progressCallback func(int), progres
 	}
 
 	buf := make([]byte, 32*1024)
+	hasher := sha256.New()
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
 			_, writeErr := tmpFile.Write(buf[:n])
 			if writeErr != nil {
 				return fmt.Errorf("failed to write to temp file: %w", writeErr)
+			}
+			if _, err := hasher.Write(buf[:n]); err != nil {
+				return fmt.Errorf("failed to hash download: %w", err)
 			}
 			downloaded += int64(n)
 
@@ -331,6 +432,9 @@ func downloadAndExtract(url, destDir string, progressCallback func(int), progres
 	}
 
 	tmpFile.Close()
+	if expectedSHA256 != "" && !strings.EqualFold(expectedSHA256, hex.EncodeToString(hasher.Sum(nil))) {
+		return fmt.Errorf("ffmpeg checksum mismatch")
+	}
 
 	if totalSize > 0 {
 		fmt.Printf("\r[FFmpeg] Download complete: %.2f MB / %.2f MB (100%%)          \n",
@@ -340,10 +444,25 @@ func downloadAndExtract(url, destDir string, progressCallback func(int), progres
 	}
 	fmt.Printf("[FFmpeg] Extracting...\n")
 
-	if strings.HasSuffix(url, ".tar.xz") || runtime.GOOS == "linux" {
+	if strings.HasSuffix(rawURL, ".tar.xz") || runtime.GOOS == "linux" {
 		return extractTarXz(tmpFile.Name(), destDir)
 	}
 	return extractZip(tmpFile.Name(), destDir)
+}
+
+func validateFFmpegDownloadURL(rawURL string) error {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return err
+	}
+	if parsed.Scheme != "https" {
+		return fmt.Errorf("ffmpeg download URL must use HTTPS")
+	}
+	host := parsed.Hostname()
+	if host != "github.com" && host != "evermeet.cx" {
+		return fmt.Errorf("unexpected ffmpeg download host: %s", host)
+	}
+	return nil
 }
 
 func extractZip(zipPath, destDir string) error {

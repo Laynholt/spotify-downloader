@@ -1,8 +1,10 @@
 import { FetchSessionTokenWithParams } from "../../wailsjs/go/main/App";
-import { getSettings, updateSettings, isTokenExpired, isLikelySessionToken, MIN_TOKEN_TIMEOUT } from "./settings";
+import { getSettings, isLikelySessionToken, MIN_TOKEN_TIMEOUT } from "./settings";
 import { logger } from "./logger";
 let isFetchingToken = false;
 let lastFetchTime = 0;
+let cachedSessionToken = "";
+let cachedSessionTokenExpiry = 0;
 export class ChromeNotInstalledError extends Error {
     constructor(message: string) {
         super(message);
@@ -11,9 +13,10 @@ export class ChromeNotInstalledError extends Error {
 }
 export async function ensureValidToken(forceRefresh: boolean = false): Promise<string> {
     const settings = getSettings();
-    if (!forceRefresh && !isTokenExpired(settings)) {
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    if (!forceRefresh && isLikelySessionToken(cachedSessionToken) && cachedSessionTokenExpiry - nowSeconds >= 30) {
         logger.debug("session token: using cached token");
-        return settings.sessionToken;
+        return cachedSessionToken;
     }
     if (isFetchingToken) {
         await new Promise(resolve => setTimeout(resolve, 1000));
@@ -33,10 +36,8 @@ export async function ensureValidToken(forceRefresh: boolean = false): Promise<s
         if (!isLikelySessionToken(response.token)) {
             throw new Error("Session token fetch returned an empty or invalid token");
         }
-        await updateSettings({
-            sessionToken: response.token,
-            sessionTokenExpiry: response.expires_at,
-        });
+        cachedSessionToken = response.token;
+        cachedSessionTokenExpiry = response.expires_at;
         logger.success("session token: fetched successfully");
         return response.token;
     }

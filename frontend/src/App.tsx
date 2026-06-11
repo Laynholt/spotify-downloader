@@ -5,7 +5,7 @@ import { Search, X, ArrowUp, ListChecks } from "lucide-react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { getSettings, getSettingsWithDefaults, loadSettings, saveSettings, applyThemeMode, applyFont } from "@/lib/settings";
 import { applyTheme } from "@/lib/themes";
-import { OpenFolder, CheckFFmpegInstalled, DownloadFFmpeg } from "../wailsjs/go/main/App";
+import { CheckAppUpdate, DownloadAppUpdate, OpenFolder, CheckFFmpegInstalled, DownloadFFmpeg } from "../wailsjs/go/main/App";
 import { EventsOn, EventsOff, Quit } from "../wailsjs/runtime/runtime";
 import { toastWithSound as toast } from "@/lib/toast-with-sound";
 import { extractArtistID } from "@/lib/spotify-url";
@@ -34,8 +34,18 @@ import { useLyrics } from "@/hooks/useLyrics";
 import { useCover } from "@/hooks/useCover";
 import { useDownloadQueueDialog } from "@/hooks/useDownloadQueueDialog";
 import { useDownloadProgress } from "@/hooks/useDownloadProgress";
+import { isNewerVersion } from "@/lib/version";
 const HISTORY_KEY = "spotidownloader_fetch_history";
 const MAX_HISTORY = 5;
+interface AppUpdateStatus {
+    available: boolean;
+    latest_version: string;
+    release_date?: string;
+    release_url?: string;
+    asset_name?: string;
+    asset_url?: string;
+    error?: string;
+}
 function App() {
     const [currentPage, setCurrentPage] = useState<PageType>("main");
     const [spotifyUrl, setSpotifyUrl] = useState("");
@@ -45,6 +55,9 @@ function App() {
     const [currentListPage, setCurrentListPage] = useState(1);
     const [hasUpdate, setHasUpdate] = useState(false);
     const [releaseDate, setReleaseDate] = useState<string | null>(null);
+    const [appUpdate, setAppUpdate] = useState<AppUpdateStatus | null>(null);
+    const [isUpdatingApp, setIsUpdatingApp] = useState(false);
+    const [appUpdateProgress, setAppUpdateProgress] = useState(0);
     const [fetchHistory, setFetchHistory] = useState<HistoryItem[]>([]);
     const [showScrollTop, setShowScrollTop] = useState(false);
     const [isSearchMode, setIsSearchMode] = useState(false);
@@ -140,18 +153,42 @@ function App() {
     }, [metadata.metadata]);
     const checkForUpdates = async () => {
         try {
-            const response = await fetch("https://api.github.com/repos/Laynholt/spotify-downloader/releases/latest");
-            const data = await response.json();
-            const latestVersion = data.tag_name?.replace(/^v/, "") || "";
-            if (data.published_at) {
-                setReleaseDate(data.published_at);
-            }
-            if (latestVersion && latestVersion > CURRENT_VERSION) {
-                setHasUpdate(true);
-            }
+            const status = await CheckAppUpdate(CURRENT_VERSION) as AppUpdateStatus;
+            setAppUpdate(status);
+            setReleaseDate(status.release_date || null);
+            setHasUpdate(Boolean(status.available && status.latest_version && isNewerVersion(status.latest_version, CURRENT_VERSION)));
         }
         catch (err) {
             console.error("Failed to check for updates:", err);
+        }
+    };
+    const handleApplyAppUpdate = async () => {
+        if (!appUpdate?.available || isUpdatingApp)
+            return;
+        setIsUpdatingApp(true);
+        setAppUpdateProgress(0);
+        try {
+            EventsOn("app-update:progress", (progress: number) => {
+                setAppUpdateProgress(progress);
+            });
+            EventsOn("app-update:status", (status: string) => {
+                if (status === "restarting") {
+                    toast.success("Update downloaded. Restarting...");
+                }
+            });
+            const result = await DownloadAppUpdate(CURRENT_VERSION);
+            if (!result?.success) {
+                toast.error(result?.error || result?.message || "Failed to apply update");
+                setIsUpdatingApp(false);
+            }
+        }
+        catch (err) {
+            toast.error(err instanceof Error ? err.message : "Failed to apply update");
+            setIsUpdatingApp(false);
+        }
+        finally {
+            EventsOff("app-update:progress");
+            EventsOff("app-update:status");
         }
     };
     const loadHistory = () => {
@@ -432,7 +469,7 @@ function App() {
                 return <FileManagerPage />;
             default:
                 return (<>
-                    <Header version={CURRENT_VERSION} hasUpdate={hasUpdate} releaseDate={releaseDate}/>
+                    <Header version={CURRENT_VERSION} hasUpdate={hasUpdate} releaseDate={releaseDate} updateAssetName={appUpdate?.asset_name} isUpdating={isUpdatingApp} updateProgress={appUpdateProgress} onApplyUpdate={handleApplyAppUpdate}/>
 
 
 

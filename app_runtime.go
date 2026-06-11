@@ -96,6 +96,9 @@ func (a *App) GetFFmpegPath() (string, error) {
 }
 
 func (a *App) UploadImage(filePath string) (string, error) {
+	if err := backend.ValidateUploadMediaFile(filePath); err != nil {
+		return "", err
+	}
 	return backend.UploadToSendNow(filePath)
 }
 
@@ -127,6 +130,29 @@ func (a *App) DownloadFFmpeg() DownloadFFmpegResponse {
 
 	runtime.EventsEmit(a.ctx, "ffmpeg:status", "completed")
 	return DownloadFFmpegResponse{Success: true, Message: "FFmpeg installed successfully"}
+}
+
+func (a *App) CheckAppUpdate(currentVersion string) (backend.AppUpdateStatus, error) {
+	return backend.CheckAppUpdate(currentVersion)
+}
+
+func (a *App) DownloadAppUpdate(currentVersion string) (backend.AppUpdateResult, error) {
+	runtime.EventsEmit(a.ctx, "app-update:status", "downloading")
+	result, err := backend.DownloadAppUpdate(currentVersion, func(progress int) {
+		runtime.EventsEmit(a.ctx, "app-update:progress", progress)
+	})
+	if err != nil {
+		runtime.EventsEmit(a.ctx, "app-update:status", "failed")
+		return result, err
+	}
+	if result.Success {
+		runtime.EventsEmit(a.ctx, "app-update:status", "restarting")
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			runtime.Quit(a.ctx)
+		}()
+	}
+	return result, nil
 }
 
 func (a *App) GetPreviewURL(trackID string) (string, error) {

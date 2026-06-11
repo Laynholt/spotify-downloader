@@ -27,6 +27,9 @@ interface FileNode {
     path: string;
     is_dir: boolean;
     size: number;
+    track_count?: number;
+    lyric_count?: number;
+    cover_count?: number;
     children?: FileNode[];
     expanded?: boolean;
 }
@@ -77,6 +80,7 @@ export function FileManagerPage() {
     const [allFiles, setAllFiles] = useState<FileNode[]>([]);
     const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
     const [loading, setLoading] = useState(false);
+    const [loadingFolders, setLoadingFolders] = useState<Set<string>>(new Set());
     const [activeTab, setActiveTab] = useState<TabType>("track");
     const [formatPreset, setFormatPreset] = useState<string>(() => {
         try {
@@ -154,12 +158,14 @@ export function FileManagerPage() {
     const filterFilesByType = (nodes: FileNode[], type: TabType): FileNode[] => {
         return nodes
             .map((node) => {
-            if (node.is_dir && node.children) {
-                const filteredChildren = filterFilesByType(node.children, type);
-                if (filteredChildren.length > 0) {
-                    return { ...node, children: filteredChildren };
-                }
-                return null;
+            if (node.is_dir) {
+                const count = type === "track" ? node.track_count || 0 : type === "lyric" ? node.lyric_count || 0 : node.cover_count || 0;
+                if (count === 0)
+                    return null;
+                return {
+                    ...node,
+                    children: node.children ? filterFilesByType(node.children, type) : undefined,
+                };
             }
             const ext = node.name.toLowerCase();
             if (type === "track" && (ext.endsWith(".flac") || ext.endsWith(".mp3") || ext.endsWith(".m4a")))
@@ -213,6 +219,13 @@ export function FileManagerPage() {
         }
         return result;
     };
+    const getNodeCount = (node: FileNode, type: TabType): number => {
+        if (type === "track")
+            return node.track_count || 0;
+        if (type === "lyric")
+            return node.lyric_count || 0;
+        return node.cover_count || 0;
+    };
     const allAudioFiles = getAllFilesFlat(filterFilesByType(allFiles, "track"));
     const allLyricFiles = getAllFilesFlat(filterFilesByType(allFiles, "lyric"));
     const allCoverFiles = getAllFilesFlat(filterFilesByType(allFiles, "cover"));
@@ -226,8 +239,25 @@ export function FileManagerPage() {
             toast.error("Failed to select folder", { description: err instanceof Error ? err.message : "Unknown error" });
         }
     };
-    const toggleExpand = (path: string) => {
+    const toggleExpand = async (path: string) => {
+        const node = findNode(allFiles, path);
+        const shouldLoad = Boolean(node?.is_dir && !node.expanded && !node.children);
         setAllFiles((prev) => toggleNodeExpand(prev, path));
+        if (shouldLoad) {
+            await loadFolderChildren(path);
+        }
+    };
+    const findNode = (nodes: FileNode[], path: string): FileNode | null => {
+        for (const node of nodes) {
+            if (node.path === path)
+                return node;
+            if (node.children) {
+                const child = findNode(node.children, path);
+                if (child)
+                    return child;
+            }
+        }
+        return null;
     };
     const toggleNodeExpand = (nodes: FileNode[], path: string): FileNode[] => {
         return nodes.map((node) => {
@@ -237,6 +267,32 @@ export function FileManagerPage() {
                 return { ...node, children: toggleNodeExpand(node.children, path) };
             return node;
         });
+    };
+    const updateNodeChildren = (nodes: FileNode[], path: string, children: FileNode[]): FileNode[] => {
+        return nodes.map((node) => {
+            if (node.path === path)
+                return { ...node, children, expanded: true };
+            if (node.children)
+                return { ...node, children: updateNodeChildren(node.children, path, children) };
+            return node;
+        });
+    };
+    const loadFolderChildren = async (path: string) => {
+        setLoadingFolders((prev) => new Set(prev).add(path));
+        try {
+            const result = await ListDirectoryFiles(path);
+            setAllFiles((prev) => updateNodeChildren(prev, path, (result || []) as FileNode[]));
+        }
+        catch (err) {
+            toast.error("Failed to load folder", { description: err instanceof Error ? err.message : "Unknown error" });
+        }
+        finally {
+            setLoadingFolders((prev) => {
+                const next = new Set(prev);
+                next.delete(path);
+                return next;
+            });
+        }
     };
     const toggleSelect = (path: string) => {
         setSelectedFiles((prev) => {
@@ -438,13 +494,14 @@ export function FileManagerPage() {
                 }} onCheckedChange={() => toggleFolderSelect(node)} onClick={(e) => e.stopPropagation()} className="shrink-0 data-[state=indeterminate]:bg-primary data-[state=indeterminate]:text-primary-foreground"/>
           {node.expanded ? <ChevronDown className="h-4 w-4 text-muted-foreground shrink-0"/> : <ChevronRight className="h-4 w-4 text-muted-foreground shrink-0"/>}
           <Folder className="h-4 w-4 text-yellow-500 shrink-0"/>
+          {loadingFolders.has(node.path) && <Spinner className="h-3 w-3 shrink-0"/>}
         </>) : (<>
           <Checkbox checked={selectedFiles.has(node.path)} onCheckedChange={() => toggleSelect(node.path)} onClick={(e) => e.stopPropagation()} className="shrink-0"/>
           <FileMusic className="h-4 w-4 text-primary shrink-0"/>
         </>)}
         <span className="truncate text-sm flex-1">
           {node.name}
-          {node.is_dir && <span className="text-muted-foreground ml-1">({getAllFilesFlat([node]).length})</span>}
+          {node.is_dir && <span className="text-muted-foreground ml-1">({getNodeCount(node, "track")})</span>}
         </span>
         {!node.is_dir && (<>
           <span className="text-xs text-muted-foreground shrink-0">{formatFileSize(node.size)}</span>
@@ -467,10 +524,11 @@ export function FileManagerPage() {
         {node.is_dir ? (<>
           {node.expanded ? <ChevronDown className="h-4 w-4 text-muted-foreground shrink-0"/> : <ChevronRight className="h-4 w-4 text-muted-foreground shrink-0"/>}
           <Folder className="h-4 w-4 text-yellow-500 shrink-0"/>
+          {loadingFolders.has(node.path) && <Spinner className="h-3 w-3 shrink-0"/>}
         </>) : (<FileText className="h-4 w-4 text-blue-500 shrink-0"/>)}
         <span className="truncate text-sm flex-1">
           {node.name}
-          {node.is_dir && <span className="text-muted-foreground ml-1">({getAllFilesFlat([node]).length})</span>}
+          {node.is_dir && <span className="text-muted-foreground ml-1">({getNodeCount(node, "lyric")})</span>}
         </span>
         {!node.is_dir && (<>
           <span className="text-xs text-muted-foreground shrink-0">{formatFileSize(node.size)}</span>
@@ -493,10 +551,11 @@ export function FileManagerPage() {
         {node.is_dir ? (<>
           {node.expanded ? <ChevronDown className="h-4 w-4 text-muted-foreground shrink-0"/> : <ChevronRight className="h-4 w-4 text-muted-foreground shrink-0"/>}
           <Folder className="h-4 w-4 text-yellow-500 shrink-0"/>
+          {loadingFolders.has(node.path) && <Spinner className="h-3 w-3 shrink-0"/>}
         </>) : (<Image className="h-4 w-4 text-green-500 shrink-0"/>)}
         <span className="truncate text-sm flex-1">
           {node.name}
-          {node.is_dir && <span className="text-muted-foreground ml-1">({getAllFilesFlat([node]).length})</span>}
+          {node.is_dir && <span className="text-muted-foreground ml-1">({getNodeCount(node, "cover")})</span>}
         </span>
         {!node.is_dir && (<>
           <span className="text-xs text-muted-foreground shrink-0">{formatFileSize(node.size)}</span>

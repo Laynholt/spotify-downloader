@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-var AppVersion = "Unknown"
+var AppVersion = "7.2.0"
 
 const musicBrainzAPIBase = "https://musicbrainz.org/ws/2"
 

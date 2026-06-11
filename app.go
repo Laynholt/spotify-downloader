@@ -387,6 +387,9 @@ func (a *App) RenameFilesByMetadata(files []string, format string) []backend.Ren
 }
 
 func (a *App) ReadTextFile(filePath string) (string, error) {
+	if err := backend.ValidateReadableTextFile(filePath); err != nil {
+		return "", err
+	}
 	content, err := os.ReadFile(filePath)
 	if err != nil {
 		return "", err
@@ -395,13 +398,17 @@ func (a *App) ReadTextFile(filePath string) (string, error) {
 }
 
 func (a *App) RenameFileTo(oldPath, newName string) error {
-	dir := filepath.Dir(oldPath)
-	ext := filepath.Ext(oldPath)
-	newPath := filepath.Join(dir, newName+ext)
+	newPath, err := backend.BuildSiblingRenamePath(oldPath, newName)
+	if err != nil {
+		return err
+	}
 	return backend.MoveFileWithFallback(oldPath, newPath)
 }
 
 func (a *App) ReadImageAsBase64(filePath string) (string, error) {
+	if err := backend.ValidateReadableImageFile(filePath); err != nil {
+		return "", err
+	}
 	content, err := os.ReadFile(filePath)
 	if err != nil {
 		return "", err
@@ -444,7 +451,7 @@ func (a *App) SaveSettings(settings map[string]interface{}) error {
 		return err
 	}
 
-	return os.WriteFile(configPath, data, 0644)
+	return os.WriteFile(configPath, data, 0600)
 }
 
 func (a *App) LoadSettings() (map[string]interface{}, error) {

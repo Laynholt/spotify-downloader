@@ -1,6 +1,6 @@
 module github.com/afkarxyz/SpotiDownloader
 
-go 1.26
+go 1.26.4
 
 require (
 	github.com/bogem/id3v2/v2 v2.1.4

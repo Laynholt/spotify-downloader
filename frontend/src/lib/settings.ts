@@ -166,7 +166,10 @@ type LegacySettings = Partial<Settings> & {
     spotFetchAPIUrl?: unknown;
 };
 function toBackendSettingsPayload(settings: Settings): { [key: string]: unknown } {
-    return { ...settings };
+    const safeSettings: { [key: string]: unknown } = { ...settings };
+    delete safeSettings.sessionToken;
+    delete safeSettings.sessionTokenExpiry;
+    return safeSettings;
 }
 function normalizeSettingsData(source: LegacySettings | null | undefined): Settings {
     const parsed = { ...(source || {}) };
@@ -176,6 +179,8 @@ function normalizeSettingsData(source: LegacySettings | null | undefined): Setti
     }
     delete parsed.useSpotFetchAPI;
     delete parsed.spotFetchAPIUrl;
+    delete parsed.sessionToken;
+    delete parsed.sessionTokenExpiry;
     if (!("folderPreset" in parsed) && ("artistSubfolder" in parsed || "albumSubfolder" in parsed)) {
         const hasArtist = parsed.artistSubfolder;
         const hasAlbum = parsed.albumSubfolder;
@@ -325,11 +330,12 @@ export async function getSettingsWithDefaults(): Promise<Settings> {
 }
 export async function saveSettings(settings: Settings): Promise<void> {
     try {
-        cachedSettings = settings;
+        const safeSettings = normalizeSettingsData(toBackendSettingsPayload(settings) as LegacySettings);
+        cachedSettings = safeSettings;
         hasLoadedSettings = true;
-        localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
-        await SaveToBackend(toBackendSettingsPayload(settings));
-        window.dispatchEvent(new CustomEvent('settingsUpdated', { detail: settings }));
+        localStorage.setItem(SETTINGS_KEY, JSON.stringify(toBackendSettingsPayload(safeSettings)));
+        await SaveToBackend(toBackendSettingsPayload(safeSettings));
+        window.dispatchEvent(new CustomEvent('settingsUpdated', { detail: safeSettings }));
     }
     catch (error) {
         console.error("Failed to save settings:", error);
