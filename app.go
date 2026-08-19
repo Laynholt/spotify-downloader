@@ -12,20 +12,34 @@ import (
 	"time"
 
 	"github.com/afkarxyz/SpotiDownloader/backend"
+	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 type App struct {
-	ctx context.Context
+	ctx            context.Context
+	runtimePaths   backend.RuntimePaths
+	runtimeInitErr error
 }
 
 const inlineLyricsWaitTimeout = 3 * time.Second
 
 func NewApp() *App {
-	return &App{}
+	paths, err := backend.InitRuntimePaths()
+	return &App{runtimePaths: paths, runtimeInitErr: err}
 }
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+
+	if a.runtimeInitErr != nil {
+		_, _ = runtime.MessageDialog(ctx, runtime.MessageDialogOptions{
+			Type:    runtime.ErrorDialog,
+			Title:   "SpotiDownloader cannot start",
+			Message: a.runtimeInitErr.Error(),
+		})
+		runtime.Quit(ctx)
+		return
+	}
 
 	if err := backend.InitHistoryDB("SpotiDownloader"); err != nil {
 		fmt.Printf("Failed to init history DB: %v\n", err)
