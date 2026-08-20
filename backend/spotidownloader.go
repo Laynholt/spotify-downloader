@@ -22,6 +22,8 @@ const (
 	spotidownloaderAPIBase = "https://api.spotidownloader.com"
 )
 
+var finalizeTaggedAudioFileForDownload = FinalizeTaggedAudioFile
+
 const (
 	networkRetryAttempts = 3
 	networkRetryDelay    = 750 * time.Millisecond
@@ -1110,8 +1112,9 @@ func (s *SpotiDownloader) DownloadTrackContext(
 
 	var outputPath string
 	var coverPath string
+	outputCommitted := false
 	defer func() {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil && !outputCommitted {
 			if outputPath != "" {
 				_ = os.Remove(outputPath)
 			}
@@ -1232,8 +1235,10 @@ func (s *SpotiDownloader) DownloadTrackContext(
 		fmt.Printf("Warning: Failed to embed metadata: %v\n", err)
 	}
 
-	if finalizeErr := FinalizeTaggedAudioFile(outputPath); finalizeErr != nil {
+	if finalizeErr := finalizeTaggedAudioFileForDownload(outputPath); finalizeErr != nil {
 		fmt.Printf("Warning: Failed to finalize MP3 tag temp file: %v\n", finalizeErr)
+	} else {
+		outputCommitted = true
 	}
 
 	if coverPath != "" {

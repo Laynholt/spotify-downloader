@@ -2,17 +2,86 @@ package backend
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
+}
+
+func TestDownloadTrackContextPreservesFinalizedOutputAfterCancellation(t *testing.T) {
+	dir := t.TempDir()
+	outputPath := filepath.Join(dir, "track - artist.flac")
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodPost {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(bytes.NewBufferString(`{"success":true,"linkFlac":"https://download.test/audio"}`)),
+				Request:    req,
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"audio/flac"}},
+			Body:       io.NopCloser(bytes.NewBufferString("partial flac")),
+			Request:    req,
+		}, nil
+	})}
+	downloader := &SpotiDownloader{httpClient: client}
+
+	finalized := make(chan struct{})
+	previousFinalize := finalizeTaggedAudioFileForDownload
+	finalizeTaggedAudioFileForDownload = func(path string) error {
+		if err := previousFinalize(path); err != nil {
+			return err
+		}
+		close(finalized)
+		return nil
+	}
+	t.Cleanup(func() { finalizeTaggedAudioFileForDownload = previousFinalize })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct {
+		path string
+		err  error
+	}, 1)
+	go func() {
+		path, err := downloader.DownloadTrackContext(ctx, "", dir, "flac", "default", false, 0,
+			"track", "artist", "album", "artist", "", "", 0, 0, 0, false, false, 0,
+			"", "", "", "", false, false, false)
+		done <- struct {
+			path string
+			err  error
+		}{path, err}
+	}()
+	select {
+	case <-finalized:
+		cancel()
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("download did not reach finalization barrier")
+	}
+	result := <-done
+	if result.err != nil {
+		t.Fatalf("download returned error after finalized cancellation: %v", result.err)
+	}
+	if result.path != outputPath {
+		t.Fatalf("download path = %q, want %q", result.path, outputPath)
+	}
+	if _, err := os.Stat(outputPath); err != nil {
+		t.Fatalf("finalized output was removed after cancellation: %v", err)
+	}
 }
 
 func TestStatusErrorTreatsUnauthorizedStatusesAsSessionTokenErrors(t *testing.T) {

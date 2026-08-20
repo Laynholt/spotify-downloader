@@ -732,6 +732,8 @@ type ConvertAudioResult struct {
 	Error      string `json:"error,omitempty"`
 }
 
+var conversionCommitHook = func(string) {}
+
 func ConvertAudio(req ConvertAudioRequest) ([]ConvertAudioResult, error) {
 	return ConvertAudioContext(context.Background(), req)
 }
@@ -749,11 +751,21 @@ func ConvertAudioContext(ctx context.Context, req ConvertAudioRequest) ([]Conver
 	}
 
 	installed, err := IsFFmpegInstalledContext(ctx)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 	if err != nil || !installed {
 		return nil, fmt.Errorf("ffmpeg is not installed")
 	}
 
 	results := make([]ConvertAudioResult, len(req.InputFiles))
+	type conversionState struct {
+		inputFile    string
+		outputFile   string
+		coverArtPath string
+		committed    bool
+	}
+	states := make([]conversionState, len(req.InputFiles))
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
@@ -761,6 +773,7 @@ func ConvertAudioContext(ctx context.Context, req ConvertAudioRequest) ([]Conver
 		wg.Add(1)
 		go func(idx int, inputFile string) {
 			defer wg.Done()
+			states[idx].inputFile = inputFile
 
 			result := ConvertAudioResult{
 				InputFile: inputFile,
@@ -791,6 +804,7 @@ func ConvertAudioContext(ctx context.Context, req ConvertAudioRequest) ([]Conver
 
 			outputExt := "." + strings.ToLower(req.OutputFormat)
 			outputFile := filepath.Join(outputDir, baseName+outputExt)
+			states[idx].outputFile = outputFile
 
 			if inputExt == outputExt {
 				result.Error = "Input and output formats are the same"
@@ -813,6 +827,7 @@ func ConvertAudioContext(ctx context.Context, req ConvertAudioRequest) ([]Conver
 			}
 
 			coverArtPath, _ = ExtractCoverArt(inputFile)
+			states[idx].coverArtPath = coverArtPath
 			lyrics, err = ExtractLyrics(inputFile)
 			if err != nil {
 				fmt.Printf("[FFmpeg] Warning: Failed to extract lyrics from %s: %v\n", inputFile, err)
@@ -937,6 +952,9 @@ func ConvertAudioContext(ctx context.Context, req ConvertAudioRequest) ([]Conver
 				}
 			}
 
+			states[idx].committed = true
+			conversionCommitHook(outputFile)
+
 			if coverArtPath != "" {
 				os.Remove(coverArtPath)
 			}
@@ -952,12 +970,19 @@ func ConvertAudioContext(ctx context.Context, req ConvertAudioRequest) ([]Conver
 
 	wg.Wait()
 	if err := ctx.Err(); err != nil {
-		for _, inputFile := range req.InputFiles {
-			_ = os.Remove(inputFile)
-			inputExt := strings.ToLower(filepath.Ext(inputFile))
-			baseName := strings.TrimSuffix(filepath.Base(inputFile), inputExt)
-			outputFile := filepath.Join(filepath.Dir(inputFile), strings.ToUpper(req.OutputFormat), baseName+"."+strings.ToLower(req.OutputFormat))
-			_ = os.Remove(outputFile)
+		for _, state := range states {
+			if state.committed {
+				continue
+			}
+			if state.inputFile != "" {
+				_ = os.Remove(state.inputFile)
+			}
+			if state.outputFile != "" {
+				_ = os.Remove(state.outputFile)
+			}
+			if state.coverArtPath != "" {
+				_ = os.Remove(state.coverArtPath)
+			}
 		}
 		return results, err
 	}

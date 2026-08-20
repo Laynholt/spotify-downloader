@@ -17,9 +17,13 @@ import (
 )
 
 const (
-	testHelperModeEnv = "SPOTI_DOWNLOAD_TEST_HELPER_MODE"
-	testHelperMarker  = "SPOTI_DOWNLOAD_TEST_HELPER_MARKER"
-	testHelperRelease = "SPOTI_DOWNLOAD_TEST_HELPER_RELEASE"
+	testHelperModeEnv           = "SPOTI_DOWNLOAD_TEST_HELPER_MODE"
+	testHelperMarker            = "SPOTI_DOWNLOAD_TEST_HELPER_MARKER"
+	testHelperRelease           = "SPOTI_DOWNLOAD_TEST_HELPER_RELEASE"
+	testHelperVersionMarker     = "SPOTI_DOWNLOAD_TEST_HELPER_VERSION_MARKER"
+	testHelperBatchMode         = "SPOTI_DOWNLOAD_TEST_HELPER_BATCH_MODE"
+	testHelperBatchFirstMarker  = "SPOTI_DOWNLOAD_TEST_HELPER_BATCH_FIRST_MARKER"
+	testHelperBatchSecondMarker = "SPOTI_DOWNLOAD_TEST_HELPER_BATCH_SECOND_MARKER"
 )
 
 func TestMain(m *testing.M) {
@@ -216,6 +220,103 @@ func TestConvertAudioContextActiveCancellation(t *testing.T) {
 	}
 }
 
+func TestConvertAudioContextVersionCheckCancellation(t *testing.T) {
+	installFakeFFmpegRuntime(t)
+	versionMarker := filepath.Join(t.TempDir(), "ffmpeg-version-started")
+	t.Setenv(testHelperVersionMarker, versionMarker)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := ConvertAudioContext(ctx, ConvertAudioRequest{})
+		done <- err
+	}()
+	if err := waitForFile(versionMarker, time.Second); err != nil {
+		cancel()
+		t.Fatal("ffmpeg version helper did not start:", err)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("version-check cancellation error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("version-check cancellation ignored")
+	}
+}
+
+func TestConvertAudioContextBatchCancellationPreservesCommittedSibling(t *testing.T) {
+	installFakeFFmpegRuntime(t)
+	firstMarker := filepath.Join(t.TempDir(), "first-started")
+	secondMarker := filepath.Join(t.TempDir(), "second-started")
+	t.Setenv(testHelperBatchMode, "1")
+	t.Setenv(testHelperBatchFirstMarker, firstMarker)
+	t.Setenv(testHelperBatchSecondMarker, secondMarker)
+	committed := make(chan string, 1)
+	previousCommitHook := conversionCommitHook
+	conversionCommitHook = func(path string) { committed <- path }
+	t.Cleanup(func() { conversionCommitHook = previousCommitHook })
+
+	dir := t.TempDir()
+	firstInput := filepath.Join(dir, "first.wav")
+	secondInput := filepath.Join(dir, "second.wav")
+	for _, path := range []string{firstInput, secondInput} {
+		if err := os.WriteFile(path, []byte("source"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := ConvertAudioContext(ctx, ConvertAudioRequest{
+			InputFiles:   []string{firstInput, secondInput},
+			OutputFormat: "flac",
+		})
+		done <- err
+	}()
+	for _, marker := range []string{firstMarker, secondMarker} {
+		if err := waitForFile(marker, time.Second); err != nil {
+			cancel()
+			t.Fatal("batch helper did not reach barrier:", err)
+		}
+	}
+	firstOutput := filepath.Join(dir, "FLAC", "first.flac")
+	select {
+	case committedPath := <-committed:
+		if committedPath != firstOutput {
+			cancel()
+			t.Fatalf("unexpected committed path %q, want %q", committedPath, firstOutput)
+		}
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("first conversion did not commit")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("batch cancellation error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("batch conversion cancellation ignored")
+	}
+	if _, err := os.Stat(firstOutput); err != nil {
+		t.Fatalf("committed sibling output was removed: %v", err)
+	}
+	if _, err := os.Stat(firstInput); err != nil {
+		t.Fatalf("committed sibling source was removed: %v", err)
+	}
+	secondOutput := filepath.Join(dir, "FLAC", "second.flac")
+	if _, err := os.Stat(secondOutput); !os.IsNotExist(err) {
+		t.Fatalf("incomplete sibling output remains: %v", err)
+	}
+	if _, err := os.Stat(secondInput); !os.IsNotExist(err) {
+		t.Fatalf("incomplete sibling source remains: %v", err)
+	}
+}
+
 func TestDownloadCoverImageCancellationRemovesTemp(t *testing.T) {
 	paths := installRuntimePathsForCancellationTest(t)
 	started := make(chan struct{})
@@ -317,6 +418,12 @@ func runManagedGrandchildHelper() int {
 
 func runFakeFFmpegHelper() int {
 	if len(os.Args) > 1 && os.Args[1] == "-version" {
+		if marker := os.Getenv(testHelperVersionMarker); marker != "" {
+			_ = os.WriteFile(marker, []byte("started"), 0600)
+			for {
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
 		return 0
 	}
 	marker := os.Getenv(testHelperMarker)
@@ -328,6 +435,17 @@ func runFakeFFmpegHelper() int {
 		if output != "" && !strings.HasPrefix(output, "-") {
 			_ = os.MkdirAll(filepath.Dir(output), 0755)
 			_ = os.WriteFile(output, []byte("partial output"), 0600)
+		}
+		if os.Getenv(testHelperBatchMode) != "" {
+			if strings.Contains(filepath.Base(output), "first") {
+				if marker := os.Getenv(testHelperBatchFirstMarker); marker != "" {
+					_ = os.WriteFile(marker, []byte("committed"), 0600)
+				}
+				return 0
+			}
+			if marker := os.Getenv(testHelperBatchSecondMarker); marker != "" {
+				_ = os.WriteFile(marker, []byte("started"), 0600)
+			}
 		}
 	}
 	for {
