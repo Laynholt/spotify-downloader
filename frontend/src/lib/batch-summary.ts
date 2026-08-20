@@ -5,6 +5,7 @@ export type BatchTrackStatus =
     | "failed"
     | "duplicate_skipped"
     | "suspicious"
+    | "cancelled"
     | "youtube_replaced"
     | "youtube_failed"
     | "youtube_still_suspicious";
@@ -23,6 +24,9 @@ export interface BatchTrackResult {
     movedOriginalPath?: string;
     replacementPath?: string;
     validationWarning?: string;
+    warnings?: string[];
+    cacheOutcomes?: Record<string, string>;
+    timings?: import("@/types/api").PipelineTimings;
 }
 
 export interface BatchDownloadSummary {
@@ -31,11 +35,14 @@ export interface BatchDownloadSummary {
     skipped: number;
     metadataUpdated: number;
     failed: number;
+    cancelled: number;
     duplicateSkipped: number;
     suspicious: number;
     youtubeReplaced: number;
     youtubeFailed: number;
     youtubeStillSuspicious: number;
+    elapsedMs: number;
+    peakActive: number;
     results: BatchTrackResult[];
 }
 
@@ -46,11 +53,14 @@ export function createEmptyBatchSummary(title: string): BatchDownloadSummary {
         skipped: 0,
         metadataUpdated: 0,
         failed: 0,
+        cancelled: 0,
         duplicateSkipped: 0,
         suspicious: 0,
         youtubeReplaced: 0,
         youtubeFailed: 0,
         youtubeStillSuspicious: 0,
+        elapsedMs: 0,
+        peakActive: 0,
         results: [],
     };
 }
@@ -74,6 +84,9 @@ export function addBatchResult(summary: BatchDownloadSummary, result: BatchTrack
         case "failed":
             next.failed++;
             break;
+        case "cancelled":
+            next.cancelled++;
+            break;
         case "duplicate_skipped":
             next.duplicateSkipped++;
             break;
@@ -96,6 +109,7 @@ export function addBatchResult(summary: BatchDownloadSummary, result: BatchTrack
 
 export function hasProblemDetails(summary: BatchDownloadSummary): boolean {
     return summary.failed > 0 ||
+        summary.cancelled > 0 ||
         summary.duplicateSkipped > 0 ||
         summary.suspicious > 0 ||
         summary.youtubeFailed > 0 ||

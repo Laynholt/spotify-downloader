@@ -153,6 +153,20 @@ export interface DownloadResponse {
     duration_delta_seconds?: number;
     suspicious?: boolean;
     validation_warning?: string;
+    warnings?: string[];
+    cache_outcomes?: Record<string, string>;
+    timings?: PipelineTimings;
+}
+export interface PipelineTimings {
+    preparation_ms: number;
+    download_ms: number;
+    conversion_ms: number;
+    cover_ms: number;
+    metadata_ms: number;
+    lyrics_ms: number;
+    duration_probe_ms: number;
+    finalization_ms: number;
+    total_ms: number;
 }
 export interface HealthResponse {
     status: string;
