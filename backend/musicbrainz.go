@@ -61,13 +61,25 @@ func FetchMusicBrainzMetadata(isrc, title, artist, album string, useSingleGenre 
 }
 
 func FetchMusicBrainzMetadataContext(ctx context.Context, isrc, title, artist, album string, useSingleGenre bool, embedGenre bool) (Metadata, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	var meta Metadata
-
 	if !embedGenre {
 		return meta, nil
+	}
+	genres, err := fetchMusicBrainzGenresContext(ctx, isrc, title, artist, album)
+	if err != nil {
+		return meta, err
+	}
+	if useSingleGenre {
+		meta.Genre = genres[0]
+	} else {
+		meta.Genre = strings.Join(genres, ", ")
+	}
+	return meta, nil
+}
+
+func fetchMusicBrainzGenresContext(ctx context.Context, isrc, title, artist, album string) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	client := musicBrainzHTTPClientFactory(10 * time.Second)
@@ -85,44 +97,11 @@ func FetchMusicBrainzMetadataContext(ctx context.Context, isrc, title, artist, a
 	}
 
 	if len(queries) == 0 {
-		return meta, fmt.Errorf("no query source available for genre lookup")
+		return nil, fmt.Errorf("no query source available for genre lookup")
 	}
 
-	var recording *struct {
-		ID       string `json:"id"`
-		Title    string `json:"title"`
-		Length   int    `json:"length"`
-		Releases []struct {
-			ID           string `json:"id"`
-			Title        string `json:"title"`
-			Status       string `json:"status"`
-			ReleaseGroup struct {
-				ID          string `json:"id"`
-				Title       string `json:"title"`
-				PrimaryType string `json:"primary-type"`
-			} `json:"release-group"`
-			Date    string `json:"date"`
-			Country string `json:"country"`
-			Media   []struct {
-				Format string `json:"format"`
-			} `json:"media"`
-			LabelInfo []struct {
-				Label struct {
-					Name string `json:"name"`
-				} `json:"label"`
-			} `json:"label-info"`
-		} `json:"releases"`
-		ArtistCredit []struct {
-			Artist struct {
-				ID   string `json:"id"`
-				Name string `json:"name"`
-			} `json:"artist"`
-		} `json:"artist-credit"`
-		Tags []struct {
-			Count int    `json:"count"`
-			Name  string `json:"name"`
-		} `json:"tags"`
-	}
+	var recordingResponse *MusicBrainzRecordingResponse
+	recordingIndex := -1
 
 	for _, query := range queries {
 		mbResp, err := queryMusicBrainzRecordingsContext(ctx, client, query)
@@ -143,18 +122,20 @@ func FetchMusicBrainzMetadataContext(ctx context.Context, isrc, title, artist, a
 			}
 		}
 		if bestIdx >= 0 {
-			recording = &mbResp.Recordings[bestIdx]
-			if len(recording.Tags) > 0 {
+			recordingResponse = mbResp
+			recordingIndex = bestIdx
+			if len(mbResp.Recordings[bestIdx].Tags) > 0 {
 				break
 			}
 		}
 	}
 
-	if recording == nil {
-		return meta, fmt.Errorf("no recordings found for provided query")
+	if recordingResponse == nil || recordingIndex < 0 {
+		return nil, fmt.Errorf("no recordings found for provided query")
 	}
 
 	var genres []string
+	recording := &recordingResponse.Recordings[recordingIndex]
 	seen := make(map[string]struct{}, len(recording.Tags))
 
 	for _, tag := range recording.Tags {
@@ -173,19 +154,11 @@ func FetchMusicBrainzMetadataContext(ctx context.Context, isrc, title, artist, a
 		}
 	}
 
-	if useSingleGenre {
-		if len(genres) > 0 {
-			meta.Genre = genres[0]
-		}
-	} else if len(genres) > 0 {
-		meta.Genre = strings.Join(genres, ", ")
+	if len(genres) == 0 {
+		return nil, fmt.Errorf("no genre tags found in MusicBrainz")
 	}
 
-	if meta.Genre == "" {
-		return meta, fmt.Errorf("no genre tags found in MusicBrainz")
-	}
-
-	return meta, nil
+	return genres, nil
 }
 
 func escapeMusicBrainzQuery(s string) string {

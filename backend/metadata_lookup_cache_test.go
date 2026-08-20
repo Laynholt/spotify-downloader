@@ -265,3 +265,104 @@ func TestSpotifyMetadataCacheSingleflightUsesOneHTTPRequest(t *testing.T) {
 		t.Fatalf("HTTP calls after shared completion = %d", got)
 	}
 }
+
+func TestMetadataLookupCacheRespectsGenreMode(t *testing.T) {
+	var songLinkCalls atomic.Int32
+	var musicBrainzCalls atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "v1-alpha.1/links"):
+			songLinkCalls.Add(1)
+			_, _ = w.Write([]byte(`{"linksByPlatform":{"deezer":{"url":"https://www.deezer.com/track/123"}}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/track/123":
+			_, _ = w.Write([]byte(`{"id":123,"isrc":"ISRC-123","title":"Track"}`))
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/recording"):
+			musicBrainzCalls.Add(1)
+			_, _ = w.Write([]byte(`{"recordings":[{"id":"recording-1","title":"Track","tags":[{"count":10,"name":"electronic"},{"count":9,"name":"ambient"}]}]}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/handshake/"):
+			_, _ = w.Write([]byte(`{"success":true}`))
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/tracks/track-1"):
+			_, _ = w.Write([]byte(`{"artists":[{"id":"artist-1"}]}`))
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/artists/artist-1"):
+			_, _ = w.Write([]byte(`{"genres":["indie"]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	base, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverClient := server.Client()
+	next := serverClient.Transport
+	serverClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		clone := req.Clone(req.Context())
+		clone.URL.Scheme = base.Scheme
+		clone.URL.Host = base.Host
+		return next.RoundTrip(clone)
+	})
+
+	previousSongLinkFactory := metadataSongLinkClientFactory
+	previousChosicFactory := metadataChosicClientFactory
+	previousHTTPFactory := metadataHTTPClientFactory
+	previousMusicBrainzFactory := musicBrainzHTTPClientFactory
+	defer func() {
+		metadataSongLinkClientFactory = previousSongLinkFactory
+		metadataChosicClientFactory = previousChosicFactory
+		metadataHTTPClientFactory = previousHTTPFactory
+		musicBrainzHTTPClientFactory = previousMusicBrainzFactory
+	}()
+	metadataSongLinkClientFactory = func() *SongLinkClient {
+		return &SongLinkClient{client: serverClient, minCallDelay: 0, apiCallResetTime: time.Now()}
+	}
+	metadataChosicClientFactory = func() (*chosicClient, error) {
+		return &chosicClient{httpClient: serverClient}, nil
+	}
+	metadataHTTPClientFactory = func(timeout time.Duration) *http.Client {
+		clone := *serverClient
+		clone.Timeout = timeout
+		return &clone
+	}
+	musicBrainzHTTPClientFactory = metadataHTTPClientFactory
+
+	now := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	cache, warnings := OpenMetadataCache("", CacheOptions{Now: func() time.Time { return now }})
+	if len(warnings) != 0 {
+		t.Fatalf("cache warnings = %v", warnings)
+	}
+	defer cache.Close()
+
+	lookup := func(useSingleGenre bool) taggingMetadataResult {
+		result, warnings := fetchTaggingMetadata(context.Background(), cache, TaggingMetadataRequest{
+			TrackID:        "track-1",
+			TrackName:      "Track",
+			ArtistName:     "Artist",
+			AlbumName:      "Album",
+			UseSingleGenre: useSingleGenre,
+			EmbedGenre:     true,
+		})
+		if len(warnings) != 0 {
+			t.Fatalf("lookup warnings = %v", warnings)
+		}
+		return result
+	}
+
+	single := lookup(true)
+	if single.Genre != "electronic" {
+		t.Fatalf("single-genre lookup = %+v", single)
+	}
+	joined := lookup(false)
+	if joined.Genre != "electronic, ambient" {
+		t.Fatalf("joined-genre lookup = %+v", joined)
+	}
+	if got := songLinkCalls.Load(); got != 1 {
+		t.Fatalf("song.link calls = %d, want 1", got)
+	}
+	if got := musicBrainzCalls.Load(); got != 1 {
+		t.Fatalf("MusicBrainz calls = %d, want 1", got)
+	}
+}

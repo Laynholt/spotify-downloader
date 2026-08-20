@@ -128,7 +128,7 @@ type TaggingMetadataRequest struct {
 
 type cachedISRCMetadata struct {
 	ISRC    string
-	Genre   string
+	Genres  []string
 	Warning string
 }
 
@@ -265,7 +265,7 @@ func fetchTaggingMetadata(ctx context.Context, cache *MetadataCache, req Tagging
 			defer wg.Done()
 			cached, _, err := cachedMetadataLookup(ctx, cache, isrcCacheKey(req.TrackID), trackMetadataTTL,
 				func(value cachedISRCMetadata) bool {
-					return strings.TrimSpace(value.ISRC) != "" && strings.TrimSpace(value.Genre) != ""
+					return strings.TrimSpace(value.ISRC) != "" && len(trimGenreList(value.Genres)) > 0
 				},
 				func(loadCtx context.Context) (cachedISRCMetadata, error) {
 					client := metadataSongLinkClientFactory()
@@ -278,11 +278,11 @@ func fetchTaggingMetadata(ctx context.Context, cache *MetadataCache, req Tagging
 						return cachedISRCMetadata{}, lookupErr
 					}
 
-					meta, musicBrainzErr := FetchMusicBrainzMetadataContext(loadCtx, isrc, req.TrackName, req.ArtistName, req.AlbumName, req.UseSingleGenre, req.EmbedGenre)
+					genres, musicBrainzErr := fetchMusicBrainzGenresContext(loadCtx, isrc, req.TrackName, req.ArtistName, req.AlbumName)
 					if musicBrainzErr != nil {
 						return cachedISRCMetadata{ISRC: isrc, Warning: musicBrainzErr.Error()}, nil
 					}
-					return cachedISRCMetadata{ISRC: isrc, Genre: strings.TrimSpace(meta.Genre)}, nil
+					return cachedISRCMetadata{ISRC: isrc, Genres: trimGenreList(genres)}, nil
 				})
 			if err != nil {
 				addWarning("ISRC/MusicBrainz lookup failed: %v", err)
@@ -290,7 +290,14 @@ func fetchTaggingMetadata(ctx context.Context, cache *MetadataCache, req Tagging
 			}
 			resultMu.Lock()
 			result.ISRC = strings.TrimSpace(cached.ISRC)
-			musicBrainzGenre = strings.TrimSpace(cached.Genre)
+			genres := trimGenreList(cached.Genres)
+			if len(genres) > 0 {
+				if req.UseSingleGenre {
+					musicBrainzGenre = genres[0]
+				} else {
+					musicBrainzGenre = strings.Join(genres, ", ")
+				}
+			}
 			resultMu.Unlock()
 			if strings.TrimSpace(cached.Warning) != "" {
 				addWarning("MusicBrainz lookup failed: %s", strings.TrimSpace(cached.Warning))
