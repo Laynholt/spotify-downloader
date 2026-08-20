@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -415,22 +416,35 @@ func (c *MetadataCache) evictCapacityLocked() {
 	}
 }
 
-func (c *MetadataCache) lookupRaw(key string, now time.Time) (json.RawMessage, bool) {
+func (c *MetadataCache) lookupRaw(key string, now time.Time) (json.RawMessage, cacheEntry, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry, ok := c.entries[key]
 	if !ok {
-		return nil, false
+		return nil, cacheEntry{}, false
 	}
 	if !now.Before(entry.ExpiresAt) {
 		delete(c.entries, key)
 		c.markDirtyLocked()
-		return nil, false
+		return nil, cacheEntry{}, false
 	}
 	entry.LastAccess = now
 	c.entries[key] = entry
 	c.markDirtyLocked()
-	return append(json.RawMessage(nil), entry.Value...), true
+	entry.Value = append(json.RawMessage(nil), entry.Value...)
+	return append(json.RawMessage(nil), entry.Value...), entry, true
+}
+
+func (c *MetadataCache) deleteRawIfEqual(key string, observed cacheEntry) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[key]
+	if !ok || !entry.ExpiresAt.Equal(observed.ExpiresAt) || !entry.LastAccess.Equal(observed.LastAccess) || !bytes.Equal(entry.Value, observed.Value) {
+		return false
+	}
+	delete(c.entries, key)
+	c.markDirtyLocked()
+	return true
 }
 
 func (c *MetadataCache) storeRaw(key string, value json.RawMessage, ttl time.Duration, now time.Time) {
@@ -462,15 +476,12 @@ func CachedLookup[T any](ctx context.Context, cache *MetadataCache, key string, 
 	if err := ctx.Err(); err != nil {
 		return zero, CacheMiss, err
 	}
-	if raw, ok := cache.lookupRaw(key, cache.now()); ok {
+	if raw, observed, ok := cache.lookupRaw(key, cache.now()); ok {
 		var value T
 		if err := json.Unmarshal(raw, &value); err == nil && (cacheable == nil || cacheable(value)) {
 			return value, CacheHit, nil
 		}
-		cache.mu.Lock()
-		delete(cache.entries, key)
-		cache.markDirtyLocked()
-		cache.mu.Unlock()
+		cache.deleteRawIfEqual(key, observed)
 	}
 
 	flight, owner := cache.group.doChan(key, func() (any, error) {
@@ -479,15 +490,20 @@ func CachedLookup[T any](ctx context.Context, cache *MetadataCache, key string, 
 		}
 		// A previous flight may have populated the key between the initial
 		// lookup and this singleflight invocation.
-		if raw, ok := cache.lookupRaw(key, cache.now()); ok {
+		if raw, observed, ok := cache.lookupRaw(key, cache.now()); ok {
 			var value T
 			if err := json.Unmarshal(raw, &value); err == nil && (cacheable == nil || cacheable(value)) {
 				return cacheFlightResult[T]{value: value}, nil
 			}
-			cache.mu.Lock()
-			delete(cache.entries, key)
-			cache.markDirtyLocked()
-			cache.mu.Unlock()
+			if !cache.deleteRawIfEqual(key, observed) {
+				if freshRaw, freshObserved, freshOK := cache.lookupRaw(key, cache.now()); freshOK {
+					var freshValue T
+					if err := json.Unmarshal(freshRaw, &freshValue); err == nil && (cacheable == nil || cacheable(freshValue)) {
+						return cacheFlightResult[T]{value: freshValue}, nil
+					}
+					cache.deleteRawIfEqual(key, freshObserved)
+				}
+			}
 		}
 		value, err := load(ctx)
 		if err != nil {

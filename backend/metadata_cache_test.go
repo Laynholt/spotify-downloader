@@ -513,3 +513,125 @@ func TestMetadataCacheReadFailureWarnsAndStartsEmpty(t *testing.T) {
 	}
 	_ = cache.Close()
 }
+
+func TestCachedLookupConditionallyInvalidatesLegacyEntry(t *testing.T) {
+	type legacyValue struct {
+		ISRC    string
+		Genre   string
+		Warning string
+	}
+	type currentValue struct {
+		ISRC    string
+		Genres  []string
+		Warning string
+	}
+
+	clock := newTestClock()
+	path := filepath.Join(t.TempDir(), "metadata-cache.json")
+	legacyCache, warnings := OpenMetadataCache(path, CacheOptions{Now: clock.Now, WriteDelay: 0})
+	if len(warnings) != 0 {
+		t.Fatalf("legacy cache warnings = %v", warnings)
+	}
+	_, outcome, err := CachedLookup(context.Background(), legacyCache, "isrc:legacy-concurrent", time.Hour,
+		func(value legacyValue) bool { return value.ISRC != "" && value.Genre != "" },
+		func(context.Context) (legacyValue, error) {
+			return legacyValue{ISRC: "ISRC-LEGACY", Genre: "electronic"}, nil
+		})
+	if err != nil || outcome != CacheMiss {
+		t.Fatalf("legacy seed = outcome %q err %v", outcome, err)
+	}
+	if err := legacyCache.Close(); err != nil {
+		t.Fatalf("legacy cache close = %v", err)
+	}
+
+	cache, warnings := OpenMetadataCache(path, CacheOptions{Now: clock.Now, WriteDelay: 0})
+	if len(warnings) != 0 {
+		t.Fatalf("reopened cache warnings = %v", warnings)
+	}
+
+	firstValidation := make(chan struct{})
+	releaseFirstValidation := make(chan struct{})
+	loaderStarted := make(chan struct{})
+	var validations atomic.Int32
+	var loaderCalls atomic.Int32
+	cacheable := func(value currentValue) bool {
+		if validations.Add(1) == 1 {
+			close(firstValidation)
+			<-releaseFirstValidation
+		}
+		return value.ISRC != "" && len(value.Genres) > 0
+	}
+	loader := func(context.Context) (currentValue, error) {
+		if loaderCalls.Add(1) == 1 {
+			close(loaderStarted)
+		}
+		return currentValue{ISRC: "ISRC-LEGACY", Genres: []string{"electronic", "ambient"}}, nil
+	}
+
+	type lookupResult struct {
+		value   currentValue
+		outcome CacheOutcome
+		err     error
+	}
+	start := make(chan struct{})
+	results := make(chan lookupResult, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-start
+			value, outcome, err := CachedLookup(context.Background(), cache, "isrc:legacy-concurrent", time.Hour, cacheable, loader)
+			results <- lookupResult{value: value, outcome: outcome, err: err}
+		}()
+	}
+	close(start)
+	select {
+	case <-firstValidation:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for stale validation")
+	}
+	select {
+	case <-loaderStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for refresh loader")
+	}
+	select {
+	case result := <-results:
+		if result.err != nil || result.value.ISRC != "ISRC-LEGACY" || len(result.value.Genres) != 2 {
+			t.Fatalf("refresh result = %+v", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for refreshed caller")
+	}
+	close(releaseFirstValidation)
+	select {
+	case result := <-results:
+		if result.err != nil || result.value.ISRC != "ISRC-LEGACY" || len(result.value.Genres) != 2 {
+			t.Fatalf("shared refresh result = %+v", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for shared caller")
+	}
+	if got := loaderCalls.Load(); got != 1 {
+		t.Fatalf("refresh loader calls = %d, want 1", got)
+	}
+	if err := cache.Close(); err != nil {
+		t.Fatalf("refreshed cache close = %v", err)
+	}
+
+	cache, warnings = OpenMetadataCache(path, CacheOptions{Now: clock.Now, WriteDelay: 0})
+	if len(warnings) != 0 {
+		t.Fatalf("refreshed cache reopen warnings = %v", warnings)
+	}
+	defer cache.Close()
+	value, outcome, err := CachedLookup(context.Background(), cache, "isrc:legacy-concurrent", time.Hour,
+		func(value currentValue) bool { return value.ISRC != "" && len(value.Genres) > 0 },
+		func(context.Context) (currentValue, error) {
+			loaderCalls.Add(1)
+			return currentValue{}, errors.New("unexpected persisted reload")
+		})
+	if err != nil || outcome != CacheHit || value.ISRC != "ISRC-LEGACY" || len(value.Genres) != 2 {
+		t.Fatalf("persisted refresh = value %+v outcome %q err %v", value, outcome, err)
+	}
+	if got := loaderCalls.Load(); got != 1 {
+		t.Fatalf("persisted cache loader calls = %d, want 1", got)
+	}
+}
