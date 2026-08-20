@@ -66,6 +66,35 @@ func EmbedMetadataContext(ctx context.Context, filePath string, metadata Metadat
 	return err
 }
 
+// FinalizeMedia writes all available metadata, lyrics, and cover art in one
+// format-specific pass. The format writer's error is fatal; callers must not
+// follow this with a separate lyrics or cover write.
+func FinalizeMedia(ctx context.Context, filePath string, metadata Metadata, coverPath string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	ext := strings.ToLower(pathfilepath.Ext(filePath))
+	var err error
+	switch ext {
+	case ".flac":
+		err = embedFlacMetadata(filePath, metadata, coverPath)
+	case ".mp3":
+		err = embedMp3MetadataContext(ctx, filePath, metadata, coverPath)
+	case ".m4a":
+		err = embedMetadataToM4AContext(ctx, filePath, metadata, coverPath)
+	default:
+		err = fmt.Errorf("unsupported file format: %s", ext)
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return err
+}
+
 func openMP3TagForWrite(filePath string) (*id3v2.Tag, error) {
 	tag, err := id3v2.Open(filePath, id3v2.Options{Parse: true})
 	if err != nil {
@@ -234,7 +263,18 @@ func embedMp3MetadataContext(ctx context.Context, filePath string, metadata Meta
 		tag.AddTextFrame("TXXX", tag.DefaultEncoding(), descriptionText)
 	}
 
+	if metadata.Lyrics != "" {
+		tag.DeleteFrames(tag.CommonID("Unsynchronised lyrics/text transcription"))
+		tag.AddUnsynchronisedLyricsFrame(id3v2.UnsynchronisedLyricsFrame{
+			Encoding:          id3v2.EncodingUTF8,
+			Language:          "eng",
+			ContentDescriptor: "",
+			Lyrics:            metadata.Lyrics,
+		})
+	}
+
 	if coverPath != "" && fileExists(coverPath) {
+		tag.DeleteFrames(tag.CommonID("Attached picture"))
 		artwork, err := os.ReadFile(coverPath)
 		if err == nil {
 			pic := id3v2.PictureFrame{
@@ -818,11 +858,18 @@ func ExtractLyrics(filePath string) (string, error) {
 	case ".flac":
 		return extractLyricsFromFlac(filePath)
 	case ".m4a":
-
-		return "", nil
+		return extractLyricsFromM4A(filePath)
 	default:
 		return "", fmt.Errorf("unsupported file format: %s", ext)
 	}
+}
+
+func extractLyricsFromM4A(filePath string) (string, error) {
+	metadata, err := ExtractFullMetadataFromFile(filePath)
+	if err != nil {
+		return "", err
+	}
+	return metadata.Lyrics, nil
 }
 
 func extractLyricsFromMp3(filePath string) (string, error) {
@@ -1019,12 +1066,31 @@ func validateLyricsDurationContext(ctx context.Context, lyrics string, filepath 
 	}
 
 	if duration <= 0 {
-
 		fmt.Printf("[ValidateLyrics] Warning: Invalid duration (%f seconds), skipping validation\n", duration)
 		return lyrics, nil
 	}
 
-	durationMs := int64(duration * 1000)
+	return validateLyricsDurationWithContext(ctx, lyrics, duration)
+}
+
+// ValidateLyricsDuration filters LRC lines using a duration already measured
+// by the caller. It deliberately performs no media probing.
+func ValidateLyricsDuration(lyrics string, durationSeconds float64) (string, error) {
+	return validateLyricsDurationWithContext(context.Background(), lyrics, durationSeconds)
+}
+
+func validateLyricsDurationWithContext(ctx context.Context, lyrics string, durationSeconds float64) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if durationSeconds <= 0 {
+		return lyrics, nil
+	}
+
+	durationMs := int64(durationSeconds * 1000)
 
 	lines := strings.Split(lyrics, "\n")
 	var validLines []string
@@ -1188,6 +1254,10 @@ func ExtractFullMetadataFromFileContext(ctx context.Context, filePath string) (M
 			if metadata.Description == "" {
 				metadata.Description = value
 			}
+		case "lyrics", "lyrics-eng", "unsyncedlyrics", "unsynchronised lyrics/text transcription":
+			if metadata.Lyrics == "" {
+				metadata.Lyrics = value
+			}
 		}
 	}
 
@@ -1274,7 +1344,18 @@ func embedMetadataToMP3(filePath string, metadata Metadata, coverPath string) er
 		tag.AddTextFrame("TSRC", id3v2.EncodingUTF8, metadata.ISRC)
 	}
 
+	if metadata.Lyrics != "" {
+		tag.DeleteFrames(tag.CommonID("Unsynchronised lyrics/text transcription"))
+		tag.AddUnsynchronisedLyricsFrame(id3v2.UnsynchronisedLyricsFrame{
+			Encoding:          id3v2.EncodingUTF8,
+			Language:          "eng",
+			ContentDescriptor: "",
+			Lyrics:            metadata.Lyrics,
+		})
+	}
+
 	if coverPath != "" && fileExists(coverPath) {
+		tag.DeleteFrames(tag.CommonID("Attached picture"))
 		artwork, err := os.ReadFile(coverPath)
 		if err == nil {
 			pic := id3v2.PictureFrame{
@@ -1371,6 +1452,9 @@ func embedMetadataToM4AContext(ctx context.Context, filePath string, metadata Me
 	}
 	if metadata.ISRC != "" {
 		args = append(args, "-metadata", "isrc="+metadata.ISRC)
+	}
+	if metadata.Lyrics != "" {
+		args = append(args, "-metadata", "lyrics="+metadata.Lyrics)
 	}
 
 	tmpOutputFile := strings.TrimSuffix(filePath, pathfilepath.Ext(filePath)) + ".tmp" + pathfilepath.Ext(filePath)

@@ -5,11 +5,208 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"os/exec"
+
+	id3v2 "github.com/bogem/id3v2/v2"
+	"github.com/go-flac/go-flac"
 )
+
+func TestValidateLyricsDurationUsesProvidedDuration(t *testing.T) {
+	lyrics := "[00:00.50]keep\n[00:01.00]boundary\n[00:01.01]drop\nplain text"
+
+	got, err := ValidateLyricsDuration(lyrics, 1.0)
+	if err != nil {
+		t.Fatalf("validate lyrics duration: %v", err)
+	}
+
+	want := "[00:00.50]keep\n[00:01.00]boundary\nplain text"
+	if got != want {
+		t.Fatalf("validated lyrics = %q, want %q", got, want)
+	}
+}
+
+func TestFinalizeMediaWritesMP3TagsLyricsAndCoverInOnePass(t *testing.T) {
+	ffmpegPath, ffprobePath := installSystemFFmpegRuntime(t)
+	dir := t.TempDir()
+	audioPath := filepath.Join(dir, "track.mp3")
+	coverPath := filepath.Join(dir, "cover.jpg")
+
+	writeFFmpegFixture(t, ffmpegPath, []string{
+		"-f", "lavfi", "-i", "sine=frequency=1000:duration=1", "-q:a", "2", "-y", audioPath,
+	})
+	writeFFmpegFixture(t, ffmpegPath, []string{
+		"-f", "lavfi", "-i", "color=c=red:s=32x32:d=1", "-frames:v", "1", "-y", coverPath,
+	})
+
+	metadata := Metadata{Title: "One Pass", Artist: "Artist", Lyrics: "[00:00.50]line"}
+	if err := FinalizeMedia(context.Background(), audioPath, metadata, coverPath); err != nil {
+		t.Fatalf("finalize mp3: %v", err)
+	}
+
+	lyrics, err := ExtractLyrics(audioPath)
+	if err != nil {
+		t.Fatalf("extract mp3 lyrics: %v", err)
+	}
+	if !strings.Contains(lyrics, "[00:00.50]line") {
+		t.Fatalf("mp3 lyrics = %q", lyrics)
+	}
+
+	tag, err := id3v2.Open(audioPath, id3v2.Options{Parse: true})
+	if err != nil {
+		t.Fatalf("open mp3 tags: %v", err)
+	}
+	defer tag.Close()
+	if pictures := tag.GetFrames(tag.CommonID("Attached picture")); len(pictures) != 1 {
+		t.Fatalf("mp3 cover frames = %d, want 1", len(pictures))
+	}
+	if _, err := os.Stat(audioPath + "-id3v2"); !os.IsNotExist(err) {
+		t.Fatalf("mp3 temporary tag file remains: %v", err)
+	}
+	_ = ffprobePath
+}
+
+func TestFinalizeMediaWritesFLACTagsLyricsAndCoverInOnePass(t *testing.T) {
+	ffmpegPath, _ := installSystemFFmpegRuntime(t)
+	dir := t.TempDir()
+	audioPath := filepath.Join(dir, "track.flac")
+	coverPath := filepath.Join(dir, "cover.jpg")
+
+	writeFFmpegFixture(t, ffmpegPath, []string{
+		"-f", "lavfi", "-i", "sine=frequency=1000:duration=1", "-c:a", "flac", "-y", audioPath,
+	})
+	writeFFmpegFixture(t, ffmpegPath, []string{
+		"-f", "lavfi", "-i", "color=c=red:s=32x32:d=1", "-frames:v", "1", "-y", coverPath,
+	})
+
+	metadata := Metadata{Title: "One Pass", Artist: "Artist", Lyrics: "[00:00.50]line"}
+	if err := FinalizeMedia(context.Background(), audioPath, metadata, coverPath); err != nil {
+		t.Fatalf("finalize flac: %v", err)
+	}
+
+	lyrics, err := ExtractLyrics(audioPath)
+	if err != nil {
+		t.Fatalf("extract flac lyrics: %v", err)
+	}
+	if !strings.Contains(lyrics, "[00:00.50]line") {
+		t.Fatalf("flac lyrics = %q", lyrics)
+	}
+	flacFile, err := flac.ParseFile(audioPath)
+	if err != nil {
+		t.Fatalf("parse finalized flac: %v", err)
+	}
+	var commentBlocks, pictureBlocks int
+	for _, block := range flacFile.Meta {
+		switch block.Type {
+		case flac.VorbisComment:
+			commentBlocks++
+		case flac.Picture:
+			pictureBlocks++
+		}
+	}
+	if commentBlocks != 1 || pictureBlocks != 1 {
+		t.Fatalf("flac metadata blocks = comments:%d pictures:%d, want one each", commentBlocks, pictureBlocks)
+	}
+}
+
+func TestFinalizeMediaWritesM4ATagsLyricsAndCoverInOnePass(t *testing.T) {
+	ffmpegPath, ffprobePath := installSystemFFmpegRuntime(t)
+	dir := t.TempDir()
+	audioPath := filepath.Join(dir, "track.m4a")
+	coverPath := filepath.Join(dir, "cover.jpg")
+
+	writeFFmpegFixture(t, ffmpegPath, []string{
+		"-f", "lavfi", "-i", "sine=frequency=1000:duration=1", "-c:a", "aac", "-y", audioPath,
+	})
+	writeFFmpegFixture(t, ffmpegPath, []string{
+		"-f", "lavfi", "-i", "color=c=red:s=32x32:d=1", "-frames:v", "1", "-y", coverPath,
+	})
+
+	metadata := Metadata{Title: "One Pass", Artist: "Artist", Lyrics: "[00:00.50]line"}
+	reportPath := "task7-ffmpeg-report-" + strconv.FormatInt(time.Now().UnixNano(), 10) + ".log"
+	t.Cleanup(func() { _ = os.Remove(reportPath) })
+	t.Setenv("FFREPORT", "file="+reportPath+":level=32")
+	if err := FinalizeMedia(context.Background(), audioPath, metadata, coverPath); err != nil {
+		t.Fatalf("finalize m4a: %v", err)
+	}
+	report, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatalf("read ffmpeg report: %v", err)
+	}
+	if invocations := strings.Count(string(report), "ffmpeg version"); invocations != 1 {
+		t.Fatalf("finalize ffmpeg invocations = %d, want 1", invocations)
+	}
+
+	lyricsOutput := runFFprobeFixture(t, ffprobePath, audioPath, "-show_entries", "format_tags=lyrics")
+	if !strings.Contains(lyricsOutput, "[00:00.50]line") {
+		t.Fatalf("m4a lyrics metadata = %q", lyricsOutput)
+	}
+	streamTypes := runFFprobeFixture(t, ffprobePath, audioPath, "-show_entries", "stream=codec_type")
+	if !strings.Contains(streamTypes, "video") {
+		t.Fatalf("m4a cover stream missing: %q", streamTypes)
+	}
+}
+
+func installSystemFFmpegRuntime(t *testing.T) (string, string) {
+	t.Helper()
+	ffmpegPath, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skipf("ffmpeg not available: %v", err)
+	}
+	ffprobePath, err := exec.LookPath("ffprobe")
+	if err != nil {
+		t.Skipf("ffprobe not available: %v", err)
+	}
+	paths, err := ResolveRuntimePaths(filepath.Join(t.TempDir(), "SpotiDownloader.exe"), "metadata")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	installRuntimePathsForTest(t, paths)
+	for _, source := range []string{ffmpegPath, ffprobePath} {
+		name := filepath.Base(source)
+		if err := copyMetadataFixtureFile(source, filepath.Join(paths.BinDir, name)); err != nil {
+			t.Fatalf("copy helper %s: %v", source, err)
+		}
+	}
+	return filepath.Join(paths.BinDir, filepath.Base(ffmpegPath)), filepath.Join(paths.BinDir, filepath.Base(ffprobePath))
+}
+
+func writeFFmpegFixture(t *testing.T, ffmpegPath string, args []string) {
+	t.Helper()
+	cmd := exec.Command(ffmpegPath, args...)
+	setHideWindow(cmd)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("ffmpeg fixture: %v\n%s", err, string(output))
+	}
+}
+
+func copyMetadataFixtureFile(sourcePath, destinationPath string) error {
+	data, err := os.ReadFile(sourcePath)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(destinationPath, data, 0755)
+}
+
+func runFFprobeFixture(t *testing.T, ffprobePath, filePath string, args ...string) string {
+	t.Helper()
+	probeArgs := append([]string{"-v", "quiet", "-of", "default=nw=1:nk=1"}, args...)
+	probeArgs = append(probeArgs, filePath)
+	cmd := exec.Command(ffprobePath, probeArgs...)
+	setHideWindow(cmd)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("ffprobe fixture: %v\n%s", err, string(output))
+	}
+	return string(output)
+}
 
 func TestEmbedMetadataContextMP3VerificationCancellation(t *testing.T) {
 	installFakeFFmpegRuntime(t)

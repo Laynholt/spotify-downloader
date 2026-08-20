@@ -228,7 +228,20 @@ func validateDownloadedFileDuration(filename string, expectedDurationMs int) Dow
 	}
 
 	actualSeconds, err := backend.GetAudioDuration(filename)
-	return buildDownloadValidationResult(expectedDurationMs, actualSeconds, err)
+	if err != nil {
+		return buildDownloadValidationResult(expectedDurationMs, actualSeconds, err)
+	}
+	return validateDownloadedDuration(filename, expectedDurationMs, actualSeconds)
+}
+
+// validateDownloadedDuration consumes a duration that has already been
+// measured by the caller. Keeping this separate from the legacy probing
+// wrapper lets the download pipeline reuse one probe result.
+func validateDownloadedDuration(filename string, expectedDurationMs int, actualDurationSeconds float64) DownloadResponse {
+	if expectedDurationMs <= 0 || filename == "" {
+		return DownloadResponse{}
+	}
+	return buildDownloadValidationResult(expectedDurationMs, actualDurationSeconds, nil)
 }
 
 func buildDownloadValidationResult(expectedDurationMs int, actualSeconds float64, probeErr error) DownloadResponse {
