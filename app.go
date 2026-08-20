@@ -19,14 +19,15 @@ import (
 )
 
 type App struct {
-	ctx              context.Context
-	runtimePaths     backend.RuntimePaths
-	runtimeInitErr   error
-	metadataCache    *backend.MetadataCache
-	activeMu         sync.Mutex
-	activeDownloads  map[string]context.CancelFunc
-	activeContexts   map[string]context.Context
-	runTrackPipeline func(context.Context, backend.TrackPipelineRequest) (backend.TrackPipelineResult, error)
+	ctx                    context.Context
+	runtimePaths           backend.RuntimePaths
+	runtimeInitErr         error
+	metadataCache          *backend.MetadataCache
+	activeMu               sync.Mutex
+	activeDownloads        map[string]context.CancelFunc
+	activeContexts         map[string]context.Context
+	runTrackPipeline       func(context.Context, backend.TrackPipelineRequest) (backend.TrackPipelineResult, error)
+	moveSuspiciousDownload func(string, string) (string, error)
 }
 
 func NewApp() *App {
@@ -293,7 +294,7 @@ func (a *App) DownloadTrack(req DownloadRequest) (DownloadResponse, error) {
 	if !result.AlreadyExists && result.DurationSeconds > 0 {
 		validation = validateDownloadedDuration(filename, req.Duration, result.DurationSeconds)
 		if validation.Suspicious {
-			movedValidation, moveErr := moveSuspiciousDownloadIfNeeded(filename, req.CollectionDir, validation)
+			movedValidation, moveErr := a.moveSuspiciousDownloadIfNeeded(filename, req.CollectionDir, validation)
 			if moveErr != nil {
 				backend.FailDownloadItem(itemID, fmt.Sprintf("Failed to move suspicious download: %v", moveErr))
 				return DownloadResponse{

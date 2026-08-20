@@ -48,7 +48,8 @@ func (a *App) beginTrack(itemID string) (context.Context, func()) {
 }
 
 // CancelActiveDownloads cancels every track context currently owned by the
-// application and marks those queue items terminal before returning.
+// application. Each DownloadTrack call maps its resulting cancellation to the
+// queue exactly once after the pipeline returns.
 func (a *App) CancelActiveDownloads() int {
 	a.activeMu.Lock()
 	ids := make([]string, 0, len(a.activeDownloads))
@@ -65,9 +66,6 @@ func (a *App) CancelActiveDownloads() int {
 
 	for _, cancel := range cancels {
 		cancel()
-	}
-	for _, itemID := range ids {
-		backend.CancelDownloadItem(itemID)
 	}
 	return len(ids)
 }

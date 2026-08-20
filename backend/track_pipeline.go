@@ -203,9 +203,6 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 		if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() && info.Size() > 0 {
 			result.File = candidate
 			result.AlreadyExists = true
-			if req.ItemID != "" {
-				SkipDownloadItem(req.ItemID, candidate)
-			}
 			return result, nil
 		}
 	}
@@ -489,14 +486,8 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 	}
 
 	result.File = finalPath
-	if info, statErr := os.Stat(finalPath); statErr == nil {
+	if _, statErr := os.Stat(finalPath); statErr == nil {
 		result.Timings.TotalMS = trackPipelineElapsedMS(now, pipelineStarted)
-		if req.ItemID != "" {
-			for _, warning := range warnings {
-				AddItemWarning(req.ItemID, warning)
-			}
-			CompleteDownloadItem(req.ItemID, finalPath, float64(info.Size())/float64(bytesPerMegabyte), result.Timings)
-		}
 	} else if req.ItemID != "" {
 		return trackPipelineFailure(&result, req, fmt.Errorf("published file missing: %w", statErr), warnings)
 	}
@@ -510,11 +501,6 @@ func trackPipelineFailure(result *TrackPipelineResult, req TrackPipelineRequest,
 	if req.ItemID != "" {
 		for _, warning := range warnings {
 			AddItemWarning(req.ItemID, warning)
-		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			CancelDownloadItem(req.ItemID)
-		} else {
-			FailDownloadItem(req.ItemID, err.Error())
 		}
 	}
 	return *result, err

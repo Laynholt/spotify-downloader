@@ -129,6 +129,55 @@ func TestDownloadCompletesAfterFinalization(t *testing.T) {
 	}
 }
 
+func TestDownloadDoesNotCompleteBeforeSuspiciousMoveFinishes(t *testing.T) {
+	backend.ClearAllDownloads()
+	t.Cleanup(backend.ClearAllDownloads)
+	outputDir := t.TempDir()
+	originalPath := filepath.Join(outputDir, "track.mp3")
+	if err := os.WriteFile(originalPath, []byte("audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	moveStarted := make(chan struct{})
+	releaseMove := make(chan struct{})
+	app := &App{
+		ctx: context.Background(),
+		runTrackPipeline: func(_ context.Context, _ backend.TrackPipelineRequest) (backend.TrackPipelineResult, error) {
+			return backend.TrackPipelineResult{File: originalPath, DurationSeconds: 10}, nil
+		},
+		moveSuspiciousDownload: func(filename, destination string) (string, error) {
+			close(moveStarted)
+			<-releaseMove
+			return filename, nil
+		},
+	}
+
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := app.DownloadTrack(DownloadRequest{
+			TrackID:      "track-suspicious-blocked",
+			SessionToken: "session-token",
+			TrackName:    "Track",
+			ArtistName:   "Artist",
+			Duration:     1000,
+			OutputDir:    outputDir,
+		})
+		resultCh <- err
+	}()
+	select {
+	case <-moveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("suspicious move did not start")
+	}
+	queue := backend.GetDownloadQueue()
+	if queue.CompletedCount != 0 || queue.FailedCount != 0 || queue.CancelledCount != 0 {
+		t.Fatalf("queue became terminal before suspicious move release: %#v", queue)
+	}
+	close(releaseMove)
+	if err := <-resultCh; err != nil {
+		t.Fatalf("DownloadTrack returned error: %v", err)
+	}
+}
+
 func TestDownloadTrackReturnsPipelineDiagnosticsAndBuildsRequest(t *testing.T) {
 	backend.ClearAllDownloads()
 	t.Cleanup(backend.ClearAllDownloads)
@@ -203,6 +252,97 @@ func TestDownloadTrackReturnsPipelineDiagnosticsAndBuildsRequest(t *testing.T) {
 	}
 	if got := queue.Queue[0].Timings; got != response.Timings {
 		t.Fatalf("queue timings = %#v, want %#v", got, response.Timings)
+	}
+}
+
+func TestDownloadTrackSuspiciousMoveOwnsTerminalQueuePath(t *testing.T) {
+	backend.ClearAllDownloads()
+	t.Cleanup(backend.ClearAllDownloads)
+	outputDir := t.TempDir()
+	collectionDir := filepath.Join(outputDir, "collection")
+	if err := os.MkdirAll(collectionDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	originalPath := filepath.Join(collectionDir, "track.mp3")
+	if err := os.WriteFile(originalPath, []byte("audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	movedPath := filepath.Join(collectionDir, backend.SuspiciousTracksDirName, "track.mp3")
+	app := &App{
+		ctx: context.Background(),
+		runTrackPipeline: func(_ context.Context, _ backend.TrackPipelineRequest) (backend.TrackPipelineResult, error) {
+			return backend.TrackPipelineResult{File: originalPath, DurationSeconds: 10}, nil
+		},
+		moveSuspiciousDownload: func(filename, destination string) (string, error) {
+			if filename != originalPath || destination != filepath.Join(collectionDir, backend.SuspiciousTracksDirName) {
+				t.Fatalf("move request = (%q, %q)", filename, destination)
+			}
+			if err := os.MkdirAll(destination, 0o755); err != nil {
+				return "", err
+			}
+			if err := os.Rename(filename, movedPath); err != nil {
+				return "", err
+			}
+			return movedPath, nil
+		},
+	}
+
+	response, err := app.DownloadTrack(DownloadRequest{
+		TrackID:       "track-suspicious",
+		SessionToken:  "session-token",
+		TrackName:     "Track",
+		ArtistName:    "Artist",
+		Duration:      1000,
+		OutputDir:     outputDir,
+		CollectionDir: collectionDir,
+	})
+	if err != nil {
+		t.Fatalf("DownloadTrack returned error: %v", err)
+	}
+	if !response.Success || response.File != movedPath || !response.Suspicious {
+		t.Fatalf("response = %#v", response)
+	}
+	queue := backend.GetDownloadQueue()
+	if queue.CompletedCount != 1 || queue.FailedCount != 0 {
+		t.Fatalf("queue terminal counts = completed:%d failed:%d", queue.CompletedCount, queue.FailedCount)
+	}
+	if got := queue.Queue[0].FilePath; got != movedPath {
+		t.Fatalf("queue file path = %q, want moved path %q", got, movedPath)
+	}
+}
+
+func TestDownloadTrackSuspiciousMoveFailureFailsQueue(t *testing.T) {
+	backend.ClearAllDownloads()
+	t.Cleanup(backend.ClearAllDownloads)
+	outputDir := t.TempDir()
+	originalPath := filepath.Join(outputDir, "track.mp3")
+	if err := os.WriteFile(originalPath, []byte("audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	app := &App{
+		ctx: context.Background(),
+		runTrackPipeline: func(_ context.Context, _ backend.TrackPipelineRequest) (backend.TrackPipelineResult, error) {
+			return backend.TrackPipelineResult{File: originalPath, DurationSeconds: 10}, nil
+		},
+		moveSuspiciousDownload: func(string, string) (string, error) {
+			return "", errors.New("move failed")
+		},
+	}
+
+	response, err := app.DownloadTrack(DownloadRequest{
+		TrackID:      "track-suspicious-failure",
+		SessionToken: "session-token",
+		TrackName:    "Track",
+		ArtistName:   "Artist",
+		Duration:     1000,
+		OutputDir:    outputDir,
+	})
+	if err == nil || response.Success {
+		t.Fatalf("expected suspicious move failure, response=%#v err=%v", response, err)
+	}
+	queue := backend.GetDownloadQueue()
+	if queue.FailedCount != 1 || queue.CompletedCount != 0 || queue.CancelledCount != 0 {
+		t.Fatalf("queue terminal counts = failed:%d completed:%d cancelled:%d", queue.FailedCount, queue.CompletedCount, queue.CancelledCount)
 	}
 }
 

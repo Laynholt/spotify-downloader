@@ -157,6 +157,18 @@ func buildDownloadValidationResult(expectedDurationMs int, actualSeconds float64
 }
 
 func moveSuspiciousDownloadIfNeeded(filename, collectionDir string, validation DownloadResponse) (DownloadResponse, error) {
+	return moveSuspiciousDownloadIfNeededWithMover(filename, collectionDir, validation, backend.MoveSuspiciousOriginal)
+}
+
+func (a *App) moveSuspiciousDownloadIfNeeded(filename, collectionDir string, validation DownloadResponse) (DownloadResponse, error) {
+	mover := a.moveSuspiciousDownload
+	if mover == nil {
+		mover = backend.MoveSuspiciousOriginal
+	}
+	return moveSuspiciousDownloadIfNeededWithMover(filename, collectionDir, validation, mover)
+}
+
+func moveSuspiciousDownloadIfNeededWithMover(filename, collectionDir string, validation DownloadResponse, mover func(string, string) (string, error)) (DownloadResponse, error) {
 	if !validation.Suspicious {
 		return validation, nil
 	}
@@ -165,7 +177,7 @@ func moveSuspiciousDownloadIfNeeded(filename, collectionDir string, validation D
 		collectionDir = filepath.Dir(filename)
 	}
 
-	movedPath, err := backend.MoveSuspiciousOriginal(filename, filepath.Join(collectionDir, backend.SuspiciousTracksDirName))
+	movedPath, err := mover(filename, filepath.Join(collectionDir, backend.SuspiciousTracksDirName))
 	if err != nil {
 		return validation, err
 	}
