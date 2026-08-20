@@ -1,11 +1,11 @@
 package backend
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	pathfilepath "path/filepath"
 	"strconv"
 	"strings"
@@ -37,18 +37,33 @@ type Metadata struct {
 }
 
 func EmbedMetadata(filePath string, metadata Metadata, coverPath string) error {
+	return EmbedMetadataContext(context.Background(), filePath, metadata, coverPath)
+}
+
+func EmbedMetadataContext(ctx context.Context, filePath string, metadata Metadata, coverPath string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	ext := strings.ToLower(pathfilepath.Ext(filePath))
 
+	var err error
 	switch ext {
 	case ".flac":
-		return embedFlacMetadata(filePath, metadata, coverPath)
+		err = embedFlacMetadata(filePath, metadata, coverPath)
 	case ".mp3":
-		return embedMp3Metadata(filePath, metadata, coverPath)
+		err = embedMp3Metadata(filePath, metadata, coverPath)
 	case ".m4a":
-		return embedMetadataToM4A(filePath, metadata, coverPath)
+		err = embedMetadataToM4AContext(ctx, filePath, metadata, coverPath)
 	default:
-		return fmt.Errorf("unsupported file format: %s", ext)
+		err = fmt.Errorf("unsupported file format: %s", ext)
 	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return err
 }
 
 func openMP3TagForWrite(filePath string) (*id3v2.Tag, error) {
@@ -453,8 +468,7 @@ func embedMetadataToMP3WithFFmpeg(filePath string, metadata Metadata, coverPath 
 
 	args = append(args, tmpOutputFile)
 
-	cmd := exec.Command(ffmpegPath, args...)
-	setHideWindow(cmd)
+	cmd := newManagedCommand(context.Background(), ffmpegPath, args...)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -608,7 +622,7 @@ func embedLyricsToM4A(filepath string, lyrics string) error {
 		}
 	}()
 
-	cmd := exec.Command(ffmpegPath,
+	cmd := newManagedCommand(context.Background(), ffmpegPath,
 		"-i", filepath,
 		"-map", "0",
 		"-map_metadata", "0",
@@ -619,8 +633,6 @@ func embedLyricsToM4A(filepath string, lyrics string) error {
 		"-y",
 		tmpOutputFile,
 	)
-
-	setHideWindow(cmd)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -792,16 +804,29 @@ func extractLyricsFromFlac(filePath string) (string, error) {
 }
 
 func GetAudioDuration(filepath string) (float64, error) {
+	return GetAudioDurationContext(context.Background(), filepath)
+}
+
+func GetAudioDurationContext(ctx context.Context, filepath string) (float64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	ext := strings.ToLower(pathfilepath.Ext(filepath))
 
 	if ext == ".flac" {
 		duration, err := getFlacDuration(filepath)
 		if err == nil && duration > 0 {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return 0, ctxErr
+			}
 			return duration, nil
 		}
 	}
 
-	return getDurationWithFFprobe(filepath)
+	return getDurationWithFFprobeContext(ctx, filepath)
 }
 
 func getFlacDuration(filepath string) (float64, error) {
@@ -835,22 +860,36 @@ func getFlacDuration(filepath string) (float64, error) {
 }
 
 func getDurationWithFFprobe(filepath string) (float64, error) {
+	return getDurationWithFFprobeContext(context.Background(), filepath)
+}
+
+func getDurationWithFFprobeContext(ctx context.Context, filepath string) (float64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	ffprobePath, err := GetFFprobePath()
 	if err != nil {
 		return 0, err
 	}
 
-	cmd := exec.Command(ffprobePath,
+	cmd := newManagedCommand(ctx, ffprobePath,
 		"-v", "quiet",
 		"-print_format", "json",
 		"-show_format",
 		filepath,
 	)
 
-	setHideWindow(cmd)
-
 	output, err := cmd.Output()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, ctxErr
+		}
+		return 0, err
+	}
+	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
 
@@ -941,14 +980,24 @@ func parseLRCTimestamp(timestamp string) int64 {
 }
 
 func ExtractFullMetadataFromFile(filePath string) (Metadata, error) {
+	return ExtractFullMetadataFromFileContext(context.Background(), filePath)
+}
+
+func ExtractFullMetadataFromFileContext(ctx context.Context, filePath string) (Metadata, error) {
 	var metadata Metadata
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return metadata, err
+	}
 
 	ffprobePath, err := GetFFprobePath()
 	if err != nil {
 		return metadata, err
 	}
 
-	cmd := exec.Command(ffprobePath,
+	cmd := newManagedCommand(ctx, ffprobePath,
 		"-v", "quiet",
 		"-print_format", "json",
 		"-show_format",
@@ -956,10 +1005,14 @@ func ExtractFullMetadataFromFile(filePath string) (Metadata, error) {
 		filePath,
 	)
 
-	setHideWindow(cmd)
-
 	output, err := cmd.Output()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return metadata, ctxErr
+		}
+		return metadata, err
+	}
+	if err := ctx.Err(); err != nil {
 		return metadata, err
 	}
 
@@ -1157,6 +1210,16 @@ func embedMetadataToMP3(filePath string, metadata Metadata, coverPath string) er
 }
 
 func embedMetadataToM4A(filePath string, metadata Metadata, coverPath string) error {
+	return embedMetadataToM4AContext(context.Background(), filePath, metadata, coverPath)
+}
+
+func embedMetadataToM4AContext(ctx context.Context, filePath string, metadata Metadata, coverPath string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	ffmpegPath, err := GetFFmpegPath()
 	if err != nil {
 		return fmt.Errorf("ffmpeg not found: %w", err)
@@ -1222,12 +1285,17 @@ func embedMetadataToM4A(filePath string, metadata Metadata, coverPath string) er
 
 	args = append(args, "-f", "ipod", tmpOutputFile)
 
-	cmd := exec.Command(ffmpegPath, args...)
-	setHideWindow(cmd)
+	cmd := newManagedCommand(ctx, ffmpegPath, args...)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return fmt.Errorf("ffmpeg failed to embed metadata: %s - %w", string(output), err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	if err := replaceFileWithTemp(tmpOutputFile, filePath); err != nil {

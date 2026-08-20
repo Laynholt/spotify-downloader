@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -184,37 +183,59 @@ func isTransientNetworkError(err error) bool {
 }
 
 func (s *SpotiDownloader) doRequestWithNetworkRetry(req *http.Request) (*http.Response, error) {
-	var resp *http.Response
-	var finalErr error
+	if req == nil {
+		return nil, fmt.Errorf("nil HTTP request")
+	}
+	ctx := req.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
-	_ = RetryWithBackoff(networkRetryAttempts, networkRetryDelay, networkRetryMaxDelay, func(attempt int) error {
+	delay := networkRetryDelay
+	var finalErr error
+	for attempt := 1; attempt <= networkRetryAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		if attempt > 1 && req.GetBody != nil {
 			body, err := req.GetBody()
 			if err != nil {
-				finalErr = err
-				return nil
+				return nil, err
 			}
 			req.Body = body
 		}
 
-		var err error
-		resp, err = s.httpClient.Do(req)
+		resp, err := s.httpClient.Do(req)
 		if err == nil {
-			finalErr = nil
-			return nil
+			return resp, nil
 		}
-
 		finalErr = err
-		if isTransientNetworkError(err) {
-			return err
+		if !isTransientNetworkError(err) || attempt == networkRetryAttempts {
+			return nil, err
 		}
-		return nil
-	})
 
-	if finalErr != nil {
-		return nil, finalErr
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+		if networkRetryMaxDelay > 0 && delay < networkRetryMaxDelay {
+			delay *= 2
+			if delay > networkRetryMaxDelay {
+				delay = networkRetryMaxDelay
+			}
+		}
 	}
-	return resp, nil
+
+	return nil, finalErr
 }
 
 func fetchTaggingMetadata(ctx context.Context, cache *MetadataCache, req TaggingMetadataRequest) (taggingMetadataResult, []string) {
@@ -580,6 +601,16 @@ func detectAudioExtension(contentType string, sniff []byte, fallbackExt string) 
 }
 
 func convertDownloadedAudio(inputPath, outputBasePath, audioFormat string) (string, error) {
+	return convertDownloadedAudioContext(context.Background(), inputPath, outputBasePath, audioFormat)
+}
+
+func convertDownloadedAudioContext(ctx context.Context, inputPath, outputBasePath, audioFormat string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	desiredExt := preferredAudioExtension(audioFormat)
 	currentExt := normalizeAudioExtension(filepath.Ext(inputPath))
 	if desiredExt == "" || currentExt == "" || desiredExt == currentExt {
@@ -636,12 +667,18 @@ func convertDownloadedAudio(inputPath, outputBasePath, audioFormat string) (stri
 
 	fmt.Printf("Converting downloaded audio from %s to %s...\n", currentExt, desiredExt)
 
-	cmd := exec.Command(ffmpegPath, args...)
-	setHideWindow(cmd)
+	cmd := newManagedCommand(ctx, ffmpegPath, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		_ = os.Remove(tempOutputPath)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		return "", fmt.Errorf("ffmpeg conversion failed: %s - %w", strings.TrimSpace(string(output)), err)
+	}
+	if err := ctx.Err(); err != nil {
+		_ = os.Remove(tempOutputPath)
+		return "", err
 	}
 
 	if err := os.Remove(inputPath); err != nil {
@@ -690,18 +727,42 @@ func withTokenRetry[T any](s *SpotiDownloader, fn func() (T, error)) (T, error) 
 
 func (s *SpotiDownloader) IsFlacAvailable(trackID string) (bool, error) {
 	return withTokenRetry(s, func() (bool, error) {
-		return s.isFlacAvailable(trackID)
+		return s.isFlacAvailableContext(context.Background(), trackID)
 	})
 }
 
 func (s *SpotiDownloader) isFlacAvailable(trackID string) (bool, error) {
+	return s.isFlacAvailableContext(context.Background(), trackID)
+}
+
+func (s *SpotiDownloader) IsFlacAvailableContext(ctx context.Context, trackID string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result, err := s.isFlacAvailableContext(ctx, trackID)
+	if !isSessionTokenError(err) {
+		return result, err
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if refreshErr := s.refreshSessionToken(); refreshErr != nil {
+		return false, refreshErr
+	}
+	return s.isFlacAvailableContext(ctx, trackID)
+}
+
+func (s *SpotiDownloader) isFlacAvailableContext(ctx context.Context, trackID string) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	reqBody := FlacAvailableRequest{ID: trackID}
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
 		return false, err
 	}
 
-	req, err := http.NewRequest("POST", spotidownloaderAPIBase+"/isFlacAvailable", bytes.NewBuffer(jsonData))
+	req, err := newHTTPRequestWithContext(ctx, "POST", spotidownloaderAPIBase+"/isFlacAvailable", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return false, err
 	}
@@ -746,18 +807,42 @@ func (s *SpotiDownloader) isFlacAvailable(trackID string) (bool, error) {
 
 func (s *SpotiDownloader) GetDownloadLink(trackID string) (*DownloadResponse, error) {
 	return withTokenRetry(s, func() (*DownloadResponse, error) {
-		return s.getDownloadLink(trackID)
+		return s.getDownloadLinkContext(context.Background(), trackID)
 	})
 }
 
 func (s *SpotiDownloader) getDownloadLink(trackID string) (*DownloadResponse, error) {
+	return s.getDownloadLinkContext(context.Background(), trackID)
+}
+
+func (s *SpotiDownloader) GetDownloadLinkContext(ctx context.Context, trackID string) (*DownloadResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result, err := s.getDownloadLinkContext(ctx, trackID)
+	if !isSessionTokenError(err) {
+		return result, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if refreshErr := s.refreshSessionToken(); refreshErr != nil {
+		return nil, refreshErr
+	}
+	return s.getDownloadLinkContext(ctx, trackID)
+}
+
+func (s *SpotiDownloader) getDownloadLinkContext(ctx context.Context, trackID string) (*DownloadResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	reqBody := DownloadRequest{ID: trackID}
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := http.NewRequest("POST", spotidownloaderAPIBase+"/download", bytes.NewBuffer(jsonData))
+	req, err := newHTTPRequestWithContext(ctx, "POST", spotidownloaderAPIBase+"/download", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, err
 	}
@@ -806,12 +891,36 @@ func (s *SpotiDownloader) getDownloadLink(trackID string) (*DownloadResponse, er
 
 func (s *SpotiDownloader) DownloadFile(downloadURL, outputBasePath, fallbackExt string) (string, error) {
 	return withTokenRetry(s, func() (string, error) {
-		return s.downloadFile(downloadURL, outputBasePath, fallbackExt)
+		return s.downloadFileContext(context.Background(), downloadURL, outputBasePath, fallbackExt)
 	})
 }
 
 func (s *SpotiDownloader) downloadFile(downloadURL, outputBasePath, fallbackExt string) (_ string, err error) {
-	req, err := http.NewRequest("GET", downloadURL, nil)
+	return s.downloadFileContext(context.Background(), downloadURL, outputBasePath, fallbackExt)
+}
+
+func (s *SpotiDownloader) DownloadFileContext(ctx context.Context, downloadURL, outputBasePath, fallbackExt string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result, err := s.downloadFileContext(ctx, downloadURL, outputBasePath, fallbackExt)
+	if !isSessionTokenError(err) {
+		return result, err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if refreshErr := s.refreshSessionToken(); refreshErr != nil {
+		return "", refreshErr
+	}
+	return s.downloadFileContext(ctx, downloadURL, outputBasePath, fallbackExt)
+}
+
+func (s *SpotiDownloader) downloadFileContext(ctx context.Context, downloadURL, outputBasePath, fallbackExt string) (_ string, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := newHTTPRequestWithContext(ctx, "GET", downloadURL, nil)
 	if err != nil {
 		return "", err
 	}
@@ -899,12 +1008,52 @@ func (s *SpotiDownloader) DownloadTrack(
 	useSingleGenre bool,
 	embedGenre bool,
 ) (string, error) {
+	return s.DownloadTrackContext(context.Background(), trackID, outputDir, audioFormat, filenameFormat,
+		includeTrackNumber, position, trackName, artistName, albumName, albumArtist, releaseDate, coverURL,
+		actualTrackNumber, discNumber, totalTracks, useAlbumTrackNumber, embedMaxQualityCover, totalDiscs,
+		copyright, publisher, playlistName, playlistOwner, useFirstArtistOnly, useSingleGenre, embedGenre)
+}
+
+func (s *SpotiDownloader) DownloadTrackContext(
+	ctx context.Context,
+	trackID string,
+	outputDir string,
+	audioFormat string,
+	filenameFormat string,
+	includeTrackNumber bool,
+	position int,
+	trackName string,
+	artistName string,
+	albumName string,
+	albumArtist string,
+	releaseDate string,
+	coverURL string,
+	actualTrackNumber int,
+	discNumber int,
+	totalTracks int,
+	useAlbumTrackNumber bool,
+	embedMaxQualityCover bool,
+	totalDiscs int,
+	copyright string,
+	publisher string,
+	playlistName string,
+	playlistOwner string,
+	useFirstArtistOnly bool,
+	useSingleGenre bool,
+	embedGenre bool,
+) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 
 	outputDir = NormalizePath(outputDir)
 
 	metaChan := make(chan taggingMetadataResult, 1)
 	go func() {
-		result, warnings := fetchTaggingMetadata(context.Background(), s.metadataCache, TaggingMetadataRequest{
+		result, warnings := fetchTaggingMetadata(ctx, s.metadataCache, TaggingMetadataRequest{
 			TrackID: trackID, TrackName: trackName, ArtistName: artistName, AlbumName: albumName,
 			ReleaseDate: releaseDate, UseSingleGenre: useSingleGenre, EmbedGenre: embedGenre,
 		})
@@ -922,7 +1071,7 @@ func (s *SpotiDownloader) DownloadTrack(
 	}
 
 	resolveDownloadTarget := func() (string, string, error) {
-		downloadResp, err := s.getDownloadLink(trackID)
+		downloadResp, err := s.getDownloadLinkContext(ctx, trackID)
 		if err != nil {
 			return "", "", err
 		}
@@ -942,6 +1091,9 @@ func (s *SpotiDownloader) DownloadTrack(
 	for attempt := 0; attempt < 2; attempt++ {
 		downloadURL, fileExt, err := resolveDownloadTarget()
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return "", ctxErr
+			}
 			if attempt == 0 && isSessionTokenError(err) {
 				if refreshErr := s.refreshSessionToken(); refreshErr != nil {
 					return "", fmt.Errorf("failed to get download link: %v", refreshErr)
@@ -963,8 +1115,11 @@ func (s *SpotiDownloader) DownloadTrack(
 			}
 		}
 
-		outputPath, err = s.downloadFile(downloadURL, outputBasePath, fileExt)
+		outputPath, err = s.downloadFileContext(ctx, downloadURL, outputBasePath, fileExt)
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return "", ctxErr
+			}
 			if attempt == 0 && isSessionTokenError(err) {
 				if refreshErr := s.refreshSessionToken(); refreshErr != nil {
 					return "", fmt.Errorf("failed to download file: %v", refreshErr)
@@ -974,8 +1129,11 @@ func (s *SpotiDownloader) DownloadTrack(
 			return "", fmt.Errorf("failed to download file: %v", err)
 		}
 
-		outputPath, err = convertDownloadedAudio(outputPath, outputBasePath, audioFormat)
+		outputPath, err = convertDownloadedAudioContext(ctx, outputPath, outputBasePath, audioFormat)
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return "", ctxErr
+			}
 			return "", fmt.Errorf("failed to convert downloaded file: %v", err)
 		}
 
@@ -990,14 +1148,22 @@ func (s *SpotiDownloader) DownloadTrack(
 	var coverPath string
 	if coverURL != "" {
 		var coverErr error
-		coverPath, coverErr = s.downloadCoverImage(coverURL, outputDir, embedMaxQualityCover)
+		coverPath, coverErr = s.downloadCoverImageContext(ctx, coverURL, outputDir, embedMaxQualityCover)
 		if coverErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return "", ctxErr
+			}
 			fmt.Printf("Warning: Failed to download cover image: %v\n", coverErr)
 			coverPath = ""
 		}
 	}
 
-	result := <-metaChan
+	var result taggingMetadataResult
+	select {
+	case result = <-metaChan:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
 	isrc := strings.TrimSpace(result.ISRC)
 	resolvedReleaseDate := strings.TrimSpace(releaseDate)
 	if resolvedReleaseDate == "" {
@@ -1027,7 +1193,10 @@ func (s *SpotiDownloader) DownloadTrack(
 		Genre:       resolvedGenre,
 	}
 
-	if err := EmbedMetadata(outputPath, metadata, coverPath); err != nil {
+	if err := EmbedMetadataContext(ctx, outputPath, metadata, coverPath); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		fmt.Printf("Warning: Failed to embed metadata: %v\n", err)
 	}
 
@@ -1043,6 +1212,16 @@ func (s *SpotiDownloader) DownloadTrack(
 }
 
 func (s *SpotiDownloader) downloadCoverImage(coverURL, outputDir string, embedMaxQualityCover bool) (string, error) {
+	return s.downloadCoverImageContext(context.Background(), coverURL, outputDir, embedMaxQualityCover)
+}
+
+func (s *SpotiDownloader) downloadCoverImageContext(ctx context.Context, coverURL, outputDir string, embedMaxQualityCover bool) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 
 	coverURL = convertSmallToMedium(coverURL)
 
@@ -1051,7 +1230,11 @@ func (s *SpotiDownloader) downloadCoverImage(coverURL, outputDir string, embedMa
 		coverURL = coverClient.getMaxResolutionURL(coverURL)
 	}
 
-	resp, err := s.httpClient.Get(coverURL)
+	req, err := newHTTPRequestWithContext(ctx, http.MethodGet, coverURL, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -1071,6 +1254,9 @@ func (s *SpotiDownloader) downloadCoverImage(coverURL, outputDir string, embedMa
 
 	_, err = io.Copy(out, resp.Body)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		return "", err
 	}
 

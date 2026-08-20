@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -9,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -152,8 +152,7 @@ func CheckYtDlpInstalled() (YtDlpStatus, error) {
 		return status, nil
 	}
 
-	cmd := exec.Command(path, "--version")
-	setHideWindow(cmd)
+	cmd := newManagedCommand(context.Background(), path, "--version")
 	output, err := cmd.Output()
 	if err != nil {
 		status.Error = err.Error()
@@ -224,6 +223,16 @@ func EnsureYtDlpInstalledOrUpdated() (YtDlpStatus, error) {
 }
 
 func DownloadWithYtDlp(req YtDlpDownloadRequest) YtDlpDownloadResult {
+	return DownloadWithYtDlpContext(context.Background(), req)
+}
+
+func DownloadWithYtDlpContext(ctx context.Context, req YtDlpDownloadRequest) YtDlpDownloadResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return YtDlpDownloadResult{Error: err.Error()}
+	}
 	if strings.TrimSpace(req.Query) == "" {
 		return YtDlpDownloadResult{Error: "query is required"}
 	}
@@ -233,6 +242,9 @@ func DownloadWithYtDlp(req YtDlpDownloadRequest) YtDlpDownloadResult {
 
 	status, err := EnsureYtDlpInstalledOrUpdated()
 	if err != nil {
+		return YtDlpDownloadResult{Error: err.Error()}
+	}
+	if err := ctx.Err(); err != nil {
 		return YtDlpDownloadResult{Error: err.Error()}
 	}
 
@@ -256,11 +268,16 @@ func DownloadWithYtDlp(req YtDlpDownloadRequest) YtDlpDownloadResult {
 	}
 	args = append(args, req.Query)
 
-	cmd := exec.Command(status.Path, args...)
-	setHideWindow(cmd)
+	cmd := newManagedCommand(ctx, status.Path, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return YtDlpDownloadResult{Error: ctxErr.Error(), Output: strings.TrimSpace(string(output))}
+		}
 		return YtDlpDownloadResult{Error: fmt.Sprintf("yt-dlp failed: %v", err), Output: strings.TrimSpace(string(output))}
+	}
+	if err := ctx.Err(); err != nil {
+		return YtDlpDownloadResult{Error: err.Error(), Output: strings.TrimSpace(string(output))}
 	}
 
 	file := findYtDlpOutputFile(req.OutputBase, audioFormat)

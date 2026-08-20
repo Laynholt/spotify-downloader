@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -83,6 +84,16 @@ func NewLyricsClient() *LyricsClient {
 }
 
 func (c *LyricsClient) FetchLyricsWithMetadata(trackName, artistName string, duration int) (*LyricsResponse, error) {
+	return c.FetchLyricsWithMetadataContext(context.Background(), trackName, artistName, duration)
+}
+
+func (c *LyricsClient) FetchLyricsWithMetadataContext(ctx context.Context, trackName, artistName string, duration int) (*LyricsResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	apiBase, _ := base64.StdEncoding.DecodeString("aHR0cHM6Ly9scmNsaWIubmV0L2FwaS9nZXQ/YXJ0aXN0X25hbWU9")
 	apiURL := fmt.Sprintf("%s%s&track_name=%s",
@@ -94,8 +105,15 @@ func (c *LyricsClient) FetchLyricsWithMetadata(trackName, artistName string, dur
 		apiURL = fmt.Sprintf("%s&duration=%d", apiURL, duration)
 	}
 
-	resp, err := c.httpClient.Get(apiURL)
+	req, err := newHTTPRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
+		return nil, err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, fmt.Errorf("failed to fetch from LRCLIB: %v", err)
 	}
 	defer resp.Body.Close()
@@ -106,6 +124,9 @@ func (c *LyricsClient) FetchLyricsWithMetadata(trackName, artistName string, dur
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, fmt.Errorf("failed to read LRCLIB response: %v", err)
 	}
 
@@ -177,12 +198,29 @@ func lrcTimestampToMs(timestamp string) int64 {
 }
 
 func (c *LyricsClient) FetchLyricsFromLRCLibSearch(trackName, artistName string) (*LyricsResponse, error) {
+	return c.FetchLyricsFromLRCLibSearchContext(context.Background(), trackName, artistName)
+}
+
+func (c *LyricsClient) FetchLyricsFromLRCLibSearchContext(ctx context.Context, trackName, artistName string) (*LyricsResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	query := fmt.Sprintf("%s %s", artistName, trackName)
 	apiBase, _ := base64.StdEncoding.DecodeString("aHR0cHM6Ly9scmNsaWIubmV0L2FwaS9zZWFyY2g/cT0=")
 	apiURL := fmt.Sprintf("%s%s", string(apiBase), url.QueryEscape(query))
 
-	resp, err := c.httpClient.Get(apiURL)
+	req, err := newHTTPRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
+		return nil, err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, fmt.Errorf("request failed: %v", err)
 	}
 	defer resp.Body.Close()
@@ -193,6 +231,9 @@ func (c *LyricsClient) FetchLyricsFromLRCLibSearch(trackName, artistName string)
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, fmt.Errorf("read failed: %v", err)
 	}
 
@@ -224,14 +265,31 @@ func (c *LyricsClient) FetchLyricsFromLRCLibSearch(trackName, artistName string)
 }
 
 func (c *LyricsClient) FetchLyricsFromSpotifyAPI(spotifyID string) (*LyricsResponse, error) {
+	return c.FetchLyricsFromSpotifyAPIContext(context.Background(), spotifyID)
+}
+
+func (c *LyricsClient) FetchLyricsFromSpotifyAPIContext(ctx context.Context, spotifyID string) (*LyricsResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if spotifyID == "" {
 		return nil, fmt.Errorf("spotify ID is empty")
 	}
 
 	apiURL := fmt.Sprintf("https://spotify-lyrics-api-pi.vercel.app/?trackid=%s&format=lrc", spotifyID)
 
-	resp, err := c.httpClient.Get(apiURL)
+	req, err := newHTTPRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
+		return nil, err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, fmt.Errorf("failed to fetch from Spotify Lyrics API: %v", err)
 	}
 	defer resp.Body.Close()
@@ -242,6 +300,9 @@ func (c *LyricsClient) FetchLyricsFromSpotifyAPI(spotifyID string) (*LyricsRespo
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, fmt.Errorf("failed to read Spotify Lyrics API response: %v", err)
 	}
 
@@ -291,22 +352,41 @@ func simplifyTrackName(name string) string {
 }
 
 func (c *LyricsClient) FetchLyricsAllSources(spotifyID, trackName, artistName string, duration int) (*LyricsResponse, string, error) {
+	return c.FetchLyricsAllSourcesContext(context.Background(), spotifyID, trackName, artistName, duration)
+}
 
-	resp, err := c.FetchLyricsFromSpotifyAPI(spotifyID)
+func (c *LyricsClient) FetchLyricsAllSourcesContext(ctx context.Context, spotifyID, trackName, artistName string, duration int) (*LyricsResponse, string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+
+	resp, err := c.FetchLyricsFromSpotifyAPIContext(ctx, spotifyID)
 	if err == nil && resp != nil && !resp.Error && len(resp.Lines) > 0 {
 		return resp, "Spotify", nil
 	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, "", ctxErr
+	}
 	fmt.Printf("   Spotify Lyrics API: %v\n", err)
 
-	resp, err = c.FetchLyricsWithMetadata(trackName, artistName, duration)
+	resp, err = c.FetchLyricsWithMetadataContext(ctx, trackName, artistName, duration)
 	if err == nil && resp != nil && !resp.Error && len(resp.Lines) > 0 {
 		return resp, "LRCLIB", nil
 	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, "", ctxErr
+	}
 	fmt.Printf("   LRCLIB exact: %v\n", err)
 
-	resp, err = c.FetchLyricsFromLRCLibSearch(trackName, artistName)
+	resp, err = c.FetchLyricsFromLRCLibSearchContext(ctx, trackName, artistName)
 	if err == nil && resp != nil && !resp.Error && len(resp.Lines) > 0 {
 		return resp, "LRCLIB Search", nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, "", ctxErr
 	}
 	fmt.Printf("   LRCLIB search: %v\n", err)
 
@@ -314,14 +394,20 @@ func (c *LyricsClient) FetchLyricsAllSources(spotifyID, trackName, artistName st
 	if simplifiedTrack != trackName {
 		fmt.Printf("   Trying simplified name: %s\n", simplifiedTrack)
 
-		resp, err = c.FetchLyricsWithMetadata(simplifiedTrack, artistName, duration)
+		resp, err = c.FetchLyricsWithMetadataContext(ctx, simplifiedTrack, artistName, duration)
 		if err == nil && resp != nil && !resp.Error && len(resp.Lines) > 0 {
 			return resp, "LRCLIB (simplified)", nil
 		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, "", ctxErr
+		}
 
-		resp, err = c.FetchLyricsFromLRCLibSearch(simplifiedTrack, artistName)
+		resp, err = c.FetchLyricsFromLRCLibSearchContext(ctx, simplifiedTrack, artistName)
 		if err == nil && resp != nil && !resp.Error && len(resp.Lines) > 0 {
 			return resp, "LRCLIB Search (simplified)", nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, "", ctxErr
 		}
 	}
 
@@ -462,6 +548,16 @@ func findAudioFileForLyrics(dir, trackName, artistName string) string {
 }
 
 func (c *LyricsClient) DownloadLyrics(req LyricsDownloadRequest) (*LyricsDownloadResponse, error) {
+	return c.DownloadLyricsContext(context.Background(), req)
+}
+
+func (c *LyricsClient) DownloadLyricsContext(ctx context.Context, req LyricsDownloadRequest) (*LyricsDownloadResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return &LyricsDownloadResponse{Success: false, Error: err.Error()}, err
+	}
 	if req.SpotifyID == "" {
 		return &LyricsDownloadResponse{
 			Success: false,
@@ -521,14 +617,14 @@ func (c *LyricsClient) DownloadLyrics(req LyricsDownloadRequest) (*LyricsDownloa
 	audioDuration := 0
 	audioFile := findAudioFileForLyrics(outputDir, req.TrackName, req.ArtistName)
 	if audioFile != "" {
-		duration, err := GetAudioDuration(audioFile)
+		duration, err := GetAudioDurationContext(ctx, audioFile)
 		if err == nil && duration > 0 {
 			audioDuration = int(duration)
 			fmt.Printf("[DownloadLyrics] Found audio file, duration: %d seconds\n", audioDuration)
 		}
 	}
 
-	lyrics, _, err := c.FetchLyricsAllSources(req.SpotifyID, req.TrackName, req.ArtistName, audioDuration)
+	lyrics, _, err := c.FetchLyricsAllSourcesContext(ctx, req.SpotifyID, req.TrackName, req.ArtistName, audioDuration)
 	if err != nil {
 		return &LyricsDownloadResponse{
 			Success: false,

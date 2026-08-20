@@ -3,6 +3,7 @@ package backend
 import (
 	"archive/tar"
 	"archive/zip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,7 +12,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -113,8 +113,7 @@ func IsFFprobeInstalled() (bool, error) {
 		return false, nil
 	}
 
-	cmd := exec.Command(ffprobePath, "-version")
-	setHideWindow(cmd)
+	cmd := newManagedCommand(context.Background(), ffprobePath, "-version")
 	err = cmd.Run()
 	return err == nil, nil
 }
@@ -129,9 +128,7 @@ func IsFFmpegInstalled() (bool, error) {
 		return false, nil
 	}
 
-	cmd := exec.Command(ffmpegPath, "-version")
-
-	setHideWindow(cmd)
+	cmd := newManagedCommand(context.Background(), ffmpegPath, "-version")
 	err = cmd.Run()
 	return err == nil, nil
 }
@@ -610,6 +607,16 @@ type ConvertAudioResult struct {
 }
 
 func ConvertAudio(req ConvertAudioRequest) ([]ConvertAudioResult, error) {
+	return ConvertAudioContext(context.Background(), req)
+}
+
+func ConvertAudioContext(ctx context.Context, req ConvertAudioRequest) ([]ConvertAudioResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	ffmpegPath, err := GetFFmpegPath()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get ffmpeg path: %w", err)
@@ -631,6 +638,13 @@ func ConvertAudio(req ConvertAudioRequest) ([]ConvertAudioResult, error) {
 
 			result := ConvertAudioResult{
 				InputFile: inputFile,
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				result.Error = ctxErr.Error()
+				mu.Lock()
+				results[idx] = result
+				mu.Unlock()
+				return
 			}
 
 			inputExt := strings.ToLower(filepath.Ext(inputFile))
@@ -667,7 +681,7 @@ func ConvertAudio(req ConvertAudioRequest) ([]ConvertAudioResult, error) {
 			var lyrics string
 			var inputMetadata Metadata
 
-			inputMetadata, err = ExtractFullMetadataFromFile(inputFile)
+			inputMetadata, err = ExtractFullMetadataFromFileContext(ctx, inputFile)
 			if err != nil {
 				fmt.Printf("[FFmpeg] Warning: Failed to extract metadata from %s: %v\n", inputFile, err)
 			}
@@ -724,12 +738,14 @@ func ConvertAudio(req ConvertAudioRequest) ([]ConvertAudioResult, error) {
 
 			fmt.Printf("[FFmpeg] Converting: %s -> %s\n", inputFile, outputFile)
 
-			cmd := exec.Command(ffmpegPath, args...)
-
-			setHideWindow(cmd)
+			cmd := newManagedCommand(ctx, ffmpegPath, args...)
 			output, err := cmd.CombinedOutput()
 			if err != nil {
-				result.Error = fmt.Sprintf("conversion failed: %s - %s", err.Error(), string(output))
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					result.Error = ctxErr.Error()
+				} else {
+					result.Error = fmt.Sprintf("conversion failed: %s - %s", err.Error(), string(output))
+				}
 				result.Success = false
 				mu.Lock()
 				results[idx] = result
@@ -741,7 +757,18 @@ func ConvertAudio(req ConvertAudioRequest) ([]ConvertAudioResult, error) {
 				return
 			}
 
-			if err := EmbedMetadataToConvertedFile(outputFile, inputMetadata, coverArtPath); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				result.Error = ctxErr.Error()
+				mu.Lock()
+				results[idx] = result
+				mu.Unlock()
+				if coverArtPath != "" {
+					os.Remove(coverArtPath)
+				}
+				return
+			}
+
+			if err := EmbedMetadataContext(ctx, outputFile, inputMetadata, coverArtPath); err != nil {
 				fmt.Printf("[FFmpeg] Warning: Failed to embed metadata: %v\n", err)
 			} else {
 				fmt.Printf("[FFmpeg] Metadata embedded successfully\n")
@@ -769,6 +796,9 @@ func ConvertAudio(req ConvertAudioRequest) ([]ConvertAudioResult, error) {
 	}
 
 	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return results, err
+	}
 	return results, nil
 }
 
@@ -806,8 +836,7 @@ func GetAudioProperties(filePath string) (*AudioProperties, error) {
 		return nil, err
 	}
 
-	cmd := exec.Command(ffprobePath, "-v", "quiet", "-print_format", "json", "-show_format", filePath)
-	setHideWindow(cmd)
+	cmd := newManagedCommand(context.Background(), ffprobePath, "-v", "quiet", "-print_format", "json", "-show_format", filePath)
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, err

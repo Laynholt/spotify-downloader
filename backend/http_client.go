@@ -1,6 +1,8 @@
 package backend
 
 import (
+	"context"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -12,6 +14,13 @@ func newHTTPClient(timeout time.Duration) *http.Client {
 		Timeout:   timeout,
 		Transport: newHTTPTransport(),
 	}
+}
+
+func newHTTPRequestWithContext(ctx context.Context, method, rawURL string, body io.Reader) (*http.Request, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return http.NewRequestWithContext(ctx, method, rawURL, body)
 }
 
 func newHTTPTransport() http.RoundTripper {
