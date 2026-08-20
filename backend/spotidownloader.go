@@ -73,6 +73,9 @@ type SpotiDownloader struct {
 	pipelineDeps      trackPipelineDeps
 	trackPipelineDeps trackPipelineDeps
 	trackDeps         trackPipelineDeps
+	// refreshToken is a per-instance seam for deterministic pipeline retry
+	// tests. Production instances use refreshSessionToken below.
+	refreshToken func() error
 }
 
 type sessionTokenError struct {
@@ -247,6 +250,11 @@ func (s *SpotiDownloader) doRequestWithNetworkRetry(req *http.Request) (*http.Re
 }
 
 func fetchTaggingMetadata(ctx context.Context, cache *MetadataCache, req TaggingMetadataRequest) (taggingMetadataResult, []string) {
+	result, warnings, _ := fetchTaggingMetadataWithOutcomes(ctx, cache, req)
+	return result, warnings
+}
+
+func fetchTaggingMetadataWithOutcomes(ctx context.Context, cache *MetadataCache, req TaggingMetadataRequest) (taggingMetadataResult, []string, map[string]CacheOutcome) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -254,11 +262,12 @@ func fetchTaggingMetadata(ctx context.Context, cache *MetadataCache, req Tagging
 	result := taggingMetadataResult{ReleaseDate: strings.TrimSpace(req.ReleaseDate)}
 	trackID := strings.TrimSpace(req.TrackID)
 	if trackID == "" {
-		return result, nil
+		return result, nil, map[string]CacheOutcome{}
 	}
 	req.TrackID = trackID
 
 	warnings := make([]string, 0, 4)
+	outcomes := make(map[string]CacheOutcome, 3)
 	var warningMu sync.Mutex
 	addWarning := func(format string, args ...interface{}) {
 		warningMu.Lock()
@@ -292,7 +301,8 @@ func fetchTaggingMetadata(ctx context.Context, cache *MetadataCache, req Tagging
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			cached, _, err := cachedMetadataLookup(ctx, cache, isrcCacheKey(req.TrackID), trackMetadataTTL,
+			key := isrcCacheKey(req.TrackID)
+			cached, outcome, err := cachedMetadataLookup(ctx, cache, key, trackMetadataTTL,
 				func(value cachedISRCMetadata) bool {
 					return strings.TrimSpace(value.ISRC) != "" && len(trimGenreList(value.Genres)) > 0
 				},
@@ -313,6 +323,9 @@ func fetchTaggingMetadata(ctx context.Context, cache *MetadataCache, req Tagging
 					}
 					return cachedISRCMetadata{ISRC: isrc, Genres: trimGenreList(genres)}, nil
 				})
+			resultMu.Lock()
+			outcomes[key] = outcome
+			resultMu.Unlock()
 			if err != nil {
 				addWarning("ISRC/MusicBrainz lookup failed: %v", err)
 				return
@@ -336,7 +349,8 @@ func fetchTaggingMetadata(ctx context.Context, cache *MetadataCache, req Tagging
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			artistID, _, err := cachedMetadataLookup(ctx, cache, chosicTrackCacheKey(req.TrackID), trackMetadataTTL,
+			key := chosicTrackCacheKey(req.TrackID)
+			artistID, outcome, err := cachedMetadataLookup(ctx, cache, key, trackMetadataTTL,
 				func(value string) bool { return strings.TrimSpace(value) != "" },
 				func(loadCtx context.Context) (string, error) {
 					client, clientErr := metadataChosicClientFactory()
@@ -345,6 +359,9 @@ func fetchTaggingMetadata(ctx context.Context, cache *MetadataCache, req Tagging
 					}
 					return client.fetchArtistIDContext(loadCtx, req.TrackID)
 				})
+			resultMu.Lock()
+			outcomes[key] = outcome
+			resultMu.Unlock()
 			if err != nil {
 				addWarning("Chosic track lookup failed: %v", err)
 				return
@@ -354,7 +371,8 @@ func fetchTaggingMetadata(ctx context.Context, cache *MetadataCache, req Tagging
 				return
 			}
 
-			genres, _, err := cachedMetadataLookup(ctx, cache, artistGenreCacheKey(artistID), artistGenreTTL,
+			genreKey := artistGenreCacheKey(artistID)
+			genres, outcome, err := cachedMetadataLookup(ctx, cache, genreKey, artistGenreTTL,
 				func(value []string) bool { return len(trimGenreList(value)) > 0 },
 				func(loadCtx context.Context) ([]string, error) {
 					client, clientErr := metadataChosicClientFactory()
@@ -363,6 +381,9 @@ func fetchTaggingMetadata(ctx context.Context, cache *MetadataCache, req Tagging
 					}
 					return client.fetchArtistGenresContext(loadCtx, artistID)
 				})
+			resultMu.Lock()
+			outcomes[genreKey] = outcome
+			resultMu.Unlock()
 			if err == nil {
 				genres = trimGenreList(genres)
 			}
@@ -397,7 +418,7 @@ func fetchTaggingMetadata(ctx context.Context, cache *MetadataCache, req Tagging
 	}
 	resultMu.Unlock()
 	sort.Strings(warnings)
-	return result, warnings
+	return result, warnings, outcomes
 }
 
 func fetchTaggingMetadataInBackground(trackID, trackName, artistName, albumName, releaseDate string, useSingleGenre, embedGenre bool) <-chan taggingMetadataResult {
@@ -730,6 +751,13 @@ func (s *SpotiDownloader) refreshSessionToken() error {
 	return nil
 }
 
+func (s *SpotiDownloader) refreshSessionTokenForPipeline() error {
+	if s != nil && s.refreshToken != nil {
+		return s.refreshToken()
+	}
+	return s.refreshSessionToken()
+}
+
 func withTokenRetry[T any](s *SpotiDownloader, fn func() (T, error)) (T, error) {
 	result, err := fn()
 	if !isSessionTokenError(err) {
@@ -846,6 +874,23 @@ func (s *SpotiDownloader) GetDownloadLinkContext(ctx context.Context, trackID st
 		return nil, err
 	}
 	if refreshErr := s.refreshSessionToken(); refreshErr != nil {
+		return nil, refreshErr
+	}
+	return s.getDownloadLinkContext(ctx, trackID)
+}
+
+func (s *SpotiDownloader) getDownloadLinkContextWithRetry(ctx context.Context, trackID string) (*DownloadResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result, err := s.getDownloadLinkContext(ctx, trackID)
+	if !isSessionTokenError(err) {
+		return result, err
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if refreshErr := s.refreshSessionTokenForPipeline(); refreshErr != nil {
 		return nil, refreshErr
 	}
 	return s.getDownloadLinkContext(ctx, trackID)
@@ -1026,6 +1071,23 @@ func (s *SpotiDownloader) downloadFileContextWithItemID(ctx context.Context, dow
 	}
 
 	return outputPath, err
+}
+
+func (s *SpotiDownloader) downloadFileContextWithItemIDRetry(ctx context.Context, downloadURL, outputBasePath, fallbackExt, itemID string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result, err := s.downloadFileContextWithItemID(ctx, downloadURL, outputBasePath, fallbackExt, itemID)
+	if !isSessionTokenError(err) {
+		return result, err
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", ctxErr
+	}
+	if refreshErr := s.refreshSessionTokenForPipeline(); refreshErr != nil {
+		return "", refreshErr
+	}
+	return s.downloadFileContextWithItemID(ctx, downloadURL, outputBasePath, fallbackExt, itemID)
 }
 
 func (s *SpotiDownloader) DownloadTrack(

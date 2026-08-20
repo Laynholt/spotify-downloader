@@ -85,6 +85,8 @@ type trackPipelineDeps struct {
 	publish                any
 	now                    any
 	clock                  any
+	newTimer               any
+	withTimeout            any
 }
 
 // pipelineDeps is the test seam used by the backend package tests. Keep the
@@ -98,7 +100,7 @@ var (
 		downloadAudio: trackPipelineDownloadAudio,
 		convertAudio:  trackPipelineConvertAudio,
 		downloadCover: trackPipelineDownloadCover,
-		metadata:      trackPipelineMetadata,
+		metadata:      trackPipelineMetadataWithOutcomes,
 		lyrics:        trackPipelineLyrics,
 		probeDuration: trackPipelineProbeDuration,
 		finalizeMedia: trackPipelineFinalizeMedia,
@@ -130,9 +132,15 @@ type trackPipelineMetadataResult struct {
 }
 
 type trackPipelineLyricsResult struct {
-	lyrics  string
-	err     error
-	elapsed int64
+	lyrics      string
+	err         error
+	elapsed     int64
+	completedAt time.Time
+}
+
+type trackPipelineTimer struct {
+	C    <-chan time.Time
+	Stop func() bool
 }
 
 func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelineRequest) (result TrackPipelineResult, err error) {
@@ -240,12 +248,21 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 		// branch still owns a staged file.
 		cancelBranches()
 		branchWG.Wait()
+		// A lyrics result that completed after the absolute deadline is already
+		// semantically discarded; drain its single buffered send before cleanup.
+		select {
+		case <-lyricsCh:
+		default:
+		}
 		_ = os.RemoveAll(trackDir)
 	}()
 
-	coverCtx, cancelCover := context.WithTimeout(branchCtx, trackPipelineBranchBudget)
+	coverStartedAt := now()
+	metadataStartedAt := now()
+	lyricsStartedAt := now()
+	coverCtx, cancelCover := trackPipelineWithTimeout(deps, branchCtx, trackPipelineBranchBudget)
 	defer cancelCover()
-	metadataCtx, cancelMetadata := context.WithTimeout(branchCtx, trackPipelineBranchBudget)
+	metadataCtx, cancelMetadata := trackPipelineWithTimeout(deps, branchCtx, trackPipelineBranchBudget)
 	defer cancelMetadata()
 	lyricsCtx, cancelLyrics := context.WithDeadline(branchCtx, lyricsDeadline)
 	defer cancelLyrics()
@@ -273,9 +290,8 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 		branchWG.Add(1)
 		go func() {
 			defer branchWG.Done()
-			started := now()
 			path, coverErr := trackPipelineDownloadCoverCall(deps, coverCtx, s, req.CoverURL, trackDir, req.EmbedMaxQualityCover)
-			coverCh <- trackPipelineCoverResult{path: path, err: coverErr, elapsed: trackPipelineElapsedMS(now, started)}
+			coverCh <- trackPipelineCoverResult{path: path, err: coverErr, elapsed: trackPipelineElapsedBetween(coverStartedAt, now())}
 		}()
 	} else {
 		coverCh <- trackPipelineCoverResult{}
@@ -286,9 +302,8 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 		branchWG.Add(1)
 		go func() {
 			defer branchWG.Done()
-			started := now()
 			metadata := trackPipelineMetadataCall(deps, metadataCtx, s, req)
-			metadata.elapsed = trackPipelineElapsedMS(now, started)
+			metadata.elapsed = trackPipelineElapsedBetween(metadataStartedAt, now())
 			metadataCh <- metadata
 		}()
 	} else {
@@ -300,9 +315,9 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 		branchWG.Add(1)
 		go func() {
 			defer branchWG.Done()
-			started := now()
 			lyrics := trackPipelineLyricsCall(deps, lyricsCtx, req)
-			lyrics.elapsed = trackPipelineElapsedMS(now, started)
+			lyrics.completedAt = now()
+			lyrics.elapsed = trackPipelineElapsedBetween(lyricsStartedAt, lyrics.completedAt)
 			lyricsCh <- lyrics
 		}()
 	} else {
@@ -347,31 +362,39 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 	if lyricsStarted {
 		remaining := lyricsDeadline.Sub(now())
 		if remaining > 0 {
-			timer := time.NewTimer(remaining)
+			timer := trackPipelineNewTimer(deps, remaining)
+			stopTimer := func() {
+				if timer.Stop == nil || timer.Stop() || timer.C == nil {
+					return
+				}
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			select {
-			case lyricsOutcome = <-lyricsCh:
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
+			case candidate := <-lyricsCh:
+				stopTimer()
+				lyricsOutcome = candidate
+				if !candidate.completedAt.IsZero() && !candidate.completedAt.Before(lyricsDeadline) {
+					cancelLyrics()
+					warnings = append(warnings, "lyrics deadline exceeded; finalized without lyrics")
+					result.Timings.LyricsMS = candidate.elapsed
+					lyricsOutcome = trackPipelineLyricsResult{}
 				}
 			case <-timer.C:
 				cancelLyrics()
 				warnings = append(warnings, "lyrics deadline exceeded; finalized without lyrics")
+				result.Timings.LyricsMS = trackPipelineElapsedMS(now, lyricsStartedAt)
 				lyricsOutcome = trackPipelineLyricsResult{}
 			case <-ctx.Done():
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
+				stopTimer()
 				return trackPipelineFailure(&result, req, ctx.Err(), warnings)
 			}
 		} else {
 			cancelLyrics()
 			warnings = append(warnings, "lyrics deadline exceeded; finalized without lyrics")
+			result.Timings.LyricsMS = trackPipelineElapsedMS(now, lyricsStartedAt)
 		}
 	} else {
 		lyricsOutcome = <-lyricsCh
@@ -379,13 +402,15 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 	if lyricsOutcome.err != nil && !errors.Is(lyricsOutcome.err, context.Canceled) && !errors.Is(lyricsOutcome.err, context.DeadlineExceeded) {
 		warnings = append(warnings, fmt.Sprintf("lyrics unavailable: %v", lyricsOutcome.err))
 	}
-	result.Timings.LyricsMS = lyricsOutcome.elapsed
+	if result.Timings.LyricsMS == 0 {
+		result.Timings.LyricsMS = lyricsOutcome.elapsed
+	}
 
 	var coverOutcome trackPipelineCoverResult
 	select {
 	case coverOutcome = <-coverCh:
 	case <-coverCtx.Done():
-		coverOutcome = trackPipelineCoverResult{err: coverCtx.Err()}
+		coverOutcome = trackPipelineCoverResult{err: coverCtx.Err(), elapsed: trackPipelineElapsedMS(now, coverStartedAt)}
 	case <-ctx.Done():
 		cancelBranches()
 		return trackPipelineFailure(&result, req, ctx.Err(), warnings)
@@ -405,7 +430,7 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 	select {
 	case metadataOutcome = <-metadataCh:
 	case <-metadataCtx.Done():
-		metadataOutcome = trackPipelineMetadataResult{err: metadataCtx.Err()}
+		metadataOutcome = trackPipelineMetadataResult{err: metadataCtx.Err(), elapsed: trackPipelineElapsedMS(now, metadataStartedAt)}
 	case <-ctx.Done():
 		cancelBranches()
 		return trackPipelineFailure(&result, req, ctx.Err(), warnings)
@@ -586,6 +611,12 @@ func overlayTrackPipelineDeps(dst, src trackPipelineDeps) trackPipelineDeps {
 	if src.clock != nil {
 		dst.now = src.clock
 	}
+	if src.newTimer != nil {
+		dst.newTimer = src.newTimer
+	}
+	if src.withTimeout != nil {
+		dst.withTimeout = src.withTimeout
+	}
 	return dst
 }
 
@@ -598,11 +629,39 @@ func trackPipelineNow(deps trackPipelineDeps) func() time.Time {
 	}
 }
 
+func trackPipelineNewTimer(deps trackPipelineDeps, duration time.Duration) trackPipelineTimer {
+	switch f := deps.newTimer.(type) {
+	case func(time.Duration) <-chan time.Time:
+		return trackPipelineTimer{C: f(duration)}
+	case func(time.Duration) *time.Timer:
+		timer := f(duration)
+		return trackPipelineTimer{C: timer.C, Stop: timer.Stop}
+	default:
+		timer := time.NewTimer(duration)
+		return trackPipelineTimer{C: timer.C, Stop: timer.Stop}
+	}
+}
+
+func trackPipelineWithTimeout(deps trackPipelineDeps, parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if f, ok := deps.withTimeout.(func(context.Context, time.Duration) (context.Context, context.CancelFunc)); ok {
+		return f(parent, timeout)
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
 func trackPipelineElapsedMS(now func() time.Time, started time.Time) int64 {
 	if now == nil {
 		now = time.Now
 	}
 	elapsed := now().Sub(started).Milliseconds()
+	if elapsed < 0 {
+		return 0
+	}
+	return elapsed
+}
+
+func trackPipelineElapsedBetween(started, completed time.Time) int64 {
+	elapsed := completed.Sub(started).Milliseconds()
 	if elapsed < 0 {
 		return 0
 	}
@@ -670,7 +729,7 @@ func mergeTrackPipelineMetadata(base Metadata, optional trackPipelineMetadataRes
 }
 
 func trackPipelineResolveTarget(ctx context.Context, s *SpotiDownloader, req TrackPipelineRequest) (string, string, error) {
-	resp, err := s.getDownloadLinkContext(ctx, req.TrackID)
+	resp, err := s.getDownloadLinkContextWithRetry(ctx, req.TrackID)
 	if err != nil {
 		return "", "", err
 	}
@@ -684,7 +743,7 @@ func trackPipelineResolveTarget(ctx context.Context, s *SpotiDownloader, req Tra
 }
 
 func trackPipelineDownloadAudio(ctx context.Context, s *SpotiDownloader, url, base, ext, itemID string) (string, error) {
-	return s.downloadFileContextWithItemID(ctx, url, base, ext, itemID)
+	return s.downloadFileContextWithItemIDRetry(ctx, url, base, ext, itemID)
 }
 
 func trackPipelineConvertAudio(ctx context.Context, path, base, format string) (string, error) {
@@ -698,6 +757,10 @@ func trackPipelineDownloadCover(ctx context.Context, s *SpotiDownloader, url, di
 func trackPipelineMetadata(ctx context.Context, cache *MetadataCache, req TaggingMetadataRequest) (taggingMetadataResult, []string) {
 	result, warnings := fetchTaggingMetadata(ctx, cache, req)
 	return result, warnings
+}
+
+func trackPipelineMetadataWithOutcomes(ctx context.Context, cache *MetadataCache, req TaggingMetadataRequest) (taggingMetadataResult, []string, map[string]CacheOutcome) {
+	return fetchTaggingMetadataWithOutcomes(ctx, cache, req)
 }
 
 func trackPipelineLyrics(ctx context.Context, req TrackPipelineRequest, _ int) (string, error) {
@@ -834,6 +897,9 @@ func trackPipelineMetadataCall(deps trackPipelineDeps, ctx context.Context, s *S
 		UseSingleGenre: req.UseSingleGenre, EmbedGenre: req.EmbedGenre,
 	}
 	switch f := fn.(type) {
+	case func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string, map[string]CacheOutcome):
+		tagging, warnings, outcomes := f(ctx, s.metadataCache, tagReq)
+		return trackPipelineMetadataResult{tagging: tagging, warnings: warnings, cacheOutcomes: outcomes}
 	case func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string):
 		tagging, warnings := f(ctx, s.metadataCache, tagReq)
 		return trackPipelineMetadataResult{tagging: tagging, warnings: warnings}
