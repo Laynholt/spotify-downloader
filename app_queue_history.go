@@ -1,13 +1,76 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/afkarxyz/SpotiDownloader/backend"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
+
+func (a *App) beginTrack(itemID string) (context.Context, func()) {
+	parent := a.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	trackCtx, cancel := context.WithCancel(parent)
+
+	a.activeMu.Lock()
+	if a.activeDownloads == nil {
+		a.activeDownloads = make(map[string]context.CancelFunc)
+	}
+	if a.activeContexts == nil {
+		a.activeContexts = make(map[string]context.Context)
+	}
+	if previous := a.activeDownloads[itemID]; previous != nil {
+		previous()
+	}
+	a.activeDownloads[itemID] = cancel
+	a.activeContexts[itemID] = trackCtx
+	a.activeMu.Unlock()
+
+	var cleanupOnce sync.Once
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			cancel()
+			a.activeMu.Lock()
+			if current, ok := a.activeContexts[itemID]; ok && current == trackCtx {
+				delete(a.activeContexts, itemID)
+				delete(a.activeDownloads, itemID)
+			}
+			a.activeMu.Unlock()
+		})
+	}
+	return trackCtx, cleanup
+}
+
+// CancelActiveDownloads cancels every track context currently owned by the
+// application and marks those queue items terminal before returning.
+func (a *App) CancelActiveDownloads() int {
+	a.activeMu.Lock()
+	ids := make([]string, 0, len(a.activeDownloads))
+	cancels := make([]context.CancelFunc, 0, len(a.activeDownloads))
+	for itemID, cancel := range a.activeDownloads {
+		ids = append(ids, itemID)
+		if cancel != nil {
+			cancels = append(cancels, cancel)
+		}
+	}
+	a.activeDownloads = make(map[string]context.CancelFunc)
+	a.activeContexts = make(map[string]context.Context)
+	a.activeMu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+	for _, itemID := range ids {
+		backend.CancelDownloadItem(itemID)
+	}
+	return len(ids)
+}
 
 func (a *App) GetDownloadProgress() backend.ProgressInfo {
 	return backend.GetDownloadProgress()

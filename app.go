@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,13 +19,15 @@ import (
 )
 
 type App struct {
-	ctx            context.Context
-	runtimePaths   backend.RuntimePaths
-	runtimeInitErr error
-	metadataCache  *backend.MetadataCache
+	ctx              context.Context
+	runtimePaths     backend.RuntimePaths
+	runtimeInitErr   error
+	metadataCache    *backend.MetadataCache
+	activeMu         sync.Mutex
+	activeDownloads  map[string]context.CancelFunc
+	activeContexts   map[string]context.Context
+	runTrackPipeline func(context.Context, backend.TrackPipelineRequest) (backend.TrackPipelineResult, error)
 }
-
-const inlineLyricsWaitTimeout = 3 * time.Second
 
 func NewApp() *App {
 	paths, err := backend.InitRuntimePaths()
@@ -69,6 +73,7 @@ func (a *App) startup(ctx context.Context) {
 }
 
 func (a *App) shutdown(ctx context.Context) {
+	a.CancelActiveDownloads()
 	if a.metadataCache != nil {
 		if err := a.metadataCache.Close(); err != nil {
 			fmt.Printf("Metadata cache close warning: %v\n", err)
@@ -79,58 +84,6 @@ func (a *App) shutdown(ctx context.Context) {
 		if err := a.runtimePaths.CleanupRun(); err != nil {
 			fmt.Printf("Runtime cleanup warning: %v\n", err)
 		}
-	}
-}
-
-func (a *App) embedLyrics(filename, lyrics string) {
-	if strings.TrimSpace(lyrics) == "" {
-		fmt.Println("No lyrics found to embed.")
-		return
-	}
-
-	fmt.Printf("\n--- Full LRC Content ---\n")
-	fmt.Println(lyrics)
-	fmt.Printf("--- End LRC Content ---\n\n")
-
-	fmt.Printf("Embedding into: %s\n", filename)
-	if err := backend.EmbedLyricsOnly(filename, lyrics); err != nil {
-		fmt.Printf("Failed to embed lyrics: %v\n", err)
-		return
-	}
-
-	fmt.Printf("Lyrics embedded successfully!\n")
-	if err := backend.FinalizeTaggedAudioFile(filename); err != nil {
-		fmt.Printf("Failed to finalize tagged MP3 file: %v\n", err)
-	}
-}
-
-func (a *App) finishLyricsEmbeddingAsync(filename string, lyricsChan <-chan string) {
-	lyrics, ok := <-lyricsChan
-	if !ok || strings.TrimSpace(lyrics) == "" {
-		fmt.Printf("Lyrics were not found for %s.\n", filepath.Base(filename))
-		return
-	}
-
-	fmt.Printf("Lyrics fetch completed in background for %s.\n", filepath.Base(filename))
-	a.embedLyrics(filename, lyrics)
-}
-
-func (a *App) embedLyricsIfReady(filename string, lyricsChan <-chan string) {
-	timer := time.NewTimer(inlineLyricsWaitTimeout)
-	defer timer.Stop()
-
-	fmt.Printf("\nWaiting up to %v for lyrics fetch...\n", inlineLyricsWaitTimeout)
-
-	select {
-	case lyrics, ok := <-lyricsChan:
-		if !ok {
-			fmt.Println("No lyrics found to embed.")
-			return
-		}
-		a.embedLyrics(filename, lyrics)
-	case <-timer.C:
-		fmt.Printf("Lyrics fetch is still running for %s; finishing download now and embedding later if lyrics arrive.\n", filepath.Base(filename))
-		go a.finishLyricsEmbeddingAsync(filename, lyricsChan)
 	}
 }
 
@@ -177,19 +130,22 @@ type DownloadRequest struct {
 }
 
 type DownloadResponse struct {
-	Success                 bool    `json:"success"`
-	Message                 string  `json:"message"`
-	File                    string  `json:"file,omitempty"`
-	Error                   string  `json:"error,omitempty"`
-	AlreadyExists           bool    `json:"already_exists,omitempty"`
-	ItemID                  string  `json:"item_id,omitempty"`
-	MovedOriginalPath       string  `json:"moved_original_path,omitempty"`
-	ReplacementPath         string  `json:"replacement_path,omitempty"`
-	ExpectedDurationSeconds float64 `json:"expected_duration_seconds,omitempty"`
-	ActualDurationSeconds   float64 `json:"actual_duration_seconds,omitempty"`
-	DurationDeltaSeconds    float64 `json:"duration_delta_seconds,omitempty"`
-	Suspicious              bool    `json:"suspicious,omitempty"`
-	ValidationWarning       string  `json:"validation_warning,omitempty"`
+	Success                 bool                            `json:"success"`
+	Message                 string                          `json:"message"`
+	File                    string                          `json:"file,omitempty"`
+	Error                   string                          `json:"error,omitempty"`
+	AlreadyExists           bool                            `json:"already_exists,omitempty"`
+	ItemID                  string                          `json:"item_id,omitempty"`
+	MovedOriginalPath       string                          `json:"moved_original_path,omitempty"`
+	ReplacementPath         string                          `json:"replacement_path,omitempty"`
+	ExpectedDurationSeconds float64                         `json:"expected_duration_seconds,omitempty"`
+	ActualDurationSeconds   float64                         `json:"actual_duration_seconds,omitempty"`
+	DurationDeltaSeconds    float64                         `json:"duration_delta_seconds,omitempty"`
+	Suspicious              bool                            `json:"suspicious,omitempty"`
+	ValidationWarning       string                          `json:"validation_warning,omitempty"`
+	Warnings                []string                        `json:"warnings,omitempty"`
+	CacheOutcomes           map[string]backend.CacheOutcome `json:"cache_outcomes,omitempty"`
+	Timings                 backend.PipelineTimings         `json:"timings,omitempty"`
 }
 
 func (a *App) GetSpotifyMetadata(req SpotifyMetadataRequest) (string, error) {
@@ -279,58 +235,63 @@ func (a *App) DownloadTrack(req DownloadRequest) (DownloadResponse, error) {
 	}
 
 	itemID := ensureDownloadQueueItem(req)
-
-	backend.SetDownloading(true)
+	trackCtx, cleanup := a.beginTrack(itemID)
+	defer cleanup()
 	backend.StartDownloadItem(itemID)
-	defer backend.SetDownloading(false)
 
-	enrichDownloadRequestMetadata(&req)
-
-	if expectedPath, exists := findExistingDownloadPath(req); exists {
-		backend.SkipDownloadItem(itemID, expectedPath)
-		return DownloadResponse{
-			Success:       true,
-			Message:       "File already exists",
-			File:          expectedPath,
-			AlreadyExists: true,
-			ItemID:        itemID,
-		}, nil
-	}
-
-	trackID := primaryTrackID(req)
-	lyricsChan := startLyricsFetch(req, trackID)
-
-	filename, err := downloadTrackFile(req, trackID)
+	pipelineReq := buildTrackPipelineRequest(req, itemID)
+	result, err := a.runTrackPipelineWithRequest(trackCtx, req, pipelineReq)
 	if err != nil {
-		backend.FailDownloadItem(itemID, fmt.Sprintf("Download failed: %v", err))
+		message := err.Error()
+		for _, warning := range result.Warnings {
+			backend.AddItemWarning(itemID, warning)
+		}
+		if errors.Is(err, context.Canceled) {
+			backend.CancelDownloadItem(itemID)
+		} else {
+			backend.FailDownloadItem(itemID, message)
+		}
 		return DownloadResponse{
-			Success: false,
-			Error:   fmt.Sprintf("Download failed: %v", err),
-			ItemID:  itemID,
+			Success:       false,
+			Error:         message,
+			ItemID:        itemID,
+			Warnings:      append([]string(nil), result.Warnings...),
+			CacheOutcomes: result.CacheOutcomes,
+			Timings:       result.Timings,
+		}, err
+	}
+	if cancelErr := trackCtx.Err(); cancelErr != nil {
+		backend.CancelDownloadItem(itemID)
+		return DownloadResponse{
+			Success:       false,
+			Error:         cancelErr.Error(),
+			ItemID:        itemID,
+			Warnings:      append([]string(nil), result.Warnings...),
+			CacheOutcomes: result.CacheOutcomes,
+			Timings:       result.Timings,
+		}, cancelErr
+	}
+	if strings.TrimSpace(result.File) == "" {
+		err = errors.New("track pipeline returned an empty file")
+		backend.FailDownloadItem(itemID, err.Error())
+		return DownloadResponse{
+			Success:       false,
+			Error:         err.Error(),
+			ItemID:        itemID,
+			Warnings:      append([]string(nil), result.Warnings...),
+			CacheOutcomes: result.CacheOutcomes,
+			Timings:       result.Timings,
 		}, err
 	}
 
-	alreadyExists := false
-	if strings.HasPrefix(filename, "EXISTS:") {
-		alreadyExists = true
-		filename = strings.TrimPrefix(filename, "EXISTS:")
+	for _, warning := range result.Warnings {
+		backend.AddItemWarning(itemID, warning)
 	}
 
-	if !alreadyExists && trackID != "" && req.EmbedLyrics && (strings.HasSuffix(filename, ".flac") || strings.HasSuffix(filename, ".mp3") || strings.HasSuffix(filename, ".m4a")) {
-		a.embedLyricsIfReady(filename, lyricsChan)
-	} else {
-		select {
-		case <-lyricsChan:
-		default:
-		}
-	}
-
-	message := "Download completed successfully"
-	if alreadyExists {
-		message = "File already exists"
-		backend.SkipDownloadItem(itemID, filename)
-	} else {
-		validation := validateDownloadedFileDuration(filename, req.Duration)
+	validation := DownloadResponse{}
+	filename := result.File
+	if !result.AlreadyExists && result.DurationSeconds > 0 {
+		validation = validateDownloadedDuration(filename, req.Duration, result.DurationSeconds)
 		if validation.Suspicious {
 			movedValidation, moveErr := moveSuspiciousDownloadIfNeeded(filename, req.CollectionDir, validation)
 			if moveErr != nil {
@@ -345,35 +306,50 @@ func (a *App) DownloadTrack(req DownloadRequest) (DownloadResponse, error) {
 					DurationDeltaSeconds:    validation.DurationDeltaSeconds,
 					Suspicious:              validation.Suspicious,
 					ValidationWarning:       validation.ValidationWarning,
+					Warnings:                append([]string(nil), result.Warnings...),
+					CacheOutcomes:           result.CacheOutcomes,
+					Timings:                 result.Timings,
 				}, moveErr
 			}
 			validation = movedValidation
 			filename = validation.File
 		}
-		completeDownloadTracking(itemID, filename)
-		addHistoryItemAsync(req, filename)
-		return DownloadResponse{
-			Success:                 true,
-			Message:                 message,
-			File:                    filename,
-			AlreadyExists:           alreadyExists,
-			ItemID:                  itemID,
-			MovedOriginalPath:       validation.MovedOriginalPath,
-			ReplacementPath:         validation.ReplacementPath,
-			ExpectedDurationSeconds: validation.ExpectedDurationSeconds,
-			ActualDurationSeconds:   validation.ActualDurationSeconds,
-			DurationDeltaSeconds:    validation.DurationDeltaSeconds,
-			Suspicious:              validation.Suspicious,
-			ValidationWarning:       validation.ValidationWarning,
-		}, nil
+	}
+	if validation.ValidationWarning != "" {
+		backend.AddItemWarning(itemID, validation.ValidationWarning)
 	}
 
+	if result.AlreadyExists {
+		backend.SkipDownloadItem(itemID, filename)
+	} else {
+		completeDownloadTracking(itemID, filename, result.Timings)
+		addHistoryItemAsync(req, filename)
+	}
+
+	warnings := append([]string(nil), result.Warnings...)
+	if validation.ValidationWarning != "" {
+		warnings = append(warnings, validation.ValidationWarning)
+	}
+	message := "Download completed successfully"
+	if result.AlreadyExists {
+		message = "File already exists"
+	}
 	return DownloadResponse{
-		Success:       true,
-		Message:       message,
-		File:          filename,
-		AlreadyExists: alreadyExists,
-		ItemID:        itemID,
+		Success:                 true,
+		Message:                 message,
+		File:                    filename,
+		AlreadyExists:           result.AlreadyExists,
+		ItemID:                  itemID,
+		MovedOriginalPath:       validation.MovedOriginalPath,
+		ReplacementPath:         validation.ReplacementPath,
+		ExpectedDurationSeconds: validation.ExpectedDurationSeconds,
+		ActualDurationSeconds:   validation.ActualDurationSeconds,
+		DurationDeltaSeconds:    validation.DurationDeltaSeconds,
+		Suspicious:              validation.Suspicious,
+		ValidationWarning:       validation.ValidationWarning,
+		Warnings:                warnings,
+		CacheOutcomes:           result.CacheOutcomes,
+		Timings:                 result.Timings,
 	}, nil
 }
 

@@ -1106,39 +1106,6 @@ func (s *SpotiDownloader) downloadFileContextWithItemIDRetry(ctx context.Context
 	return s.downloadFileContextWithItemID(ctx, downloadURL, outputBasePath, fallbackExt, itemID)
 }
 
-func (s *SpotiDownloader) DownloadTrack(
-	trackID string,
-	outputDir string,
-	audioFormat string,
-	filenameFormat string,
-	includeTrackNumber bool,
-	position int,
-	trackName string,
-	artistName string,
-	albumName string,
-	albumArtist string,
-	releaseDate string,
-	coverURL string,
-	actualTrackNumber int,
-	discNumber int,
-	totalTracks int,
-	useAlbumTrackNumber bool,
-	embedMaxQualityCover bool,
-	totalDiscs int,
-	copyright string,
-	publisher string,
-	playlistName string,
-	playlistOwner string,
-	useFirstArtistOnly bool,
-	useSingleGenre bool,
-	embedGenre bool,
-) (string, error) {
-	return s.DownloadTrackContext(context.Background(), trackID, outputDir, audioFormat, filenameFormat,
-		includeTrackNumber, position, trackName, artistName, albumName, albumArtist, releaseDate, coverURL,
-		actualTrackNumber, discNumber, totalTracks, useAlbumTrackNumber, embedMaxQualityCover, totalDiscs,
-		copyright, publisher, playlistName, playlistOwner, useFirstArtistOnly, useSingleGenre, embedGenre)
-}
-
 func (s *SpotiDownloader) DownloadTrackContext(
 	ctx context.Context,
 	trackID string,

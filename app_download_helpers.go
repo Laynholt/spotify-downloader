@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -57,161 +56,66 @@ func primaryTrackID(req DownloadRequest) string {
 	return req.SpotifyID
 }
 
-func metadataTrackID(req DownloadRequest) string {
-	if req.SpotifyID != "" {
-		return req.SpotifyID
+func buildTrackPipelineRequest(req DownloadRequest, itemID string) backend.TrackPipelineRequest {
+	trackNumber := req.AlbumTrackNumber
+	if trackNumber == 0 {
+		trackNumber = 1
 	}
-	return req.TrackID
-}
-
-func enrichDownloadRequestMetadata(req *DownloadRequest) {
-	spotifyTrackID := metadataTrackID(*req)
-	if spotifyTrackID == "" {
-		return
-	}
-
-	needsSpotifyMetadata := req.Copyright == "" ||
-		req.Publisher == "" ||
-		req.SpotifyTotalDiscs == 0 ||
-		req.ReleaseDate == "" ||
-		req.TotalTracks == 0 ||
-		req.AlbumTrackNumber == 0
-	if !needsSpotifyMetadata {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	trackURL := fmt.Sprintf("https://open.spotify.com/track/%s", spotifyTrackID)
-	trackData, err := backend.GetFilteredSpotifyData(ctx, trackURL, false, 0)
-	if err != nil {
-		return
-	}
-
-	var trackResp struct {
-		Track struct {
-			Copyright   string `json:"copyright"`
-			Publisher   string `json:"publisher"`
-			TotalDiscs  int    `json:"total_discs"`
-			TotalTracks int    `json:"total_tracks"`
-			TrackNumber int    `json:"track_number"`
-			ReleaseDate string `json:"release_date"`
-		} `json:"track"`
-	}
-	jsonData, jsonErr := json.Marshal(trackData)
-	if jsonErr != nil || json.Unmarshal(jsonData, &trackResp) != nil {
-		return
-	}
-
-	if req.Copyright == "" && trackResp.Track.Copyright != "" {
-		req.Copyright = trackResp.Track.Copyright
-	}
-	if req.Publisher == "" && trackResp.Track.Publisher != "" {
-		req.Publisher = trackResp.Track.Publisher
-	}
-	if req.SpotifyTotalDiscs == 0 && trackResp.Track.TotalDiscs > 0 {
-		req.SpotifyTotalDiscs = trackResp.Track.TotalDiscs
-	}
-	if req.TotalTracks == 0 && trackResp.Track.TotalTracks > 0 {
-		req.TotalTracks = trackResp.Track.TotalTracks
-	}
-	if req.AlbumTrackNumber == 0 && trackResp.Track.TrackNumber > 0 {
-		req.AlbumTrackNumber = trackResp.Track.TrackNumber
-	}
-	if req.ReleaseDate == "" && trackResp.Track.ReleaseDate != "" {
-		req.ReleaseDate = trackResp.Track.ReleaseDate
+	trackID := primaryTrackID(req)
+	return backend.TrackPipelineRequest{
+		ItemID:               itemID,
+		TrackID:              trackID,
+		OutputDir:            req.OutputDir,
+		AudioFormat:          req.AudioFormat,
+		FilenameFormat:       req.FilenameFormat,
+		IncludeTrackNumber:   req.TrackNumber,
+		Position:             req.Position,
+		UseAlbumTrackNumber:  req.UseAlbumTrackNumber,
+		PlaylistName:         req.PlaylistName,
+		PlaylistOwner:        req.PlaylistOwner,
+		UseFirstArtistOnly:   req.UseFirstArtistOnly,
+		EmbedMaxQualityCover: req.EmbedMaxQualityCover,
+		EmbedGenre:           req.EmbedGenre,
+		UseSingleGenre:       req.UseSingleGenre,
+		EmbedLyrics:          req.EmbedLyrics,
+		ExpectedDurationMS:   req.Duration,
+		CoverURL:             req.CoverURL,
+		BaseMetadata: backend.Metadata{
+			Title:       req.TrackName,
+			Artist:      req.ArtistName,
+			Album:       req.AlbumName,
+			AlbumArtist: req.AlbumArtist,
+			Date:        req.ReleaseDate,
+			ReleaseDate: req.ReleaseDate,
+			TrackNumber: trackNumber,
+			TotalTracks: req.TotalTracks,
+			DiscNumber:  req.DiscNumber,
+			TotalDiscs:  req.SpotifyTotalDiscs,
+			URL:         fmt.Sprintf("https://open.spotify.com/track/%s", trackID),
+			Copyright:   req.Copyright,
+			Publisher:   req.Publisher,
+			Description: "https://github.com/afkarxyz/SpotiDownloader",
+		},
 	}
 }
 
-func findExistingDownloadPath(req DownloadRequest) (string, bool) {
-	if req.TrackName == "" || req.ArtistName == "" {
-		return "", false
+func (a *App) runTrackPipelineWithRequest(ctx context.Context, req DownloadRequest, pipelineReq backend.TrackPipelineRequest) (backend.TrackPipelineResult, error) {
+	if a.runTrackPipeline != nil {
+		return a.runTrackPipeline(ctx, pipelineReq)
 	}
-
-	filenameBase := backend.BuildFilename(req.TrackName, req.ArtistName, req.AlbumName, req.AlbumArtist, req.ReleaseDate, req.DiscNumber, req.FilenameFormat, req.TrackNumber, req.Position, req.UseAlbumTrackNumber, req.PlaylistName, req.PlaylistOwner)
-	filenameBase = backend.SanitizeFilename(filenameBase)
-
-	for _, ext := range backend.PossibleAudioExtensions(req.AudioFormat) {
-		expectedPath := filepath.Join(req.OutputDir, filenameBase+ext)
-		if fileInfo, err := os.Stat(expectedPath); err == nil && fileInfo.Size() > 0 {
-			return expectedPath, true
-		}
-	}
-
-	return "", false
-}
-
-func startLyricsFetch(req DownloadRequest, trackID string) <-chan string {
-	lyricsChan := make(chan string, 1)
-	if !req.EmbedLyrics || trackID == "" {
-		close(lyricsChan)
-		return lyricsChan
-	}
-
-	go func() {
-		defer close(lyricsChan)
-
-		fmt.Println("Fetching lyrics in background...")
-		client := backend.NewLyricsClient()
-		resp, _, err := client.FetchLyricsAllSources(trackID, req.TrackName, req.ArtistName, req.Duration)
-		if err == nil && resp != nil && len(resp.Lines) > 0 {
-			lyricsChan <- client.ConvertToLRC(resp, req.TrackName, req.ArtistName)
-			return
-		}
-
-		lyricsChan <- ""
-	}()
-
-	return lyricsChan
-}
-
-func downloadTrackFile(req DownloadRequest, trackID string) (string, error) {
 	downloader := backend.NewSpotiDownloader(req.SessionToken)
 	defer downloader.CloseIdleConnections()
-
-	actualTrackNumber := req.AlbumTrackNumber
-	if actualTrackNumber == 0 {
-		actualTrackNumber = 1
-	}
-
-	return downloader.DownloadTrack(
-		trackID,
-		req.OutputDir,
-		req.AudioFormat,
-		req.FilenameFormat,
-		req.TrackNumber,
-		req.Position,
-		req.TrackName,
-		req.ArtistName,
-		req.AlbumName,
-		req.AlbumArtist,
-		req.ReleaseDate,
-		req.CoverURL,
-		actualTrackNumber,
-		req.DiscNumber,
-		req.TotalTracks,
-		req.UseAlbumTrackNumber,
-		req.EmbedMaxQualityCover,
-		req.SpotifyTotalDiscs,
-		req.Copyright,
-		req.Publisher,
-		req.PlaylistName,
-		req.PlaylistOwner,
-		req.UseFirstArtistOnly,
-		req.UseSingleGenre,
-		req.EmbedGenre,
-	)
+	return downloader.RunTrackPipeline(ctx, pipelineReq)
 }
 
-func completeDownloadTracking(itemID, filename string) {
+func completeDownloadTracking(itemID, filename string, timings backend.PipelineTimings) {
 	if fileInfo, statErr := os.Stat(filename); statErr == nil {
 		finalSize := float64(fileInfo.Size()) / (1024 * 1024)
-		backend.CompleteDownloadItem(itemID, filename, finalSize)
+		backend.CompleteDownloadItem(itemID, filename, finalSize, timings)
 		return
 	}
 
-	backend.CompleteDownloadItem(itemID, filename, 0)
+	backend.CompleteDownloadItem(itemID, filename, 0, timings)
 }
 
 func addHistoryItemAsync(req DownloadRequest, filename string) {
@@ -222,21 +126,8 @@ func addHistoryItemAsync(req DownloadRequest, filename string) {
 	}()
 }
 
-func validateDownloadedFileDuration(filename string, expectedDurationMs int) DownloadResponse {
-	if expectedDurationMs <= 0 || filename == "" {
-		return DownloadResponse{}
-	}
-
-	actualSeconds, err := backend.GetAudioDuration(filename)
-	if err != nil {
-		return buildDownloadValidationResult(expectedDurationMs, actualSeconds, err)
-	}
-	return validateDownloadedDuration(filename, expectedDurationMs, actualSeconds)
-}
-
 // validateDownloadedDuration consumes a duration that has already been
-// measured by the caller. Keeping this separate from the legacy probing
-// wrapper lets the download pipeline reuse one probe result.
+// measured by the pipeline, so the App never probes the same file twice.
 func validateDownloadedDuration(filename string, expectedDurationMs int, actualDurationSeconds float64) DownloadResponse {
 	if expectedDurationMs <= 0 || filename == "" {
 		return DownloadResponse{}
