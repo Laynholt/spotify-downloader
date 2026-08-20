@@ -8,6 +8,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Spinner } from "@/components/ui/spinner";
 import type { BatchDownloadSummary, BatchTrackResult } from "@/lib/batch-summary";
 import { hasProblemDetails } from "@/lib/batch-summary";
+import { formatCancelledSummary } from "@/lib/download-timings";
 
 interface BatchDownloadSummaryDialogProps {
     open: boolean;
@@ -99,6 +100,7 @@ function ResultSection({ title, icon, results }: { title: string; icon: ReactNod
 export function BatchDownloadSummaryDialog({ open, summary, isRedownloadingSuspicious = false, redownloadProgress = 0, redownloadCurrentTrack = null, onMinimize, onClose, onRedownloadSuspicious }: BatchDownloadSummaryDialogProps) {
     const [includeFailedTracks, setIncludeFailedTracks] = useState(false);
     const failed = summary?.results.filter((result) => result.status === "failed") || [];
+    const cancelled = summary?.results.filter((result) => result.status === "cancelled") || [];
     const suspicious = summary?.results.filter((result) => result.status === "suspicious") || [];
     const duplicateSkipped = summary?.results.filter((result) => result.status === "duplicate_skipped") || [];
     const metadataUpdated = summary?.results.filter((result) => result.status === "metadata_updated") || [];
@@ -141,6 +143,8 @@ export function BatchDownloadSummaryDialog({ open, summary, isRedownloadingSuspi
                                 <div className="space-y-3">
                                     <ResultSection title="Suspicious Tracks" icon={<AlertTriangle className="h-4 w-4 text-yellow-500" />} results={suspicious} />
                                     <ResultSection title="Failed Tracks" icon={<XCircle className="h-4 w-4 text-red-500" />} results={failed} />
+                                    <ResultSection title="Cancelled Tracks" icon={<XCircle className="h-4 w-4 text-orange-500" />} results={cancelled} />
+                                    {summary.cancelled > 0 && cancelled.length === 0 && <div className="rounded-md border border-border/60 px-3 py-2 text-sm text-muted-foreground">{formatCancelledSummary(summary.cancelled)}</div>}
                                     <ResultSection title="Duplicate Tracks" icon={<FileCheck className="h-4 w-4 text-yellow-500" />} results={duplicateSkipped} />
                                     <ResultSection title="Metadata Updates" icon={<RefreshCw className="h-4 w-4 text-blue-500" />} results={metadataUpdated} />
                                     <ResultSection title="YouTube Downloads" icon={<Download className="h-4 w-4 text-green-500" />} results={youtubeSucceeded} />

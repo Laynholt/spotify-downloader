@@ -1,7 +1,6 @@
 import { Button } from "@/components/ui/button";
-import { Progress } from "@/components/ui/progress";
 import { useDownloadQueueData } from "@/hooks/useDownloadQueueData";
-import { phaseLabel } from "@/lib/download-timings";
+import { formatAggregateProgress, formatTransferProgress, phaseLabel } from "@/lib/download-timings";
 import { StopCircle } from "lucide-react";
 interface DownloadProgressProps {
     progress: number;
@@ -11,29 +10,21 @@ interface DownloadProgressProps {
     } | null;
     onStop: () => void;
 }
-export function DownloadProgress({ progress, currentTrack, onStop }: DownloadProgressProps) {
+export function DownloadProgress({ currentTrack, onStop }: DownloadProgressProps) {
     const queueInfo = useDownloadQueueData();
-    const clampedProgress = Math.min(100, Math.max(0, progress));
     const activeItems = queueInfo.queue.filter((item) => item.status === "downloading" || item.status === "queued");
-    const formatBytes = (bytes: number) => {
-        if (!Number.isFinite(bytes) || bytes <= 0) {
-            return "0 B";
-        }
-        if (bytes < 1024 * 1024) {
-            return `${(bytes / 1024).toFixed(0)} KB`;
-        }
-        return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
-    };
+    const activeCount = queueInfo.active_count ?? queueInfo.queue.filter((item) => item.status === "downloading").length;
+    const settledCount = queueInfo.completed_count + queueInfo.failed_count + queueInfo.skipped_count + (queueInfo.cancelled_count ?? 0);
+    const aggregate = formatAggregateProgress(activeCount, settledCount, queueInfo.queue.length);
     return (<div className="w-full space-y-2 mt-4">
       <div className="flex items-center gap-2">
-        <Progress value={clampedProgress} className="h-2 flex-1"/>
+        <p className="flex-1 text-sm font-medium tabular-nums">{aggregate}</p>
         <Button variant="destructive" size="sm" onClick={onStop} className="gap-1.5">
           <StopCircle className="h-4 w-4"/>
           Stop
         </Button>
       </div>
       <p className="text-xs text-muted-foreground">
-        {clampedProgress}% -{" "}
         {currentTrack
             ? `${currentTrack.name} - ${currentTrack.artists}`
             : "Preparing download..."}
@@ -45,16 +36,8 @@ export function DownloadProgress({ progress, currentTrack, onStop }: DownloadPro
             {item.speed > 0 && <span className="shrink-0 font-mono text-muted-foreground">{item.speed.toFixed(2)} MB/s</span>}
           </div>
           <div className="truncate text-muted-foreground">{item.detail || item.track_name}</div>
-          <div className="flex items-center justify-between gap-2 font-mono text-muted-foreground">
-            <span>
-              {item.total_bytes > 0
-                  ? `${formatBytes(item.downloaded_bytes)} / ${formatBytes(item.total_bytes)}`
-                  : item.downloaded_bytes > 0
-                      ? `${formatBytes(item.downloaded_bytes)} downloaded`
-                      : "Waiting for byte progress"}
-            </span>
-            {item.warning && <span className="truncate text-yellow-600 dark:text-yellow-400">{item.warning}</span>}
-          </div>
+          {formatTransferProgress(item.downloaded_bytes, item.total_bytes) && <div className="font-mono text-muted-foreground">{formatTransferProgress(item.downloaded_bytes, item.total_bytes)}</div>}
+          {item.warning && <div className="truncate text-yellow-600 dark:text-yellow-400">{item.warning}</div>}
         </div>))}
         {activeItems.length > 3 && <div className="text-xs text-muted-foreground">+{activeItems.length - 3} more active tracks</div>}
       </div>)}

@@ -5,7 +5,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, } from "@/components/
 import { Badge } from "@/components/ui/badge";
 import { GetDownloadQueue, ClearCompletedDownloads, ClearAllDownloads, ExportFailedDownloads, } from "../../wailsjs/go/main/App";
 import { toastWithSound as toast } from "@/lib/toast-with-sound";
-import { formatAggregateProgress, formatPipelineTimings, phaseLabel } from "@/lib/download-timings";
+import { formatAggregateProgress, formatPipelineTimings, formatTransferProgress, phaseLabel } from "@/lib/download-timings";
 import { backend } from "../../wailsjs/go/models";
 interface DownloadQueueProps {
     isOpen: boolean;
@@ -102,7 +102,7 @@ export function DownloadQueue({ isOpen, onClose }: DownloadQueueProps) {
                 return null;
         }
     };
-    const getStatusBadge = (status: string) => {
+    const getStatusBadge = (status: string, phase?: string) => {
         const variants: Record<string, "default" | "secondary" | "destructive" | "outline"> = {
             downloading: "default",
             completed: "outline",
@@ -112,17 +112,8 @@ export function DownloadQueue({ isOpen, onClose }: DownloadQueueProps) {
             queued: "outline",
         };
         return (<Badge variant={variants[status] || "outline"} className="text-xs">
-        {phaseLabel(status)}
+        {phaseLabel(status === "downloading" || status === "queued" ? (phase || status) : status)}
       </Badge>);
-    };
-    const formatBytes = (bytes: number) => {
-        if (!Number.isFinite(bytes) || bytes <= 0) {
-            return "0 B";
-        }
-        if (bytes < 1024 * 1024) {
-            return `${(bytes / 1024).toFixed(0)} KB`;
-        }
-        return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
     };
     const settledCount = queueInfo.completed_count + queueInfo.failed_count + queueInfo.skipped_count + (queueInfo.cancelled_count ?? 0);
     const activeCount = queueInfo.active_count ?? queueInfo.queue.filter((item) => item.status === "downloading").length;
@@ -202,11 +193,11 @@ export function DownloadQueue({ isOpen, onClose }: DownloadQueueProps) {
               <span className="text-muted-foreground">Failed:</span>
               <span className="font-semibold">{queueInfo.failed_count}</span>
             </div>
-            <div className={`flex items-center gap-1.5 cursor-pointer hover:opacity-80 transition-all select-none ${filterStatus === "cancelled" ? "bg-orange-500/10 px-2 py-0.5 rounded-md ring-1 ring-orange-500/20" : ""}`} onClick={() => toggleFilter("cancelled")}>
+            <button type="button" aria-pressed={filterStatus === "cancelled"} className={`flex items-center gap-1.5 cursor-pointer hover:opacity-80 transition-all select-none bg-transparent p-0 text-sm ${filterStatus === "cancelled" ? "bg-orange-500/10 px-2 py-0.5 rounded-md ring-1 ring-orange-500/20" : ""}`} onClick={() => toggleFilter("cancelled")}>
               <XCircle className="h-3.5 w-3.5 text-orange-500"/>
               <span className="text-muted-foreground">Cancelled:</span>
               <span className="font-semibold">{queueInfo.cancelled_count ?? 0}</span>
-            </div>
+            </button>
           </div>
 
           <div className="flex items-center gap-4 text-sm pt-3 mt-3 border-t">
@@ -265,7 +256,7 @@ export function DownloadQueue({ isOpen, onClose }: DownloadQueueProps) {
                             {item.album_name && ` • ${item.album_name}`}
                           </p>
                         </div>
-                        {getStatusBadge(item.status)}
+                        {getStatusBadge(item.status, item.phase)}
                       </div>
 
                       {(item.status === "downloading" || item.status === "queued") && (<div className="mt-1.5 space-y-1 text-xs text-muted-foreground">
@@ -274,24 +265,13 @@ export function DownloadQueue({ isOpen, onClose }: DownloadQueueProps) {
                             {item.speed > 0 && <span className="font-mono">{item.speed.toFixed(2)} MB/s</span>}
                           </div>
                           {item.detail && <div className="truncate">{item.detail}</div>}
-                          <div className="flex items-center justify-between gap-3 font-mono">
-                            <span>
-                              {item.total_bytes > 0
-                                  ? `${formatBytes(item.downloaded_bytes)} / ${formatBytes(item.total_bytes)} (${Math.min(100, Math.round((item.downloaded_bytes / item.total_bytes) * 100))}%)`
-                                  : item.downloaded_bytes > 0
-                                      ? `${formatBytes(item.downloaded_bytes)} downloaded`
-                                      : "Byte total unavailable"}
-                            </span>
-                            {item.speed <= 0 && <span>{queueInfo.current_speed > 0 ? `${queueInfo.current_speed.toFixed(2)} MB/s` : "—"}</span>}
-                          </div>
+                          {formatTransferProgress(item.downloaded_bytes, item.total_bytes) && <div className="font-mono">{formatTransferProgress(item.downloaded_bytes, item.total_bytes)}</div>}
                           {item.warning && <div className="rounded bg-yellow-500/10 px-2 py-1 text-yellow-700 dark:text-yellow-400">{item.warning}</div>}
                         </div>)}
 
                       {item.status === "completed" && (<div className="mt-1.5 space-y-1 text-xs text-muted-foreground">
-                          <div className="flex items-center gap-3">
-                            <span className="font-mono">{item.progress.toFixed(2)} MB</span>
-                            {item.timings && formatPipelineTimings(item.timings) && <span className="truncate font-mono">{formatPipelineTimings(item.timings)}</span>}
-                          </div>
+                          {formatTransferProgress(item.downloaded_bytes, item.total_bytes) && <div className="font-mono">{formatTransferProgress(item.downloaded_bytes, item.total_bytes)}</div>}
+                          {item.timings && formatPipelineTimings(item.timings) && <div className="truncate font-mono">{formatPipelineTimings(item.timings)}</div>}
                           {item.warning && <div className="rounded bg-yellow-500/10 px-2 py-1 text-yellow-700 dark:text-yellow-400">{item.warning}</div>}
                         </div>)}
 

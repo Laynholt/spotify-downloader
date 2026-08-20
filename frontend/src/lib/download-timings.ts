@@ -36,6 +36,37 @@ export function formatAggregateProgress(activeCount: number, settledCount: numbe
     return total > 0 ? `${active} active · ${settled}/${total} settled` : `${active} active · ${settled} settled`;
 }
 
+function formatByteSize(bytes: number): string {
+    const normalized = Math.max(0, Number.isFinite(bytes) ? bytes : 0);
+    if (normalized < 1024) {
+        return `${normalized.toFixed(0)} B`;
+    }
+    if (normalized < 1024 * 1024) {
+        return `${(normalized / 1024).toFixed(2)} KB`;
+    }
+    return `${(normalized / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+export function formatTransferProgress(downloadedBytes: number, totalBytes: number): string {
+    if (!Number.isFinite(totalBytes) || totalBytes <= 0) {
+        return "";
+    }
+    const downloaded = Math.max(0, Number.isFinite(downloadedBytes) ? downloadedBytes : 0);
+    const percentage = Math.min(100, Math.max(0, Math.round((downloaded / totalBytes) * 100)));
+    return `${formatByteSize(downloaded)} / ${formatByteSize(totalBytes)} (${percentage}%)`;
+}
+
+export function formatCancelledSummary(cancelledCount: number): string {
+    if (!Number.isFinite(cancelledCount) || cancelledCount <= 0) {
+        return "";
+    }
+    const count = Math.trunc(cancelledCount);
+    if (count <= 0) {
+        return "";
+    }
+    return `${count} track${count === 1 ? "" : "s"} cancelled`;
+}
+
 const PHASE_LABELS: Record<string, string> = {
     queued: "Queued",
     preparing: "Preparing",

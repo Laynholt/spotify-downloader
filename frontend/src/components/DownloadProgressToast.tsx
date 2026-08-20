@@ -1,5 +1,5 @@
 import { useDownloadProgress } from "@/hooks/useDownloadProgress";
-import { formatAggregateProgress, phaseLabel } from "@/lib/download-timings";
+import { formatAggregateProgress, formatTransferProgress, phaseLabel } from "@/lib/download-timings";
 import { Download, ChevronRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 interface DownloadProgressToastProps {
@@ -15,11 +15,7 @@ export function DownloadProgressToast({ onClick }: DownloadProgressToastProps) {
     const settled = progress.settled_count;
     const aggregate = formatAggregateProgress(progress.active_count, settled, progress.total_count);
     const primaryItem = activeItems.find((item) => item.status === "downloading") || activeItems[0];
-    const bytes = primaryItem.total_bytes > 0
-        ? `${(primaryItem.downloaded_bytes / (1024 * 1024)).toFixed(2)} / ${(primaryItem.total_bytes / (1024 * 1024)).toFixed(2)} MB`
-        : primaryItem.downloaded_bytes > 0
-            ? `${(primaryItem.downloaded_bytes / (1024 * 1024)).toFixed(2)} MB`
-            : "Preparing";
+    const bytes = formatTransferProgress(primaryItem.downloaded_bytes, primaryItem.total_bytes) || "Preparing";
     return (<div className="fixed bottom-4 left-[calc(56px+1rem)] z-50 animate-in slide-in-from-bottom-5 data-[state=closed]:animate-out data-[state=closed]:slide-out-to-bottom-5">
       <Button variant="outline" className="bg-background border rounded-lg shadow-lg p-3 h-auto hover:bg-muted/50 transition-colors cursor-pointer" onClick={onClick}>
         <div className="flex items-center gap-3">
@@ -31,7 +27,7 @@ export function DownloadProgressToast({ onClick }: DownloadProgressToastProps) {
             </p>
             <p className="text-xs text-muted-foreground font-mono tabular-nums">
               {bytes}
-              {(primaryItem.speed > 0 || progress.speed_mbps > 0) && ` · ${(primaryItem.speed || progress.speed_mbps).toFixed(2)} MB/s`}
+              {primaryItem.speed > 0 && ` · ${primaryItem.speed.toFixed(2)} MB/s`}
             </p>
             {primaryItem.warning && <p className="max-w-[220px] truncate text-xs text-yellow-600 dark:text-yellow-400">{primaryItem.warning}</p>}
           </div>
