@@ -13,9 +13,12 @@ export interface PoolOptions<T, R> {
 
 export async function runBoundedPool<T, R>(options: PoolOptions<T, R>): Promise<PoolResult<R>[]> {
     const { items, concurrency, shouldStop, worker, onSettled } = options;
+    if (!Number.isFinite(concurrency) || !Number.isInteger(concurrency) || concurrency <= 0) {
+        throw new RangeError("concurrency must be a positive integer");
+    }
     const results: Array<PoolResult<R> | undefined> = new Array(items.length);
     let nextIndex = 0;
-    const workerCount = Math.min(Math.max(0, Math.floor(concurrency)), items.length);
+    const workerCount = Math.min(concurrency, items.length);
 
     const runWorker = async (): Promise<void> => {
         while (nextIndex < items.length) {

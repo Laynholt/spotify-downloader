@@ -2,7 +2,6 @@ import { FetchSessionTokenWithParams } from "../../wailsjs/go/main/App";
 import { getSettings, isLikelySessionToken, MIN_TOKEN_TIMEOUT } from "./settings";
 import { logger } from "./logger";
 let tokenFetchPromise: Promise<string> | null = null;
-let lastFetchTime = 0;
 let cachedSessionToken = "";
 let cachedSessionTokenExpiry = 0;
 export class ChromeNotInstalledError extends Error {
@@ -21,14 +20,6 @@ export async function ensureValidToken(forceRefresh: boolean = false): Promise<s
     if (tokenFetchPromise) {
         return tokenFetchPromise;
     }
-    const now = Date.now();
-    if (now - lastFetchTime < 2000) {
-        await new Promise(resolve => setTimeout(resolve, 2000 - (now - lastFetchTime)));
-    }
-    if (tokenFetchPromise) {
-        return tokenFetchPromise;
-    }
-    lastFetchTime = Date.now();
     const fetchPromise = (async () => {
         try {
             const timeout = Math.max(settings.tokenTimeout || MIN_TOKEN_TIMEOUT, MIN_TOKEN_TIMEOUT);
