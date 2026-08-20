@@ -72,6 +72,17 @@ The executable is written to:
 build/bin/SpotiDownloader.exe
 ```
 
+### Portable runtime files
+
+SpotiDownloader stores downloaded helpers, metadata cache, and working files in
+`SpotiDownloader.runtime` beside the application executable. Keep the executable
+in a writable directory. Running it from a protected directory such as
+`Program Files` produces a startup error instead of writing hidden fallback
+files into the user profile.
+
+`yt-dlp.exe` is checked for a newer official release at most once every 24 hours.
+Settings, history, and downloaded music keep their existing locations.
+
 ## Test
 
 Run backend tests:
