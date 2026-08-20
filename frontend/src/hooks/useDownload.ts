@@ -11,6 +11,7 @@ import { addBatchResult, createEmptyBatchSummary, type BatchDownloadSummary, typ
 import type { DownloadResponse, SuspiciousRedownloadRequest, SuspiciousRedownloadResult, TrackMetadata, TrackMetadataUpdateRequest, TrackMetadataUpdateResult } from "@/types/api";
 import { buildBatchDownloadWorkItems, isUnauthorizedDownloadError, reduceBatchFilePaths, type BatchDownloadWorkerResult, type BatchDownloadWorkItem } from "@/lib/batch-download";
 import { runBoundedPool, type PoolResult } from "@/lib/download-pool";
+import { formatCacheOutcomes, formatPipelineTimings } from "@/lib/download-timings";
 interface CheckFileExistenceRequest {
     spotify_id: string;
     track_name: string;
@@ -321,6 +322,13 @@ function logExistencePrecheck(context: string, outputDir: string, rootDir: strin
         logger.debug(`${context}: ${existing.length - 5} more existing matches omitted`);
     }
 }
+
+function logDownloadResponseTiming(track: TrackMetadata, displayArtist: string, response: DownloadResponse, includeGenre: boolean) {
+    const timing = formatPipelineTimings(response.timings);
+    const warnings = response.warnings?.filter(Boolean).join("; ") || "none";
+    const cacheOutcomes = formatCacheOutcomes(response.cache_outcomes, includeGenre);
+    logger.info(`track timing: ${track.name || "Unknown track"} - ${displayArtist || "Unknown artist"}; ${timing || "timings unavailable"}; warnings: ${warnings}; cache_outcomes: ${cacheOutcomes}`);
+}
 function requireSessionToken(sessionToken: string): string {
     if (!isLikelySessionToken(sessionToken)) {
         throw new Error("Session token is missing or invalid");
@@ -537,6 +545,7 @@ export function useDownload() {
         setDownloadingTrack(id);
         try {
             const response = await downloadWithSpotiDownloader(track, settings, playlistName, position, 0, isAlbum);
+            logDownloadResponseTiming(track, displayArtist, response, settings.embedGenre);
             if (response.success) {
                 if (response.already_exists) {
                     logger.info(`skipped: ${track.name} - ${displayArtist} (already exists)`);
@@ -586,6 +595,7 @@ export function useDownload() {
         }
     };
     const handleDownloadSelected = async (selectedTracks: string[], allTracks: TrackMetadata[], playlistName?: string, isAlbum?: boolean) => {
+        const batchStartedAt = performance.now();
         if (selectedTracks.length === 0) {
             toast.error("No tracks selected");
             return;
@@ -653,6 +663,8 @@ export function useDownload() {
         let errorCount = 0;
         let skippedCount = 0;
         let metadataUpdatedCount = 0;
+        let cancelledCount = 0;
+        const peakActive = 1;
         const total = selectedTracks.length;
         for (const { track, pathInfo } of selectedTrackPathInfo) {
             const trackID = track.spotify_id || "";
@@ -729,6 +741,11 @@ export function useDownload() {
         for (let i = 0; i < tracksToDownload.length; i++) {
             if (shouldStopDownloadRef.current) {
                 toast.info(`Download stopped. ${successCount} tracks downloaded, ${tracksToDownload.length - i} remaining.`);
+                for (let remaining = i; remaining < tracksToDownload.length; remaining++) {
+                    const pendingTrack = tracksToDownload[remaining];
+                    cancelledCount++;
+                    summary = addBatchResult(summary, batchResult(pendingTrack, "cancelled", { reason: "Download cancelled" }));
+                }
                 break;
             }
             const track = tracksToDownload[i];
@@ -801,6 +818,7 @@ export function useDownload() {
                         embed_genre: settings.embedGenre,
                     });
                 }
+                logDownloadResponseTiming(track, displayArtist, response, settings.embedGenre);
                 if (response.success) {
                     if (response.already_exists) {
                         skippedCount++;
@@ -834,7 +852,12 @@ export function useDownload() {
                 }
                 else {
                     errorCount++;
-                    summary = addBatchResult(summary, batchResult(track, "failed", { error: response.error || "Download failed" }));
+                    summary = addBatchResult(summary, batchResult(track, "failed", {
+                        error: response.error || "Download failed",
+                        warnings: response.warnings,
+                        cacheOutcomes: response.cache_outcomes,
+                        timings: response.timings,
+                    }));
                     logger.error(`failed: ${track.name} - ${displayArtist}`);
                     queueFailedRedownload(track, settings, pathInfo);
                     setFailedTracks((prev) => new Set(prev).add(id));
@@ -847,7 +870,7 @@ export function useDownload() {
                 queueFailedRedownload(track, settings, pathInfo);
                 setFailedTracks((prev) => new Set(prev).add(id));
             }
-            const completedCount = skippedCount + successCount + errorCount + metadataUpdatedCount;
+            const completedCount = skippedCount + successCount + errorCount + metadataUpdatedCount + cancelledCount;
             setDownloadProgress(Math.min(100, Math.round((completedCount / total) * 100)));
         }
         setDownloadingTrack(null);
@@ -871,7 +894,10 @@ export function useDownload() {
                 }
             }
         }
-        logger.info(`batch complete: ${successCount} downloaded, ${skippedCount} skipped, ${metadataUpdatedCount} metadata updated, ${errorCount} failed`);
+        const elapsedMs = Math.max(0, performance.now() - batchStartedAt);
+        summary = { ...summary, elapsedMs, peakActive };
+        logger.info(`batch complete: ${successCount} downloaded, ${skippedCount} skipped, ${metadataUpdatedCount} metadata updated, ${errorCount} failed, ${cancelledCount} cancelled`);
+        logger.info(`batch timing: total ${(elapsedMs / 1000).toFixed(2)}s, peak ${peakActive} active, ${successCount} downloaded, ${skippedCount} skipped, ${errorCount} failed, ${cancelledCount} cancelled`);
         openBatchSummary(summary);
     };
     const handleDownloadAll = async (tracks: TrackMetadata[], playlistName?: string, isAlbum?: boolean) => {
@@ -1111,6 +1137,7 @@ export function useDownload() {
             const { response } = poolResult.value;
             const id = item.track.spotify_id || "";
             const displayArtist = item.pathInfo.displayArtist;
+            logDownloadResponseTiming(item.track, displayArtist, response, settings.embedGenre);
             if (!response.success) {
                 if (shouldStopDownloadRef.current || isDownloadCancellation(response.error)) {
                     markCancelled(response.error);
@@ -1197,7 +1224,7 @@ export function useDownload() {
         }
         summary = { ...summary, elapsedMs, peakActive };
         logger.info(`batch complete: ${successCount} downloaded, ${skippedCount} skipped, ${metadataUpdatedCount} metadata updated, ${errorCount} failed, ${cancelledCount} cancelled`);
-        logger.info(`batch timing: total ${(elapsedMs / 1000).toFixed(2)}s, peak ${peakActive} active`);
+        logger.info(`batch timing: total ${(elapsedMs / 1000).toFixed(2)}s, peak ${peakActive} active, ${successCount} downloaded, ${skippedCount} skipped, ${errorCount} failed, ${cancelledCount} cancelled`);
         openBatchSummary(summary);
     };
     const handleUpdateAllMetadata = async (tracks: TrackMetadata[], playlistName?: string, isAlbum?: boolean) => {

@@ -5,6 +5,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, } from "@/components/
 import { Badge } from "@/components/ui/badge";
 import { GetDownloadQueue, ClearCompletedDownloads, ClearAllDownloads, ExportFailedDownloads, } from "../../wailsjs/go/main/App";
 import { toastWithSound as toast } from "@/lib/toast-with-sound";
+import { formatAggregateProgress, formatPipelineTimings, phaseLabel } from "@/lib/download-timings";
 import { backend } from "../../wailsjs/go/models";
 interface DownloadQueueProps {
     isOpen: boolean;
@@ -22,6 +23,8 @@ export function DownloadQueue({ isOpen, onClose }: DownloadQueueProps) {
         completed_count: 0,
         failed_count: 0,
         skipped_count: 0,
+        active_count: 0,
+        cancelled_count: 0,
     }));
     useEffect(() => {
         if (!isOpen)
@@ -89,6 +92,8 @@ export function DownloadQueue({ isOpen, onClose }: DownloadQueueProps) {
                 return <CheckCircle2 className="h-4 w-4 text-green-500"/>;
             case "failed":
                 return <XCircle className="h-4 w-4 text-red-500"/>;
+            case "cancelled":
+                return <XCircle className="h-4 w-4 text-orange-500"/>;
             case "skipped":
                 return <FileCheck className="h-4 w-4 text-yellow-500"/>;
             case "queued":
@@ -102,13 +107,25 @@ export function DownloadQueue({ isOpen, onClose }: DownloadQueueProps) {
             downloading: "default",
             completed: "outline",
             failed: "destructive",
+            cancelled: "destructive",
             skipped: "secondary",
             queued: "outline",
         };
         return (<Badge variant={variants[status] || "outline"} className="text-xs">
-        {status}
+        {phaseLabel(status)}
       </Badge>);
     };
+    const formatBytes = (bytes: number) => {
+        if (!Number.isFinite(bytes) || bytes <= 0) {
+            return "0 B";
+        }
+        if (bytes < 1024 * 1024) {
+            return `${(bytes / 1024).toFixed(0)} KB`;
+        }
+        return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+    };
+    const settledCount = queueInfo.completed_count + queueInfo.failed_count + queueInfo.skipped_count + (queueInfo.cancelled_count ?? 0);
+    const activeCount = queueInfo.active_count ?? queueInfo.queue.filter((item) => item.status === "downloading").length;
     const formatDuration = (startTimestamp: number) => {
         if (startTimestamp === 0)
             return "—";
@@ -145,7 +162,8 @@ export function DownloadQueue({ isOpen, onClose }: DownloadQueueProps) {
             <div className="flex items-center gap-2">
               {(queueInfo.completed_count > 0 ||
             queueInfo.failed_count > 0 ||
-            queueInfo.skipped_count > 0) && (<Button variant="ghost" size="sm" className="h-7 text-xs gap-1.5" onClick={handleClearHistory}>
+            queueInfo.skipped_count > 0 ||
+            (queueInfo.cancelled_count ?? 0) > 0) && (<Button variant="ghost" size="sm" className="h-7 text-xs gap-1.5" onClick={handleClearHistory}>
                   <Trash2 className="h-3 w-3"/>
                   Clear History
                 </Button>)}
@@ -160,6 +178,10 @@ export function DownloadQueue({ isOpen, onClose }: DownloadQueueProps) {
           </div>
 
           <div className="flex items-center gap-4 text-sm">
+            <div className="flex items-center gap-1.5">
+              <Download className="h-3.5 w-3.5 text-blue-500"/>
+              <span className="font-semibold">{formatAggregateProgress(activeCount, settledCount, queueInfo.queue.length)}</span>
+            </div>
             <div className={`flex items-center gap-1.5 cursor-pointer hover:opacity-80 transition-all select-none ${filterStatus === "queued" ? "bg-secondary px-2 py-0.5 rounded-md ring-1 ring-border" : ""}`} onClick={() => toggleFilter("queued")}>
               <Clock className="h-3.5 w-3.5 text-muted-foreground"/>
               <span className="text-muted-foreground">Queued:</span>
@@ -179,6 +201,11 @@ export function DownloadQueue({ isOpen, onClose }: DownloadQueueProps) {
               <XCircle className="h-3.5 w-3.5 text-red-500"/>
               <span className="text-muted-foreground">Failed:</span>
               <span className="font-semibold">{queueInfo.failed_count}</span>
+            </div>
+            <div className={`flex items-center gap-1.5 cursor-pointer hover:opacity-80 transition-all select-none ${filterStatus === "cancelled" ? "bg-orange-500/10 px-2 py-0.5 rounded-md ring-1 ring-orange-500/20" : ""}`} onClick={() => toggleFilter("cancelled")}>
+              <XCircle className="h-3.5 w-3.5 text-orange-500"/>
+              <span className="text-muted-foreground">Cancelled:</span>
+              <span className="font-semibold">{queueInfo.cancelled_count ?? 0}</span>
             </div>
           </div>
 
@@ -241,28 +268,31 @@ export function DownloadQueue({ isOpen, onClose }: DownloadQueueProps) {
                         {getStatusBadge(item.status)}
                       </div>
 
-                      {item.status === "downloading" && (<div className="flex items-center gap-3 mt-1.5 text-xs text-muted-foreground font-mono">
-                          <span>
-                            {item.progress > 0
-                    ? `${item.progress.toFixed(2)} MB`
-                    : queueInfo.is_downloading &&
-                        queueInfo.current_speed > 0
-                        ? "Downloading..."
-                        : "Starting..."}
-                          </span>
-                          <span>
-                            {item.speed > 0
-                    ? `${item.speed.toFixed(2)} MB/s`
-                    : queueInfo.current_speed > 0
-                        ? `${queueInfo.current_speed.toFixed(2)} MB/s`
-                        : "—"}
-                          </span>
+                      {(item.status === "downloading" || item.status === "queued") && (<div className="mt-1.5 space-y-1 text-xs text-muted-foreground">
+                          <div className="flex items-center justify-between gap-3">
+                            <span className="font-medium text-foreground">{phaseLabel(item.phase || item.status)}</span>
+                            {item.speed > 0 && <span className="font-mono">{item.speed.toFixed(2)} MB/s</span>}
+                          </div>
+                          {item.detail && <div className="truncate">{item.detail}</div>}
+                          <div className="flex items-center justify-between gap-3 font-mono">
+                            <span>
+                              {item.total_bytes > 0
+                                  ? `${formatBytes(item.downloaded_bytes)} / ${formatBytes(item.total_bytes)} (${Math.min(100, Math.round((item.downloaded_bytes / item.total_bytes) * 100))}%)`
+                                  : item.downloaded_bytes > 0
+                                      ? `${formatBytes(item.downloaded_bytes)} downloaded`
+                                      : "Byte total unavailable"}
+                            </span>
+                            {item.speed <= 0 && <span>{queueInfo.current_speed > 0 ? `${queueInfo.current_speed.toFixed(2)} MB/s` : "—"}</span>}
+                          </div>
+                          {item.warning && <div className="rounded bg-yellow-500/10 px-2 py-1 text-yellow-700 dark:text-yellow-400">{item.warning}</div>}
                         </div>)}
 
-                      {item.status === "completed" && (<div className="flex items-center gap-3 mt-1.5 text-xs text-muted-foreground">
-                          <span className="font-mono">
-                            {item.progress.toFixed(2)} MB
-                          </span>
+                      {item.status === "completed" && (<div className="mt-1.5 space-y-1 text-xs text-muted-foreground">
+                          <div className="flex items-center gap-3">
+                            <span className="font-mono">{item.progress.toFixed(2)} MB</span>
+                            {item.timings && formatPipelineTimings(item.timings) && <span className="truncate font-mono">{formatPipelineTimings(item.timings)}</span>}
+                          </div>
+                          {item.warning && <div className="rounded bg-yellow-500/10 px-2 py-1 text-yellow-700 dark:text-yellow-400">{item.warning}</div>}
                         </div>)}
 
                       {item.status === "skipped" && (<div className="mt-1.5 text-xs text-muted-foreground">
@@ -271,6 +301,10 @@ export function DownloadQueue({ isOpen, onClose }: DownloadQueueProps) {
 
                       {item.status === "failed" && item.error_message && (<div className="mt-1.5 text-xs text-red-500 bg-red-50 dark:bg-red-950/20 rounded px-2 py-1">
                           {item.error_message}
+                        </div>)}
+
+                      {item.status === "cancelled" && (<div className="mt-1.5 text-xs text-orange-600 bg-orange-50 dark:bg-orange-950/20 rounded px-2 py-1">
+                          {item.error_message || "Cancelled"}
                         </div>)}
 
                       {(item.status === "completed" ||

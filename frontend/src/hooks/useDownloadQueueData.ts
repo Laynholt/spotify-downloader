@@ -12,6 +12,8 @@ export function useDownloadQueueData() {
         completed_count: 0,
         failed_count: 0,
         skipped_count: 0,
+        active_count: 0,
+        cancelled_count: 0,
     }));
     useEffect(() => {
         const fetchQueue = async () => {
@@ -27,5 +29,10 @@ export function useDownloadQueueData() {
         const interval = setInterval(fetchQueue, 200);
         return () => clearInterval(interval);
     }, []);
-    return queueInfo;
+    const settledCount = queueInfo.completed_count + queueInfo.failed_count + queueInfo.skipped_count + (queueInfo.cancelled_count ?? 0);
+    return {
+        ...queueInfo,
+        settled_count: settledCount,
+        total_count: queueInfo.queue.length,
+    };
 }
