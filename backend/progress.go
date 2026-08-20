@@ -3,9 +3,12 @@ package backend
 import (
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 )
+
+const bytesPerMegabyte = int64(1024 * 1024)
 
 type DownloadStatus string
 
@@ -15,7 +18,33 @@ const (
 	StatusCompleted   DownloadStatus = "completed"
 	StatusFailed      DownloadStatus = "failed"
 	StatusSkipped     DownloadStatus = "skipped"
+	StatusCancelled   DownloadStatus = "cancelled"
 )
+
+type DownloadPhase string
+
+const (
+	PhaseQueued      DownloadPhase = "queued"
+	PhasePreparing   DownloadPhase = "preparing"
+	PhaseDownloading DownloadPhase = "downloading"
+	PhaseConverting  DownloadPhase = "converting"
+	PhaseFinalizing  DownloadPhase = "finalizing"
+	PhaseCompleted   DownloadPhase = "completed"
+	PhaseFailed      DownloadPhase = "failed"
+	PhaseCancelled   DownloadPhase = "cancelled"
+)
+
+type PipelineTimings struct {
+	PreparationMS   int64 `json:"preparation_ms"`
+	DownloadMS      int64 `json:"download_ms"`
+	ConversionMS    int64 `json:"conversion_ms"`
+	CoverMS         int64 `json:"cover_ms"`
+	MetadataMS      int64 `json:"metadata_ms"`
+	LyricsMS        int64 `json:"lyrics_ms"`
+	DurationProbeMS int64 `json:"duration_probe_ms"`
+	FinalizationMS  int64 `json:"finalization_ms"`
+	TotalMS         int64 `json:"total_ms"`
+}
 
 type DownloadItem struct {
 	ID           string         `json:"id"`
@@ -31,24 +60,29 @@ type DownloadItem struct {
 	EndTime      int64          `json:"end_time"`
 	ErrorMessage string         `json:"error_message"`
 	FilePath     string         `json:"file_path"`
+
+	Phase           DownloadPhase   `json:"phase"`
+	Detail          string          `json:"detail"`
+	DownloadedBytes int64           `json:"downloaded_bytes"`
+	TotalBytes      int64           `json:"total_bytes"`
+	Warning         string          `json:"warning"`
+	Timings         PipelineTimings `json:"timings"`
 }
 
 var (
-	currentProgress     float64
-	currentProgressLock sync.RWMutex
-	isDownloading       bool
-	downloadingLock     sync.RWMutex
-	currentSpeed        float64
-	speedLock           sync.RWMutex
+	downloadQueue     []DownloadItem
+	downloadQueueLock sync.RWMutex
 
-	downloadQueue       []DownloadItem
-	downloadQueueLock   sync.RWMutex
-	currentItemID       string
-	currentItemLock     sync.RWMutex
-	totalDownloaded     float64
-	totalDownloadedLock sync.RWMutex
-	sessionStartTime    int64
-	sessionStartLock    sync.RWMutex
+	sessionStartTime int64
+	sessionStartLock sync.RWMutex
+
+	// Installer progress is intentionally separate from queue-item progress. The
+	// FFmpeg installer still uses the legacy setters, while track writers update
+	// their item directly by ID.
+	installerProgress    float64
+	installerSpeed       float64
+	installerDownloading bool
+	installerStateLock   sync.RWMutex
 )
 
 type ProgressInfo struct {
@@ -67,77 +101,72 @@ type DownloadQueueInfo struct {
 	CompletedCount   int            `json:"completed_count"`
 	FailedCount      int            `json:"failed_count"`
 	SkippedCount     int            `json:"skipped_count"`
+	ActiveCount      int            `json:"active_count"`
+	CancelledCount   int            `json:"cancelled_count"`
 }
 
 func GetDownloadProgress() ProgressInfo {
-	downloadingLock.RLock()
-	downloading := isDownloading
-	downloadingLock.RUnlock()
-
-	currentProgressLock.RLock()
-	progress := currentProgress
-	currentProgressLock.RUnlock()
-
-	speedLock.RLock()
-	speed := currentSpeed
-	speedLock.RUnlock()
-
+	queue := GetDownloadQueue()
 	return ProgressInfo{
-		IsDownloading: downloading,
-		MBDownloaded:  progress,
-		SpeedMBps:     speed,
+		IsDownloading: queue.IsDownloading,
+		MBDownloaded:  queue.TotalDownloaded,
+		SpeedMBps:     queue.CurrentSpeed,
 	}
 }
 
+// SetDownloadSpeed and SetDownloadProgress remain for the FFmpeg installer
+// and other legacy callers that do not own a queue item. Track-scoped writers
+// never call these setters.
 func SetDownloadSpeed(mbps float64) {
-	speedLock.Lock()
-	currentSpeed = mbps
-	speedLock.Unlock()
+	installerStateLock.Lock()
+	installerSpeed = mbps
+	installerStateLock.Unlock()
 }
 
 func SetDownloadProgress(mbDownloaded float64) {
-	currentProgressLock.Lock()
-	currentProgress = mbDownloaded
-	currentProgressLock.Unlock()
+	installerStateLock.Lock()
+	installerProgress = mbDownloaded
+	installerStateLock.Unlock()
 }
 
 func SetDownloading(downloading bool) {
-	downloadingLock.Lock()
-	isDownloading = downloading
-	downloadingLock.Unlock()
-
+	installerStateLock.Lock()
+	installerDownloading = downloading
 	if !downloading {
-
-		SetDownloadProgress(0)
-		SetDownloadSpeed(0)
+		installerProgress = 0
+		installerSpeed = 0
 	}
+	installerStateLock.Unlock()
 }
 
 type ProgressWriter struct {
 	writer      io.Writer
 	total       int64
+	totalBytes  int64
 	lastPrinted int64
 	startTime   int64
 	lastTime    int64
 	lastBytes   int64
 	itemID      string
+	mu          sync.Mutex
 }
 
-func NewProgressWriter(writer io.Writer) *ProgressWriter {
+func NewProgressWriter(writer io.Writer, totalBytes ...int64) *ProgressWriter {
+	total := int64(0)
+	if len(totalBytes) > 0 {
+		total = totalBytes[0]
+	}
 	now := getCurrentTimeMillis()
 	return &ProgressWriter{
-		writer:      writer,
-		total:       0,
-		lastPrinted: 0,
-		startTime:   now,
-		lastTime:    now,
-		lastBytes:   0,
-		itemID:      "",
+		writer:     writer,
+		totalBytes: total,
+		startTime:  now,
+		lastTime:   now,
 	}
 }
 
-func NewProgressWriterWithID(writer io.Writer, itemID string) *ProgressWriter {
-	pw := NewProgressWriter(writer)
+func NewProgressWriterWithID(writer io.Writer, itemID string, totalBytes ...int64) *ProgressWriter {
+	pw := NewProgressWriter(writer, totalBytes...)
 	pw.itemID = itemID
 	return pw
 }
@@ -147,31 +176,39 @@ func getCurrentTimeMillis() int64 {
 }
 
 func (pw *ProgressWriter) Write(p []byte) (int, error) {
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
+
 	n, err := pw.writer.Write(p)
+	if n < 0 {
+		n = 0
+	}
 	pw.total += int64(n)
 
-	if pw.total-pw.lastPrinted >= 256*1024 {
-		mbDownloaded := float64(pw.total) / (1024 * 1024)
+	now := getCurrentTimeMillis()
+	elapsed := float64(now-pw.lastTime) / 1000
+	bytesDiff := pw.total - pw.lastBytes
+	speedMBps := float64(0)
+	if elapsed > 0 {
+		speedMBps = (float64(bytesDiff) / float64(bytesPerMegabyte)) / elapsed
+	}
 
-		now := getCurrentTimeMillis()
-		timeDiff := float64(now-pw.lastTime) / 1000.0
-		bytesDiff := float64(pw.total - pw.lastBytes)
-
-		var speedMBps float64
-		if timeDiff > 0 {
-			speedMBps = (bytesDiff / (1024 * 1024)) / timeDiff
+	if pw.itemID != "" {
+		UpdateItemTransfer(pw.itemID, pw.total, pw.totalBytes, speedMBps)
+	} else {
+		SetDownloadProgress(float64(pw.total) / float64(bytesPerMegabyte))
+		if speedMBps > 0 {
 			SetDownloadSpeed(speedMBps)
+		}
+	}
+
+	if pw.total-pw.lastPrinted >= 256*1024 {
+		mbDownloaded := float64(pw.total) / float64(bytesPerMegabyte)
+		if elapsed > 0 {
 			fmt.Printf("\rDownloaded: %.2f MB (%.2f MB/s)", mbDownloaded, speedMBps)
 		} else {
 			fmt.Printf("\rDownloaded: %.2f MB", mbDownloaded)
 		}
-
-		SetDownloadProgress(mbDownloaded)
-
-		if pw.itemID != "" {
-			UpdateItemProgress(pw.itemID, mbDownloaded, speedMBps)
-		}
-
 		pw.lastPrinted = pw.total
 		pw.lastTime = now
 		pw.lastBytes = pw.total
@@ -181,34 +218,36 @@ func (pw *ProgressWriter) Write(p []byte) (int, error) {
 }
 
 func (pw *ProgressWriter) GetTotal() int64 {
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
 	return pw.total
 }
 
+// GetCurrentItemID is retained for old bindings. It derives the first active
+// item from the queue snapshot and does not maintain process-global item state.
 func GetCurrentItemID() string {
-	currentItemLock.RLock()
-	defer currentItemLock.RUnlock()
-	return currentItemID
+	downloadQueueLock.RLock()
+	defer downloadQueueLock.RUnlock()
+	for _, item := range downloadQueue {
+		if item.Status == StatusDownloading {
+			return item.ID
+		}
+	}
+	return ""
 }
 
 func AddToQueue(id, trackName, artistName, albumName, spotifyID string) {
 	downloadQueueLock.Lock()
-	defer downloadQueueLock.Unlock()
-
-	item := DownloadItem{
+	downloadQueue = append(downloadQueue, DownloadItem{
 		ID:         id,
 		TrackName:  trackName,
 		ArtistName: artistName,
 		AlbumName:  albumName,
 		SpotifyID:  spotifyID,
 		Status:     StatusQueued,
-		Progress:   0,
-		TotalSize:  0,
-		Speed:      0,
-		StartTime:  0,
-		EndTime:    0,
-	}
-
-	downloadQueue = append(downloadQueue, item)
+		Phase:      PhaseQueued,
+	})
+	downloadQueueLock.Unlock()
 
 	sessionStartLock.Lock()
 	if sessionStartTime == 0 {
@@ -222,103 +261,205 @@ func StartDownloadItem(id string) {
 	defer downloadQueueLock.Unlock()
 
 	for i := range downloadQueue {
-		if downloadQueue[i].ID == id {
-			downloadQueue[i].Status = StatusDownloading
-			downloadQueue[i].StartTime = time.Now().Unix()
-			downloadQueue[i].Progress = 0
-			break
+		if downloadQueue[i].ID != id {
+			continue
 		}
+		if isTerminalStatus(downloadQueue[i].Status) {
+			return
+		}
+		downloadQueue[i].Status = StatusDownloading
+		downloadQueue[i].Phase = PhasePreparing
+		downloadQueue[i].Detail = ""
+		downloadQueue[i].StartTime = time.Now().Unix()
+		downloadQueue[i].Progress = 0
+		downloadQueue[i].DownloadedBytes = 0
+		downloadQueue[i].Speed = 0
+		return
 	}
-
-	currentItemLock.Lock()
-	currentItemID = id
-	currentItemLock.Unlock()
 }
 
+func UpdateItemTransfer(id string, downloaded, total int64, speedMBps float64) {
+	if downloaded < 0 {
+		downloaded = 0
+	}
+	if total < 0 {
+		total = 0
+	}
+
+	downloadQueueLock.Lock()
+	defer downloadQueueLock.Unlock()
+	for i := range downloadQueue {
+		if downloadQueue[i].ID != id {
+			continue
+		}
+		downloadQueue[i].DownloadedBytes = downloaded
+		downloadQueue[i].TotalBytes = total
+		downloadQueue[i].Progress = float64(downloaded) / float64(bytesPerMegabyte)
+		downloadQueue[i].TotalSize = float64(total) / float64(bytesPerMegabyte)
+		downloadQueue[i].Speed = speedMBps
+		return
+	}
+}
+
+// UpdateItemProgress is the pre-item-bytes compatibility API. New callers
+// should use UpdateItemTransfer so totals remain lossless.
 func UpdateItemProgress(id string, progress, speed float64) {
+	if progress < 0 {
+		progress = 0
+	}
+	downloaded := int64(progress * float64(bytesPerMegabyte))
 	downloadQueueLock.Lock()
 	defer downloadQueueLock.Unlock()
+	for i := range downloadQueue {
+		if downloadQueue[i].ID != id {
+			continue
+		}
+		downloadQueue[i].DownloadedBytes = downloaded
+		downloadQueue[i].Progress = progress
+		downloadQueue[i].Speed = speed
+		return
+	}
+}
 
+func UpdateItemPhase(id string, phase DownloadPhase, detail string) {
+	downloadQueueLock.Lock()
+	defer downloadQueueLock.Unlock()
 	for i := range downloadQueue {
 		if downloadQueue[i].ID == id {
-			downloadQueue[i].Progress = progress
-			downloadQueue[i].Speed = speed
-			break
+			downloadQueue[i].Phase = phase
+			downloadQueue[i].Detail = detail
+			return
 		}
 	}
 }
 
-func CompleteDownloadItem(id, filePath string, finalSize float64) {
+func AddItemWarning(id, warning string) {
+	warning = strings.TrimSpace(warning)
+	if warning == "" {
+		return
+	}
 	downloadQueueLock.Lock()
 	defer downloadQueueLock.Unlock()
-
 	for i := range downloadQueue {
-		if downloadQueue[i].ID == id {
-			downloadQueue[i].Status = StatusCompleted
-			downloadQueue[i].EndTime = time.Now().Unix()
-			downloadQueue[i].FilePath = filePath
-			downloadQueue[i].Progress = finalSize
-			downloadQueue[i].Speed = 0
-			break
+		if downloadQueue[i].ID != id {
+			continue
 		}
+		if downloadQueue[i].Warning == "" {
+			downloadQueue[i].Warning = warning
+		} else if !strings.Contains(downloadQueue[i].Warning, warning) {
+			downloadQueue[i].Warning += "; " + warning
+		}
+		return
+	}
+}
+
+func CompleteDownloadItem(id, filePath string, finalSize float64, timings ...PipelineTimings) {
+	var pipelineTimings PipelineTimings
+	if len(timings) > 0 {
+		pipelineTimings = timings[0]
 	}
 
-	totalDownloadedLock.Lock()
-	totalDownloaded += finalSize
-	totalDownloadedLock.Unlock()
+	downloadQueueLock.Lock()
+	defer downloadQueueLock.Unlock()
+	for i := range downloadQueue {
+		item := &downloadQueue[i]
+		if item.ID != id || isTerminalStatus(item.Status) {
+			continue
+		}
+		item.Status = StatusCompleted
+		item.Phase = PhaseCompleted
+		item.Detail = ""
+		item.EndTime = time.Now().Unix()
+		item.FilePath = filePath
+		item.Progress = finalSize
+		item.Speed = 0
+		item.Timings = pipelineTimings
+		if item.DownloadedBytes == 0 && finalSize > 0 {
+			item.DownloadedBytes = int64(finalSize * float64(bytesPerMegabyte))
+		}
+		if item.TotalBytes == 0 {
+			item.TotalBytes = item.DownloadedBytes
+		}
+		if item.TotalSize == 0 && item.TotalBytes > 0 {
+			item.TotalSize = float64(item.TotalBytes) / float64(bytesPerMegabyte)
+		}
+		return
+	}
 }
 
 func SkipDownloadItem(id, filePath string) {
 	downloadQueueLock.Lock()
 	defer downloadQueueLock.Unlock()
-
 	for i := range downloadQueue {
-		if downloadQueue[i].ID == id {
-			downloadQueue[i].Status = StatusSkipped
-			downloadQueue[i].EndTime = time.Now().Unix()
-			downloadQueue[i].FilePath = filePath
-			downloadQueue[i].Speed = 0
-			break
+		item := &downloadQueue[i]
+		if item.ID != id || isTerminalStatus(item.Status) {
+			continue
 		}
+		item.Status = StatusSkipped
+		item.EndTime = time.Now().Unix()
+		item.FilePath = filePath
+		item.Speed = 0
+		item.Phase = PhaseCompleted
+		return
 	}
 }
 
 func FailDownloadItem(id, errorMsg string) {
 	downloadQueueLock.Lock()
 	defer downloadQueueLock.Unlock()
-
 	for i := range downloadQueue {
-		if downloadQueue[i].ID == id {
-			downloadQueue[i].Status = StatusFailed
-			downloadQueue[i].EndTime = time.Now().Unix()
-			downloadQueue[i].ErrorMessage = errorMsg
-			downloadQueue[i].Speed = 0
-			break
+		item := &downloadQueue[i]
+		if item.ID != id || item.Status == StatusCompleted || item.Status == StatusCancelled {
+			continue
 		}
+		item.Status = StatusFailed
+		item.Phase = PhaseFailed
+		item.EndTime = time.Now().Unix()
+		item.ErrorMessage = errorMsg
+		item.Speed = 0
+		return
+	}
+}
+
+func CancelDownloadItem(id string) {
+	downloadQueueLock.Lock()
+	defer downloadQueueLock.Unlock()
+	for i := range downloadQueue {
+		item := &downloadQueue[i]
+		if item.ID != id || isTerminalStatus(item.Status) {
+			continue
+		}
+		item.Status = StatusCancelled
+		item.Phase = PhaseCancelled
+		item.EndTime = time.Now().Unix()
+		if item.ErrorMessage == "" {
+			item.ErrorMessage = "Cancelled"
+		}
+		item.Speed = 0
+		return
 	}
 }
 
 func GetDownloadQueue() DownloadQueueInfo {
-	downloadingLock.RLock()
-	downloading := isDownloading
-	downloadingLock.RUnlock()
-
-	speedLock.RLock()
-	speed := currentSpeed
-	speedLock.RUnlock()
-
-	totalDownloadedLock.RLock()
-	total := totalDownloaded
-	totalDownloadedLock.RUnlock()
+	installerStateLock.RLock()
+	installer := struct {
+		downloading bool
+		progress    float64
+		speed       float64
+	}{installerDownloading, installerProgress, installerSpeed}
+	installerStateLock.RUnlock()
 
 	sessionStartLock.RLock()
 	sessionStart := sessionStartTime
 	sessionStartLock.RUnlock()
 
 	downloadQueueLock.RLock()
-	defer downloadQueueLock.RUnlock()
+	queueCopy := make([]DownloadItem, len(downloadQueue))
+	copy(queueCopy, downloadQueue)
 
-	var queued, completed, failed, skipped int
+	var queued, completed, failed, skipped, cancelled, active int
+	var speed float64
+	var downloadedBytes int64
 	for _, item := range downloadQueue {
 		switch item.Status {
 		case StatusQueued:
@@ -329,30 +470,45 @@ func GetDownloadQueue() DownloadQueueInfo {
 			failed++
 		case StatusSkipped:
 			skipped++
+		case StatusCancelled:
+			cancelled++
+		case StatusDownloading:
+			active++
+			speed += item.Speed
+		}
+		downloadedBytes += item.DownloadedBytes
+		if item.DownloadedBytes == 0 && item.Progress > 0 {
+			downloadedBytes += int64(item.Progress * float64(bytesPerMegabyte))
 		}
 	}
+	downloadQueueLock.RUnlock()
 
-	queueCopy := make([]DownloadItem, len(downloadQueue))
-	copy(queueCopy, downloadQueue)
+	totalDownloaded := float64(downloadedBytes) / float64(bytesPerMegabyte)
+	currentSpeed := speed
+	if len(queueCopy) == 0 {
+		totalDownloaded = installer.progress
+		currentSpeed = installer.speed
+	}
 
 	return DownloadQueueInfo{
-		IsDownloading:    downloading,
+		IsDownloading:    active > 0 || installer.downloading,
 		Queue:            queueCopy,
-		CurrentSpeed:     speed,
-		TotalDownloaded:  total,
+		CurrentSpeed:     currentSpeed,
+		TotalDownloaded:  totalDownloaded,
 		SessionStartTime: sessionStart,
 		QueuedCount:      queued,
 		CompletedCount:   completed,
 		FailedCount:      failed,
 		SkippedCount:     skipped,
+		ActiveCount:      active,
+		CancelledCount:   cancelled,
 	}
 }
 
 func ClearDownloadQueue() {
 	downloadQueueLock.Lock()
 	defer downloadQueueLock.Unlock()
-
-	newQueue := make([]DownloadItem, 0)
+	newQueue := make([]DownloadItem, 0, len(downloadQueue))
 	for _, item := range downloadQueue {
 		if item.Status == StatusQueued || item.Status == StatusDownloading {
 			newQueue = append(newQueue, item)
@@ -363,32 +519,27 @@ func ClearDownloadQueue() {
 
 func ClearAllDownloads() {
 	downloadQueueLock.Lock()
-	downloadQueue = []DownloadItem{}
+	downloadQueue = nil
 	downloadQueueLock.Unlock()
-
-	totalDownloadedLock.Lock()
-	totalDownloaded = 0
-	totalDownloadedLock.Unlock()
 
 	sessionStartLock.Lock()
 	sessionStartTime = 0
 	sessionStartLock.Unlock()
 
-	currentItemLock.Lock()
-	currentItemID = ""
-	currentItemLock.Unlock()
-
-	SetDownloadProgress(0)
-	SetDownloadSpeed(0)
+	installerStateLock.Lock()
+	installerProgress = 0
+	installerSpeed = 0
+	installerDownloading = false
+	installerStateLock.Unlock()
 }
 
 func CancelAllQueuedItems() {
 	downloadQueueLock.Lock()
 	defer downloadQueueLock.Unlock()
-
 	for i := range downloadQueue {
 		if downloadQueue[i].Status == StatusQueued {
-			downloadQueue[i].Status = StatusSkipped
+			downloadQueue[i].Status = StatusCancelled
+			downloadQueue[i].Phase = PhaseCancelled
 			downloadQueue[i].EndTime = time.Now().Unix()
 			downloadQueue[i].ErrorMessage = "Cancelled"
 		}
@@ -405,14 +556,20 @@ func ResetSessionIfComplete() {
 		}
 	}
 	downloadQueueLock.RUnlock()
+	if hasActiveOrQueued {
+		return
+	}
 
-	if !hasActiveOrQueued {
-		sessionStartLock.Lock()
-		sessionStartTime = 0
-		sessionStartLock.Unlock()
+	sessionStartLock.Lock()
+	sessionStartTime = 0
+	sessionStartLock.Unlock()
+}
 
-		totalDownloadedLock.Lock()
-		totalDownloaded = 0
-		totalDownloadedLock.Unlock()
+func isTerminalStatus(status DownloadStatus) bool {
+	switch status {
+	case StatusCompleted, StatusFailed, StatusSkipped, StatusCancelled:
+		return true
+	default:
+		return false
 	}
 }
