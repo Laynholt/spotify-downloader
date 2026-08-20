@@ -17,6 +17,17 @@ type testClock struct {
 	now time.Time
 }
 
+type doneSignalContext struct {
+	context.Context
+	once    sync.Once
+	entered chan struct{}
+}
+
+func (c *doneSignalContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.entered) })
+	return c.Context.Done()
+}
+
 func newTestClock() *testClock {
 	return &testClock{now: time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)}
 }
@@ -131,6 +142,46 @@ func TestCachedLookupSingleflight(t *testing.T) {
 	}
 }
 
+func TestCachedLookupSingleflightAttributionFollowsRegisteredLoader(t *testing.T) {
+	// Production break caught: miss/shared attribution must follow the loader
+	// that singleflight actually registered, not a separate bookkeeping race.
+	cache := openTestCache(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	loader := func(context.Context) (string, error) {
+		close(started)
+		<-release
+		return "USRC17607839", nil
+	}
+	type lookupResult struct {
+		value   string
+		outcome CacheOutcome
+		err     error
+	}
+	ownerResult := make(chan lookupResult, 1)
+	go func() {
+		value, outcome, err := CachedLookup(context.Background(), cache, "registered-loader", time.Hour, func(v string) bool { return v != "" }, loader)
+		ownerResult <- lookupResult{value, outcome, err}
+	}()
+	<-started
+	waiterContext := &doneSignalContext{Context: context.Background(), entered: make(chan struct{})}
+	waiterResult := make(chan lookupResult, 1)
+	go func() {
+		value, outcome, err := CachedLookup(waiterContext, cache, "registered-loader", time.Hour, func(v string) bool { return v != "" }, loader)
+		waiterResult <- lookupResult{value, outcome, err}
+	}()
+	<-waiterContext.entered
+	close(release)
+	owner := <-ownerResult
+	waiter := <-waiterResult
+	if owner.err != nil || owner.value != "USRC17607839" || owner.outcome != CacheMiss {
+		t.Fatalf("owner = value %q outcome %q err %v", owner.value, owner.outcome, owner.err)
+	}
+	if waiter.err != nil || waiter.value != "USRC17607839" || waiter.outcome != CacheShared {
+		t.Fatalf("waiter = value %q outcome %q err %v", waiter.value, waiter.outcome, waiter.err)
+	}
+}
+
 func TestCachedLookupWaiterHonorsCancellation(t *testing.T) {
 	cache := openTestCache(t)
 	started := make(chan struct{})
@@ -170,6 +221,40 @@ func TestCachedLookupWaiterHonorsCancellation(t *testing.T) {
 	if err := <-firstDone; err != nil {
 		t.Fatalf("loader caller error = %v", err)
 	}
+}
+
+func TestCachedLookupOwnerCancellationReportsMiss(t *testing.T) {
+	// Production break caught: a caller that owns the singleflight load is
+	// reported as shared when its own context is cancelled.
+	cache := openTestCache(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan struct {
+		value   string
+		outcome CacheOutcome
+		err     error
+	}, 1)
+	go func() {
+		value, outcome, err := CachedLookup(ctx, cache, "owner-cancel", time.Hour, func(v string) bool { return v != "" }, func(context.Context) (string, error) {
+			close(started)
+			<-release
+			return "USRC17607839", nil
+		})
+		result <- struct {
+			value   string
+			outcome CacheOutcome
+			err     error
+		}{value, outcome, err}
+	}()
+	<-started
+	cancel()
+	got := <-result
+	if !errors.Is(got.err, context.Canceled) || got.value != "" || got.outcome != CacheMiss {
+		t.Fatalf("cancelled owner = value %q outcome %q err %v", got.value, got.outcome, got.err)
+	}
+	close(release)
 }
 
 func TestCachedLookupDoesNotStoreEmptyValuesOrErrors(t *testing.T) {
