@@ -22,6 +22,7 @@ export interface UnauthorizedRetryOptions<T> {
     execute: (token: string) => Promise<T>;
     refreshToken: () => Promise<string>;
     isUnauthorizedResult: (result: T) => boolean;
+    shouldStop?: () => boolean;
 }
 
 function downloadErrorMessage(error: unknown): string {
@@ -42,19 +43,24 @@ export function isUnauthorizedDownloadError(error?: unknown): boolean {
 
 /** Retry one download after refreshing the token, whether Wails resolves or rejects the first unauthorized call. */
 export async function runWithUnauthorizedRetry<T>(options: UnauthorizedRetryOptions<T>): Promise<T> {
+    const retry = async (): Promise<T> => {
+        if (options.shouldStop?.()) throw new Error("Download cancelled");
+        const refreshedToken = await options.refreshToken();
+        if (options.shouldStop?.()) throw new Error("Download cancelled");
+        return options.execute(refreshedToken);
+    };
+
     let firstResult: T;
     try {
         firstResult = await options.execute(options.initialToken);
     }
     catch (error) {
         if (!isUnauthorizedDownloadError(error)) throw error;
-        const refreshedToken = await options.refreshToken();
-        return options.execute(refreshedToken);
+        return retry();
     }
 
     if (!options.isUnauthorizedResult(firstResult)) return firstResult;
-    const refreshedToken = await options.refreshToken();
-    return options.execute(refreshedToken);
+    return retry();
 }
 
 /** Build only the tracks that still need a download while retaining source indices. */

@@ -163,4 +163,26 @@ describe("batch download source ordering", () => {
         expect(tokens).toEqual(["stale-token", "fresh-token"]);
         expect(refreshes).toBe(1);
     });
+
+    it("does not start the retry when stop is requested during token refresh", async () => {
+        let attempts = 0;
+        let stopped = false;
+
+        await expect(runWithUnauthorizedRetry({
+            initialToken: "stale-token",
+            execute: async () => {
+                attempts++;
+                if (attempts === 1) throw new Error("401 unauthorized");
+                return { success: true };
+            },
+            refreshToken: async () => {
+                stopped = true;
+                return "fresh-token";
+            },
+            isUnauthorizedResult: () => false,
+            shouldStop: () => stopped,
+        })).rejects.toThrow("Download cancelled");
+
+        expect(attempts).toBe(1);
+    });
 });

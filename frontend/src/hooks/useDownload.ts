@@ -1096,6 +1096,7 @@ export function useDownload() {
                         return token;
                     },
                     isUnauthorizedResult: (result) => !result.success && isUnauthorizedDownloadError(result.error),
+                    shouldStop: () => shouldStopDownloadRef.current,
                 });
                 return { item, response };
             }
