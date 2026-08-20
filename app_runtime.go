@@ -170,7 +170,7 @@ func (a *App) Quit() {
 }
 
 func (a *App) GetConfigPath() (string, error) {
-	dir, err := backend.GetFFmpegDir()
+	dir, err := backend.GetUserDataDir()
 	if err != nil {
 		return "", err
 	}

@@ -22,6 +22,15 @@ func FetchSessionToken() (string, error) {
 
 var ErrChromeNotInstalled = fmt.Errorf("chrome_not_installed")
 
+func portableTokenHelperPath(paths RuntimePaths) (string, error) {
+	helperPath := filepath.Join(paths.BinDir, tokenHelperName())
+	info, err := os.Stat(helperPath)
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+		return "", fmt.Errorf("portable helper is missing: %s", helperPath)
+	}
+	return helperPath, nil
+}
+
 func FetchSessionTokenWithParams(timeout int, retry int) (string, error) {
 	if timeout < 15 {
 		timeout = 15
@@ -31,10 +40,9 @@ func FetchSessionTokenWithParams(timeout int, retry int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	exePath := filepath.Join(paths.BinDir, tokenHelperName())
-	info, statErr := os.Stat(exePath)
-	if statErr != nil || !info.Mode().IsRegular() || info.Size() == 0 {
-		return "", fmt.Errorf("portable helper is missing: %s", exePath)
+	exePath, err := portableTokenHelperPath(paths)
+	if err != nil {
+		return "", err
 	}
 
 	browserInstalled, browserPath, err := IsChromeInstalled()
