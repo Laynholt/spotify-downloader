@@ -197,6 +197,67 @@ func TestTrackPipelineLeavesTerminalQueueStateToCaller(t *testing.T) {
 	}
 }
 
+func TestTrackPipelineLeavesFailureAndCancellationToCaller(t *testing.T) {
+	t.Run("failure", func(t *testing.T) {
+		ClearAllDownloads()
+		t.Cleanup(ClearAllDownloads)
+		req, _ := testTrackPipelineRequest(t)
+		AddToQueue(req.ItemID, req.BaseMetadata.Title, req.BaseMetadata.Artist, req.BaseMetadata.Album, req.TrackID)
+		installPipelineDepsForTest(t, trackPipelineDeps{
+			resolveTarget: func(context.Context, *SpotiDownloader, TrackPipelineRequest) (string, string, error) {
+				return "source", ".mp3", nil
+			},
+			downloadAudio: func(context.Context, *SpotiDownloader, string, string, string, string) (string, error) {
+				return "", errors.New("audio failed")
+			},
+		})
+		if _, err := (&SpotiDownloader{}).RunTrackPipeline(context.Background(), req); err == nil {
+			t.Fatal("expected pipeline failure")
+		}
+		queue := GetDownloadQueue()
+		if queue.CompletedCount != 0 || queue.FailedCount != 0 || queue.CancelledCount != 0 || queue.SkippedCount != 0 {
+			t.Fatalf("failure terminal counts = completed:%d failed:%d cancelled:%d skipped:%d", queue.CompletedCount, queue.FailedCount, queue.CancelledCount, queue.SkippedCount)
+		}
+	})
+
+	t.Run("cancellation", func(t *testing.T) {
+		ClearAllDownloads()
+		t.Cleanup(ClearAllDownloads)
+		req, _ := testTrackPipelineRequest(t)
+		AddToQueue(req.ItemID, req.BaseMetadata.Title, req.BaseMetadata.Artist, req.BaseMetadata.Album, req.TrackID)
+		ctx, cancel := context.WithCancel(context.Background())
+		started := make(chan struct{})
+		installPipelineDepsForTest(t, trackPipelineDeps{
+			resolveTarget: func(context.Context, *SpotiDownloader, TrackPipelineRequest) (string, string, error) {
+				return "source", ".mp3", nil
+			},
+			downloadAudio: func(ctx context.Context, _ *SpotiDownloader, _ string, _ string, _ string, _ string) (string, error) {
+				close(started)
+				<-ctx.Done()
+				return "", ctx.Err()
+			},
+		})
+		resultCh := make(chan error, 1)
+		go func() {
+			_, err := (&SpotiDownloader{}).RunTrackPipeline(ctx, req)
+			resultCh <- err
+		}()
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("audio did not start")
+		}
+		cancel()
+		if err := <-resultCh; !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want cancellation", err)
+		}
+		queue := GetDownloadQueue()
+		if queue.CompletedCount != 0 || queue.FailedCount != 0 || queue.CancelledCount != 0 || queue.SkippedCount != 0 {
+			t.Fatalf("cancellation terminal counts = completed:%d failed:%d cancelled:%d skipped:%d", queue.CompletedCount, queue.FailedCount, queue.CancelledCount, queue.SkippedCount)
+		}
+	})
+}
+
 func TestTrackPipelineProbesDurationAndFinalizesOnce(t *testing.T) {
 	req, _ := testTrackPipelineRequest(t)
 	var probes atomic.Int32
@@ -481,7 +542,10 @@ func TestTrackPipelineCleansTrackTempOnFailureAndCancellation(t *testing.T) {
 }
 
 func TestTrackPipelineExistingOutputSkipsOptionalBranches(t *testing.T) {
+	ClearAllDownloads()
+	t.Cleanup(ClearAllDownloads)
 	req, _ := testTrackPipelineRequest(t)
+	AddToQueue(req.ItemID, req.BaseMetadata.Title, req.BaseMetadata.Artist, req.BaseMetadata.Album, req.TrackID)
 	if err := os.MkdirAll(req.OutputDir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -506,6 +570,10 @@ func TestTrackPipelineExistingOutputSkipsOptionalBranches(t *testing.T) {
 	}
 	if calls.Load() != 0 {
 		t.Fatalf("source resolution calls = %d, want 0", calls.Load())
+	}
+	queue := GetDownloadQueue()
+	if queue.CompletedCount != 0 || queue.FailedCount != 0 || queue.CancelledCount != 0 || queue.SkippedCount != 0 {
+		t.Fatalf("existing output terminal counts = completed:%d failed:%d cancelled:%d skipped:%d", queue.CompletedCount, queue.FailedCount, queue.CancelledCount, queue.SkippedCount)
 	}
 }
 
