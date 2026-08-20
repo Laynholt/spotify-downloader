@@ -10,15 +10,7 @@ import (
 )
 
 func (a *App) GetDownloadProgress() backend.ProgressInfo {
-	// Keep the Wails toast contract stable while deriving its values from the
-	// item-scoped queue aggregate. The backend still exposes the same mapping for
-	// non-Wails callers.
-	queue := backend.GetDownloadQueue()
-	return backend.ProgressInfo{
-		IsDownloading: queue.IsDownloading,
-		MBDownloaded:  queue.TotalDownloaded,
-		SpeedMBps:     queue.CurrentSpeed,
-	}
+	return backend.GetDownloadProgress()
 }
 
 func (a *App) GetDownloadQueue() backend.DownloadQueueInfo {

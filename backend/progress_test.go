@@ -172,3 +172,89 @@ func TestProgressWriterWithIDTracksOnlyItsItem(t *testing.T) {
 		t.Fatalf("writer B item = %#v", items["writer-b"])
 	}
 }
+
+func TestTerminalItemsIgnoreLateProgressPhaseAndFailure(t *testing.T) {
+	terminals := []struct {
+		name string
+		end  func(string)
+	}{
+		{name: "completed", end: func(id string) {
+			CompleteDownloadItem(id, "completed.mp3", 1.5, PipelineTimings{TotalMS: 17})
+		}},
+		{name: "failed", end: func(id string) {
+			FailDownloadItem(id, "initial failure")
+		}},
+		{name: "cancelled", end: func(id string) {
+			CancelDownloadItem(id)
+		}},
+		{name: "skipped", end: func(id string) {
+			SkipDownloadItem(id, "skipped.mp3")
+		}},
+	}
+
+	for _, terminal := range terminals {
+		t.Run(terminal.name, func(t *testing.T) {
+			resetProgressStateForTest(t)
+			defer resetProgressStateForTest(t)
+
+			id := "terminal-" + terminal.name
+			AddToQueue(id, terminal.name, "artist", "album", id)
+			StartDownloadItem(id)
+			UpdateItemTransfer(id, 100, 200, 4.5)
+			terminal.end(id)
+
+			before := queueItemForTest(t, id)
+			lateWriter := NewProgressWriterWithID(&bytes.Buffer{}, id, 1000)
+			if _, err := lateWriter.Write(bytes.Repeat([]byte{'x'}, 32)); err != nil {
+				t.Fatal(err)
+			}
+			UpdateItemTransfer(id, 900, 1000, 99)
+			UpdateItemProgress(id, 33, 88)
+			UpdateItemPhase(id, PhaseDownloading, "late phase")
+			AddItemWarning(id, "late warning")
+			FailDownloadItem(id, "late failure")
+
+			after := queueItemForTest(t, id)
+			if after != before {
+				t.Fatalf("terminal item changed after late writes:\n before=%#v\n after=%#v", before, after)
+			}
+		})
+	}
+}
+
+func TestLegacyProgressFallsBackToInstallerForTerminalQueue(t *testing.T) {
+	resetProgressStateForTest(t)
+	defer resetProgressStateForTest(t)
+
+	SetDownloadProgress(7.5)
+	SetDownloadSpeed(2.25)
+	SetDownloading(true)
+	AddToQueue("stale", "stale", "artist", "album", "stale")
+	StartDownloadItem("stale")
+	CompleteDownloadItem("stale", "stale.mp3", 1)
+
+	legacy := GetDownloadProgress()
+	if legacy.MBDownloaded != 7.5 || legacy.SpeedMBps != 2.25 || !legacy.IsDownloading {
+		t.Fatalf("legacy installer progress = %#v, want 7.5 MB at 2.25 MB/s while downloading", legacy)
+	}
+
+	AddToQueue("active", "active", "artist", "album", "active")
+	StartDownloadItem("active")
+	UpdateItemTransfer("active", 3*bytesPerMegabyte, 4*bytesPerMegabyte, 1.5)
+
+	queueDerived := GetDownloadProgress()
+	if queueDerived.MBDownloaded != 4 || queueDerived.SpeedMBps != 1.5 || !queueDerived.IsDownloading {
+		t.Fatalf("active queue aggregate = %#v, want 4 MB at 1.5 MB/s", queueDerived)
+	}
+}
+
+func queueItemForTest(t *testing.T, id string) DownloadItem {
+	t.Helper()
+	for _, item := range GetDownloadQueue().Queue {
+		if item.ID == id {
+			return item
+		}
+	}
+	t.Fatalf("queue item %q not found", id)
+	return DownloadItem{}
+}

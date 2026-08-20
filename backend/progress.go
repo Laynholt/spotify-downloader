@@ -107,6 +107,16 @@ type DownloadQueueInfo struct {
 
 func GetDownloadProgress() ProgressInfo {
 	queue := GetDownloadQueue()
+	if queue.ActiveCount == 0 && queue.QueuedCount == 0 {
+		installerStateLock.RLock()
+		installer := ProgressInfo{
+			IsDownloading: installerDownloading,
+			MBDownloaded:  installerProgress,
+			SpeedMBps:     installerSpeed,
+		}
+		installerStateLock.RUnlock()
+		return installer
+	}
 	return ProgressInfo{
 		IsDownloading: queue.IsDownloading,
 		MBDownloaded:  queue.TotalDownloaded,
@@ -292,6 +302,9 @@ func UpdateItemTransfer(id string, downloaded, total int64, speedMBps float64) {
 		if downloadQueue[i].ID != id {
 			continue
 		}
+		if isTerminalStatus(downloadQueue[i].Status) {
+			return
+		}
 		downloadQueue[i].DownloadedBytes = downloaded
 		downloadQueue[i].TotalBytes = total
 		downloadQueue[i].Progress = float64(downloaded) / float64(bytesPerMegabyte)
@@ -314,6 +327,9 @@ func UpdateItemProgress(id string, progress, speed float64) {
 		if downloadQueue[i].ID != id {
 			continue
 		}
+		if isTerminalStatus(downloadQueue[i].Status) {
+			return
+		}
 		downloadQueue[i].DownloadedBytes = downloaded
 		downloadQueue[i].Progress = progress
 		downloadQueue[i].Speed = speed
@@ -325,11 +341,12 @@ func UpdateItemPhase(id string, phase DownloadPhase, detail string) {
 	downloadQueueLock.Lock()
 	defer downloadQueueLock.Unlock()
 	for i := range downloadQueue {
-		if downloadQueue[i].ID == id {
-			downloadQueue[i].Phase = phase
-			downloadQueue[i].Detail = detail
-			return
+		if downloadQueue[i].ID != id || isTerminalStatus(downloadQueue[i].Status) {
+			continue
 		}
+		downloadQueue[i].Phase = phase
+		downloadQueue[i].Detail = detail
+		return
 	}
 }
 
@@ -341,7 +358,7 @@ func AddItemWarning(id, warning string) {
 	downloadQueueLock.Lock()
 	defer downloadQueueLock.Unlock()
 	for i := range downloadQueue {
-		if downloadQueue[i].ID != id {
+		if downloadQueue[i].ID != id || isTerminalStatus(downloadQueue[i].Status) {
 			continue
 		}
 		if downloadQueue[i].Warning == "" {
@@ -409,7 +426,7 @@ func FailDownloadItem(id, errorMsg string) {
 	defer downloadQueueLock.Unlock()
 	for i := range downloadQueue {
 		item := &downloadQueue[i]
-		if item.ID != id || item.Status == StatusCompleted || item.Status == StatusCancelled {
+		if item.ID != id || isTerminalStatus(item.Status) {
 			continue
 		}
 		item.Status = StatusFailed
@@ -485,10 +502,6 @@ func GetDownloadQueue() DownloadQueueInfo {
 
 	totalDownloaded := float64(downloadedBytes) / float64(bytesPerMegabyte)
 	currentSpeed := speed
-	if len(queueCopy) == 0 {
-		totalDownloaded = installer.progress
-		currentSpeed = installer.speed
-	}
 
 	return DownloadQueueInfo{
 		IsDownloading:    active > 0 || installer.downloading,
