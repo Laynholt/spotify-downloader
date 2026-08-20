@@ -464,7 +464,7 @@ func CachedLookup[T any](ctx context.Context, cache *MetadataCache, key string, 
 	}
 	if raw, ok := cache.lookupRaw(key, cache.now()); ok {
 		var value T
-		if err := json.Unmarshal(raw, &value); err == nil {
+		if err := json.Unmarshal(raw, &value); err == nil && (cacheable == nil || cacheable(value)) {
 			return value, CacheHit, nil
 		}
 		cache.mu.Lock()
@@ -481,9 +481,13 @@ func CachedLookup[T any](ctx context.Context, cache *MetadataCache, key string, 
 		// lookup and this singleflight invocation.
 		if raw, ok := cache.lookupRaw(key, cache.now()); ok {
 			var value T
-			if err := json.Unmarshal(raw, &value); err == nil {
+			if err := json.Unmarshal(raw, &value); err == nil && (cacheable == nil || cacheable(value)) {
 				return cacheFlightResult[T]{value: value}, nil
 			}
+			cache.mu.Lock()
+			delete(cache.entries, key)
+			cache.markDirtyLocked()
+			cache.mu.Unlock()
 		}
 		value, err := load(ctx)
 		if err != nil {

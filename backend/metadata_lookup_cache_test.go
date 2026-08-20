@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -364,5 +365,144 @@ func TestMetadataLookupCacheRespectsGenreMode(t *testing.T) {
 	}
 	if got := musicBrainzCalls.Load(); got != 1 {
 		t.Fatalf("MusicBrainz calls = %d, want 1", got)
+	}
+}
+
+func TestMetadataLookupCacheRefreshesLegacyISRCGenreSchema(t *testing.T) {
+	const trackID = "track-legacy"
+	var songLinkCalls atomic.Int32
+	var musicBrainzCalls atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "v1-alpha.1/links"):
+			songLinkCalls.Add(1)
+			_, _ = w.Write([]byte(`{"linksByPlatform":{"deezer":{"url":"https://www.deezer.com/track/123"}}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/track/123":
+			_, _ = w.Write([]byte(`{"id":123,"isrc":"ISRC-LEGACY","title":"Track"}`))
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/recording"):
+			musicBrainzCalls.Add(1)
+			_, _ = w.Write([]byte(`{"recordings":[{"id":"recording-legacy","title":"Track","tags":[{"count":10,"name":"electronic"},{"count":9,"name":"ambient"}]}]}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/handshake/"):
+			_, _ = w.Write([]byte(`{"success":true}`))
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/tracks/track-legacy"):
+			_, _ = w.Write([]byte(`{"artists":[{"id":"artist-legacy"}]}`))
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/artists/artist-legacy"):
+			_, _ = w.Write([]byte(`{"genres":["indie"]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	base, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverClient := server.Client()
+	next := serverClient.Transport
+	serverClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		clone := req.Clone(req.Context())
+		clone.URL.Scheme = base.Scheme
+		clone.URL.Host = base.Host
+		return next.RoundTrip(clone)
+	})
+
+	previousSongLinkFactory := metadataSongLinkClientFactory
+	previousChosicFactory := metadataChosicClientFactory
+	previousHTTPFactory := metadataHTTPClientFactory
+	previousMusicBrainzFactory := musicBrainzHTTPClientFactory
+	defer func() {
+		metadataSongLinkClientFactory = previousSongLinkFactory
+		metadataChosicClientFactory = previousChosicFactory
+		metadataHTTPClientFactory = previousHTTPFactory
+		musicBrainzHTTPClientFactory = previousMusicBrainzFactory
+	}()
+	metadataSongLinkClientFactory = func() *SongLinkClient {
+		return &SongLinkClient{client: serverClient, minCallDelay: 0, apiCallResetTime: time.Now()}
+	}
+	metadataChosicClientFactory = func() (*chosicClient, error) {
+		return &chosicClient{httpClient: serverClient}, nil
+	}
+	metadataHTTPClientFactory = func(timeout time.Duration) *http.Client {
+		clone := *serverClient
+		clone.Timeout = timeout
+		return &clone
+	}
+	musicBrainzHTTPClientFactory = metadataHTTPClientFactory
+
+	now := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	cachePath := filepath.Join(t.TempDir(), "metadata-cache.json")
+	type legacyISRCMetadata struct {
+		ISRC    string
+		Genre   string
+		Warning string
+	}
+	legacyCache, warnings := OpenMetadataCache(cachePath, CacheOptions{Now: func() time.Time { return now }, WriteDelay: 0})
+	if len(warnings) != 0 {
+		t.Fatalf("legacy cache open warnings = %v", warnings)
+	}
+	_, outcome, err := CachedLookup(context.Background(), legacyCache, isrcCacheKey(trackID), trackMetadataTTL,
+		func(value legacyISRCMetadata) bool {
+			return strings.TrimSpace(value.ISRC) != "" && strings.TrimSpace(value.Genre) != ""
+		},
+		func(context.Context) (legacyISRCMetadata, error) {
+			return legacyISRCMetadata{ISRC: "ISRC-LEGACY", Genre: "electronic"}, nil
+		})
+	if err != nil || outcome != CacheMiss {
+		t.Fatalf("legacy seed = outcome %q err %v", outcome, err)
+	}
+	if err := legacyCache.Close(); err != nil {
+		t.Fatalf("legacy cache close = %v", err)
+	}
+
+	cache, warnings := OpenMetadataCache(cachePath, CacheOptions{Now: func() time.Time { return now }, WriteDelay: 0})
+	if len(warnings) != 0 {
+		t.Fatalf("reopened cache warnings = %v", warnings)
+	}
+	lookup := func(useSingleGenre bool) taggingMetadataResult {
+		result, lookupWarnings := fetchTaggingMetadata(context.Background(), cache, TaggingMetadataRequest{
+			TrackID:        trackID,
+			TrackName:      "Track",
+			ArtistName:     "Artist",
+			AlbumName:      "Album",
+			UseSingleGenre: useSingleGenre,
+			EmbedGenre:     true,
+		})
+		if len(lookupWarnings) != 0 {
+			t.Fatalf("lookup warnings = %v", lookupWarnings)
+		}
+		return result
+	}
+
+	first := lookup(true)
+	if first.Genre != "electronic" {
+		t.Fatalf("legacy refresh lookup = %+v", first)
+	}
+	if got := songLinkCalls.Load(); got != 1 {
+		t.Fatalf("song.link calls after legacy refresh = %d, want 1", got)
+	}
+	if got := musicBrainzCalls.Load(); got != 1 {
+		t.Fatalf("MusicBrainz calls after legacy refresh = %d, want 1", got)
+	}
+	if err := cache.Close(); err != nil {
+		t.Fatalf("refreshed cache close = %v", err)
+	}
+
+	cache, warnings = OpenMetadataCache(cachePath, CacheOptions{Now: func() time.Time { return now }, WriteDelay: 0})
+	if len(warnings) != 0 {
+		t.Fatalf("refreshed cache reopen warnings = %v", warnings)
+	}
+	defer cache.Close()
+	second := lookup(false)
+	if second.Genre != "electronic, ambient" {
+		t.Fatalf("persisted raw genre lookup = %+v", second)
+	}
+	if got := songLinkCalls.Load(); got != 1 {
+		t.Fatalf("song.link calls after persisted hit = %d, want 1", got)
+	}
+	if got := musicBrainzCalls.Load(); got != 1 {
+		t.Fatalf("MusicBrainz calls after persisted hit = %d, want 1", got)
 	}
 }
