@@ -106,23 +106,33 @@ func TestCachedLookupSingleflight(t *testing.T) {
 	cache := openTestCache(t)
 	var calls atomic.Int32
 	outcomes := make(chan CacheOutcome, 12)
+	loaderStarted := make(chan struct{})
+	releaseLoader := make(chan struct{})
 	loader := func(context.Context) (string, error) {
 		calls.Add(1)
-		time.Sleep(25 * time.Millisecond)
+		close(loaderStarted)
+		<-releaseLoader
 		return "USRC17607839", nil
 	}
+	contexts := make([]*doneSignalContext, 12)
 	var wg sync.WaitGroup
-	for i := 0; i < 12; i++ {
+	for i := range contexts {
+		contexts[i] = &doneSignalContext{Context: context.Background(), entered: make(chan struct{})}
 		wg.Add(1)
-		go func() {
+		go func(index int) {
 			defer wg.Done()
-			value, outcome, err := CachedLookup(context.Background(), cache, "isrc:track", 7*24*time.Hour, func(v string) bool { return v != "" }, loader)
+			value, outcome, err := CachedLookup(contexts[index], cache, "isrc:track", 7*24*time.Hour, func(v string) bool { return v != "" }, loader)
 			outcomes <- outcome
 			if err != nil || value == "" {
 				t.Errorf("value=%q err=%v", value, err)
 			}
-		}()
+		}(i)
 	}
+	<-loaderStarted
+	for _, ctx := range contexts {
+		<-ctx.entered
+	}
+	close(releaseLoader)
 	wg.Wait()
 	if calls.Load() != 1 {
 		t.Fatalf("loader calls = %d", calls.Load())
@@ -198,20 +208,23 @@ func TestCachedLookupWaiterHonorsCancellation(t *testing.T) {
 	}()
 	<-started
 	ctx, cancel := context.WithCancel(context.Background())
+	waiterContext := &doneSignalContext{Context: ctx, entered: make(chan struct{})}
 	waiter := make(chan struct {
 		value   string
 		outcome CacheOutcome
 		err     error
 	}, 1)
 	go func() {
-		value, outcome, err := CachedLookup(ctx, cache, "isrc:track", time.Hour, func(v string) bool { return v != "" }, loader)
+		value, outcome, err := CachedLookup(waiterContext, cache, "isrc:track", time.Hour, func(v string) bool { return v != "" }, loader)
 		waiter <- struct {
 			value   string
 			outcome CacheOutcome
 			err     error
 		}{value, outcome, err}
 	}()
-	time.Sleep(time.Millisecond)
+	// The waiter context's Done method is evaluated only after it has joined
+	// the existing flight, so cancellation cannot race registration.
+	<-waiterContext.entered
 	cancel()
 	result := <-waiter
 	if !errors.Is(result.err, context.Canceled) || result.value != "" || result.outcome != CacheShared {
@@ -255,6 +268,45 @@ func TestCachedLookupOwnerCancellationReportsMiss(t *testing.T) {
 		t.Fatalf("cancelled owner = value %q outcome %q err %v", got.value, got.outcome, got.err)
 	}
 	close(release)
+}
+
+func TestCachedLookupOwnerCancellationBeforeLoaderStartsReportsMiss(t *testing.T) {
+	// Production break caught: a registered owner cancelled before the
+	// asynchronous singleflight closure starts must still be reported as a miss.
+	cache := openTestCache(t)
+	closureEntered := make(chan struct{})
+	releaseClosure := make(chan struct{})
+	loaderStarted := make(chan struct{})
+	cache.beforeFlight = func() {
+		close(closureEntered)
+		<-releaseClosure
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan struct {
+		value   string
+		outcome CacheOutcome
+		err     error
+	}, 1)
+	go func() {
+		value, outcome, err := CachedLookup(ctx, cache, "owner-cancel-before-start", time.Hour, func(v string) bool { return v != "" }, func(context.Context) (string, error) {
+			close(loaderStarted)
+			return "USRC17607839", nil
+		})
+		result <- struct {
+			value   string
+			outcome CacheOutcome
+			err     error
+		}{value, outcome, err}
+	}()
+	<-closureEntered
+	cancel()
+	got := <-result
+	if !errors.Is(got.err, context.Canceled) || got.value != "" || got.outcome != CacheMiss {
+		t.Fatalf("cancelled pre-start owner = value %q outcome %q err %v", got.value, got.outcome, got.err)
+	}
+	close(releaseClosure)
+	<-loaderStarted
 }
 
 func TestCachedLookupDoesNotStoreEmptyValuesOrErrors(t *testing.T) {

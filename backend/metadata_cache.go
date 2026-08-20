@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -61,7 +60,11 @@ type MetadataCache struct {
 	maxEntries int
 	now        func() time.Time
 
-	group singleflight.Group
+	group cacheFlightGroup
+
+	// beforeFlight is a deterministic test seam that runs before the
+	// asynchronous singleflight closure performs its lookup or load.
+	beforeFlight func()
 
 	replaceFile func(tempPath, targetPath string) error
 	onWarning   func(message string)
@@ -81,11 +84,44 @@ type MetadataCache struct {
 type cacheFlightResult[T any] struct {
 	value  T
 	loaded bool
-	owner  *cacheFlightCall
 }
 
-type cacheFlightCall struct {
-	started atomic.Bool
+type cacheFlight struct {
+	done   chan struct{}
+	result singleflight.Result
+}
+
+type cacheFlightGroup struct {
+	mu      sync.Mutex
+	group   singleflight.Group
+	flights map[string]*cacheFlight
+}
+
+func (g *cacheFlightGroup) doChan(key string, fn func() (any, error)) (*cacheFlight, bool) {
+	g.mu.Lock()
+	if g.flights == nil {
+		g.flights = make(map[string]*cacheFlight)
+	}
+	if flight, ok := g.flights[key]; ok {
+		g.mu.Unlock()
+		return flight, false
+	}
+	flight := &cacheFlight{done: make(chan struct{})}
+	g.flights[key] = flight
+	resultCh := g.group.DoChan(key, fn)
+	g.mu.Unlock()
+
+	go func() {
+		result := <-resultCh
+		g.mu.Lock()
+		flight.result = result
+		close(flight.done)
+		if g.flights[key] == flight {
+			delete(g.flights, key)
+		}
+		g.mu.Unlock()
+	}()
+	return flight, true
 }
 
 var metadataCacheRegistry struct {
@@ -437,20 +473,21 @@ func CachedLookup[T any](ctx context.Context, cache *MetadataCache, key string, 
 		cache.mu.Unlock()
 	}
 
-	flightCall := &cacheFlightCall{}
-	resultCh := cache.group.DoChan(key, func() (any, error) {
-		flightCall.started.Store(true)
+	flight, owner := cache.group.doChan(key, func() (any, error) {
+		if cache.beforeFlight != nil {
+			cache.beforeFlight()
+		}
 		// A previous flight may have populated the key between the initial
 		// lookup and this singleflight invocation.
 		if raw, ok := cache.lookupRaw(key, cache.now()); ok {
 			var value T
 			if err := json.Unmarshal(raw, &value); err == nil {
-				return cacheFlightResult[T]{value: value, owner: flightCall}, nil
+				return cacheFlightResult[T]{value: value}, nil
 			}
 		}
 		value, err := load(ctx)
 		if err != nil {
-			return cacheFlightResult[T]{value: value, loaded: true, owner: flightCall}, err
+			return cacheFlightResult[T]{value: value, loaded: true}, err
 		}
 		if cacheable != nil && cacheable(value) {
 			if encoded, marshalErr := json.Marshal(value); marshalErr == nil {
@@ -459,22 +496,27 @@ func CachedLookup[T any](ctx context.Context, cache *MetadataCache, key string, 
 				cache.warn(fmt.Sprintf("metadata cache value encode failed: %v", marshalErr))
 			}
 		}
-		return cacheFlightResult[T]{value: value, loaded: true, owner: flightCall}, nil
+		return cacheFlightResult[T]{value: value, loaded: true}, nil
 	})
 
 	select {
 	case <-ctx.Done():
-		if flightCall.started.Load() {
+		if owner {
 			return zero, CacheMiss, ctx.Err()
 		}
 		return zero, CacheShared, ctx.Err()
-	case result := <-resultCh:
+	case <-flight.done:
+		result := flight.result
 		flightResult, ok := result.Val.(cacheFlightResult[T])
 		if !ok {
-			return zero, CacheShared, errors.New("metadata cache singleflight result type mismatch")
+			outcome := CacheShared
+			if owner {
+				outcome = CacheMiss
+			}
+			return zero, outcome, errors.New("metadata cache singleflight result type mismatch")
 		}
 		outcome := CacheShared
-		if flightResult.owner == flightCall {
+		if owner {
 			outcome = CacheMiss
 		}
 		if !flightResult.loaded && result.Err == nil {
