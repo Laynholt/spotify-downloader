@@ -3,16 +3,12 @@
 package backend
 
 import (
-	_ "embed"
 	"os/exec"
 	"syscall"
 )
 
-//go:embed bin/get_token.exe
-var gettokenBinary []byte
-
-func getTokenBinary() ([]byte, string) {
-	return gettokenBinary, "get_token.exe"
+func tokenHelperName() string {
+	return "get_token.exe"
 }
 
 func newTokenCmd(exePath string, args ...string) *exec.Cmd {

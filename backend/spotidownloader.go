@@ -926,7 +926,7 @@ func (s *SpotiDownloader) downloadCoverImage(coverURL, outputDir string, embedMa
 
 	_ = outputDir
 
-	out, err := os.CreateTemp("", "spotidownloader-cover-*.jpg")
+	out, err := CreateRunTemp("spotidownloader-cover-*.jpg")
 	if err != nil {
 		return "", err
 	}

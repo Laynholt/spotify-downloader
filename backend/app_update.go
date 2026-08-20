@@ -310,7 +310,10 @@ func scheduleAppUpdateScript(downloadPath, targetPath string) (string, error) {
 }
 
 func scheduleWindowsUpdateScript(downloadPath, targetPath string, pid int) (string, error) {
-	scriptPath := filepath.Join(os.TempDir(), fmt.Sprintf("spotidownloader-update-%d.cmd", time.Now().UnixNano()))
+	scriptPath, err := CreateUpdateTempPath(fmt.Sprintf("spotidownloader-update-%d.cmd", time.Now().UnixNano()))
+	if err != nil {
+		return "", err
+	}
 	script := fmt.Sprintf(`@echo off
 setlocal
 set "PID=%d"
@@ -340,7 +343,10 @@ del /Q "%%~f0" >nul 2>nul
 }
 
 func scheduleUnixExecutableUpdateScript(downloadPath, targetPath string, pid int) (string, error) {
-	scriptPath := filepath.Join(os.TempDir(), fmt.Sprintf("spotidownloader-update-%d.sh", time.Now().UnixNano()))
+	scriptPath, err := CreateUpdateTempPath(fmt.Sprintf("spotidownloader-update-%d.sh", time.Now().UnixNano()))
+	if err != nil {
+		return "", err
+	}
 	script := fmt.Sprintf(`#!/bin/sh
 PID=%d
 SRC=%s
@@ -366,15 +372,27 @@ func scheduleMacOSUpdateScript(downloadPath, targetPath string, pid int) (string
 	if !strings.HasSuffix(targetPath, ".app") {
 		return "", fmt.Errorf("current executable is not inside a macOS app bundle")
 	}
-	scriptPath := filepath.Join(os.TempDir(), fmt.Sprintf("spotidownloader-update-%d.sh", time.Now().UnixNano()))
+	updateID := time.Now().UnixNano()
+	scriptPath, err := CreateUpdateTempPath(fmt.Sprintf("spotidownloader-update-%d.sh", updateID))
+	if err != nil {
+		return "", err
+	}
+	mountPath, err := CreateUpdateTempPath(fmt.Sprintf("spotidownloader-update-mount-%d", updateID))
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(mountPath, 0755); err != nil {
+		return "", err
+	}
 	script := fmt.Sprintf(`#!/bin/sh
 PID=%d
 DMG=%s
 APP=%s
+MOUNT=%s
 while kill -0 "$PID" 2>/dev/null; do
   sleep 1
 done
-MOUNT=$(mktemp -d)
+mkdir -p "$MOUNT"
 hdiutil attach "$DMG" -mountpoint "$MOUNT" -nobrowse -quiet || exit 1
 NEW_APP=$(find "$MOUNT" -maxdepth 1 -name "*.app" -type d | head -n 1)
 if [ -z "$NEW_APP" ]; then
@@ -384,10 +402,11 @@ fi
 rm -rf "$APP"
 ditto "$NEW_APP" "$APP"
 hdiutil detach "$MOUNT" -quiet
+rmdir "$MOUNT" 2>/dev/null || true
 open "$APP"
 rm -f "$DMG"
 rm -f "$0"
-`, pid, shellQuote(downloadPath), shellQuote(targetPath))
+`, pid, shellQuote(downloadPath), shellQuote(targetPath), shellQuote(mountPath))
 	if err := os.WriteFile(scriptPath, []byte(script), 0700); err != nil {
 		return "", err
 	}

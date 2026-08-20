@@ -16,7 +16,11 @@ import (
 	"time"
 )
 
-const ytDlpLatestReleaseURL = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
+const (
+	ytDlpLatestReleaseURL    = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
+	ytDlpUpdateCheckFilename = "yt-dlp.update-check"
+	ytDlpUpdateCheckTTL      = 24 * time.Hour
+)
 
 type GitHubReleaseAsset struct {
 	Name               string `json:"name"`
@@ -84,11 +88,15 @@ func SelectYtDlpAsset(goos, goarch string, assets []GitHubReleaseAsset) (GitHubR
 }
 
 func GetYtDlpDir() (string, error) {
-	return GetFFmpegDir()
+	paths, err := CurrentRuntimePaths()
+	if err != nil {
+		return "", err
+	}
+	return paths.BinDir, nil
 }
 
 func GetYtDlpPath() (string, error) {
-	dir, err := GetYtDlpDir()
+	paths, err := CurrentRuntimePaths()
 	if err != nil {
 		return "", err
 	}
@@ -97,7 +105,36 @@ func GetYtDlpPath() (string, error) {
 	if runtime.GOOS == "windows" {
 		name = "yt-dlp.exe"
 	}
-	return filepath.Join(dir, name), nil
+	return filepath.Join(paths.BinDir, name), nil
+}
+
+func getYtDlpUpdateCheckPath() (string, error) {
+	dir, err := GetYtDlpDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, ytDlpUpdateCheckFilename), nil
+}
+
+func shouldSkipYtDlpReleaseCheck(current YtDlpStatus, markerPath string, now time.Time) bool {
+	if !current.Installed {
+		return false
+	}
+	info, err := os.Stat(markerPath)
+	if err != nil || info.IsDir() {
+		return false
+	}
+	return now.Sub(info.ModTime()) < ytDlpUpdateCheckTTL
+}
+
+func recordYtDlpReleaseCheck(markerPath string, checkedAt time.Time) error {
+	if err := os.MkdirAll(filepath.Dir(markerPath), 0755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(markerPath, []byte(checkedAt.UTC().Format(time.RFC3339Nano)), 0600); err != nil {
+		return err
+	}
+	return os.Chtimes(markerPath, checkedAt, checkedAt)
 }
 
 func CheckYtDlpInstalled() (YtDlpStatus, error) {
@@ -130,6 +167,11 @@ func CheckYtDlpInstalled() (YtDlpStatus, error) {
 
 func EnsureYtDlpInstalledOrUpdated() (YtDlpStatus, error) {
 	current, _ := CheckYtDlpInstalled()
+	checkedAt := time.Now()
+	markerPath, markerErr := getYtDlpUpdateCheckPath()
+	if markerErr == nil && shouldSkipYtDlpReleaseCheck(current, markerPath, checkedAt) {
+		return current, nil
+	}
 	release, err := fetchLatestYtDlpRelease()
 	if err != nil {
 		if current.Installed {
@@ -138,6 +180,11 @@ func EnsureYtDlpInstalledOrUpdated() (YtDlpStatus, error) {
 		}
 		current.Error = err.Error()
 		return current, err
+	}
+	if markerErr == nil {
+		if err := recordYtDlpReleaseCheck(markerPath, checkedAt); err != nil {
+			current.Warning = fmt.Sprintf("failed to record yt-dlp update check: %v", err)
+		}
 	}
 
 	current.Latest = strings.TrimPrefix(release.TagName, "v")

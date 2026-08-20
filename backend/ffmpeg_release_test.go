@@ -1,6 +1,42 @@
 package backend
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
+
+// Production break caught: FFmpeg helper getters consult the host PATH or the
+// legacy user profile instead of returning portable runtime locations.
+func TestHelperPathsUsePortableFFmpegBin(t *testing.T) {
+	paths, err := ResolveRuntimePaths(filepath.Join(t.TempDir(), "SpotiDownloader.exe"), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	installRuntimePathsForTest(t, paths)
+
+	dir, err := GetFFmpegDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dir != paths.BinDir {
+		t.Fatalf("ffmpeg dir: %s", dir)
+	}
+	for name, getPath := range map[string]func() (string, error){
+		"ffmpeg":  GetFFmpegPath,
+		"ffprobe": GetFFprobePath,
+	} {
+		path, err := getPath()
+		if err != nil {
+			t.Fatalf("%s path: %v", name, err)
+		}
+		if filepath.Dir(path) != paths.BinDir {
+			t.Fatalf("%s path: %s", name, path)
+		}
+	}
+}
 
 func TestSelectFFmpegAssetForPlatform(t *testing.T) {
 	assets := []GitHubReleaseAsset{

@@ -80,6 +80,7 @@ $goTmpDir = Join-Path $cacheRoot "go-tmp"
 $helperVenvDir = Join-Path $cacheRoot "helper-venv"
 $helperVenvPython = Join-Path $helperVenvDir "Scripts\python.exe"
 $appExe = Join-Path $scriptRoot "build\bin\SpotiDownloader.exe"
+$runtimeBinDir = Join-Path $scriptRoot "build\bin\SpotiDownloader.runtime\bin"
 
 Push-Location $scriptRoot
 
@@ -167,6 +168,8 @@ try {
     Invoke-External "wails" $wailsArgs $scriptRoot
 
     if (Test-Path $appExe) {
+        New-Item -ItemType Directory -Force $runtimeBinDir | Out-Null
+        Copy-Item -LiteralPath $embeddedHelperExe -Destination (Join-Path $runtimeBinDir "get_token.exe") -Force
         Write-Host ""
         Write-Host "Build completed: $appExe" -ForegroundColor Green
     } else {

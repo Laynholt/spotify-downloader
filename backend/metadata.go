@@ -666,7 +666,7 @@ func extractCoverFromMp3(filePath string) (string, error) {
 		return "", fmt.Errorf("invalid picture frame")
 	}
 
-	tmpFile, err := os.CreateTemp("", "cover-*.jpg")
+	tmpFile, err := CreateRunTemp("cover-*.jpg")
 	if err != nil {
 		return "", fmt.Errorf("failed to create temp file: %w", err)
 	}
@@ -696,7 +696,7 @@ func extractCoverFromM4AOrFlac(filePath string) (string, error) {
 					continue
 				}
 
-				tmpFile, err := os.CreateTemp("", "cover-*.jpg")
+				tmpFile, err := CreateRunTemp("cover-*.jpg")
 				if err != nil {
 					return "", fmt.Errorf("failed to create temp file: %w", err)
 				}

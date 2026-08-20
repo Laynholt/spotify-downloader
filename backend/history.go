@@ -33,8 +33,7 @@ const (
 )
 
 func InitHistoryDB(appName string) error {
-
-	appDir, err := GetFFmpegDir()
+	appDir, err := GetUserDataDir()
 	if err != nil {
 		return err
 	}

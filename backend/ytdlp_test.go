@@ -1,6 +1,11 @@
 package backend
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
 
 func TestSelectYtDlpAssetForWindows(t *testing.T) {
 	assets := []GitHubReleaseAsset{
@@ -49,5 +54,69 @@ func TestParseYtDlpSHA256Sums(t *testing.T) {
 	hashes := parseSHA256Sums(checksums)
 	if hashes["yt-dlp_linux"] != "abcd1234" {
 		t.Fatalf("expected hash for yt-dlp_linux, got %q", hashes["yt-dlp_linux"])
+	}
+}
+
+func TestShouldSkipYtDlpReleaseCheckUses24HourTTL(t *testing.T) {
+	markerPath := filepath.Join(t.TempDir(), ytDlpUpdateCheckFilename)
+	if err := os.WriteFile(markerPath, []byte("checked"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(1_700_000_000, 0)
+	if err := os.Chtimes(markerPath, now.Add(-ytDlpUpdateCheckTTL+time.Minute), now.Add(-ytDlpUpdateCheckTTL+time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if !shouldSkipYtDlpReleaseCheck(YtDlpStatus{Installed: true}, markerPath, now) {
+		t.Fatal("expected a fresh marker to skip release check")
+	}
+}
+
+func TestShouldSkipYtDlpReleaseCheckAtBoundary(t *testing.T) {
+	markerPath := filepath.Join(t.TempDir(), ytDlpUpdateCheckFilename)
+	if err := os.WriteFile(markerPath, []byte("checked"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(1_700_000_000, 0)
+	if err := os.Chtimes(markerPath, now.Add(-ytDlpUpdateCheckTTL), now.Add(-ytDlpUpdateCheckTTL)); err != nil {
+		t.Fatal(err)
+	}
+	if shouldSkipYtDlpReleaseCheck(YtDlpStatus{Installed: true}, markerPath, now) {
+		t.Fatal("expected the exact TTL boundary to trigger a release check")
+	}
+}
+
+func TestShouldSkipYtDlpReleaseCheckRequiresInstalledBinary(t *testing.T) {
+	markerPath := filepath.Join(t.TempDir(), ytDlpUpdateCheckFilename)
+	if err := os.WriteFile(markerPath, []byte("checked"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if shouldSkipYtDlpReleaseCheck(YtDlpStatus{Installed: false}, markerPath, now) {
+		t.Fatal("an absent yt-dlp binary must not skip the release check")
+	}
+}
+
+func TestShouldSkipYtDlpReleaseCheckRequiresMarker(t *testing.T) {
+	markerPath := filepath.Join(t.TempDir(), ytDlpUpdateCheckFilename)
+	if shouldSkipYtDlpReleaseCheck(YtDlpStatus{Installed: true}, markerPath, time.Now()) {
+		t.Fatal("a missing marker must trigger a release check")
+	}
+}
+
+func TestRecordYtDlpReleaseCheckCreatesFreshMarker(t *testing.T) {
+	markerPath := filepath.Join(t.TempDir(), ytDlpUpdateCheckFilename)
+	checkedAt := time.Unix(1_700_000_000, 123).UTC()
+	if err := recordYtDlpReleaseCheck(markerPath, checkedAt); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(markerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() == 0 {
+		t.Fatal("recorded marker is empty")
+	}
+	if !shouldSkipYtDlpReleaseCheck(YtDlpStatus{Installed: true}, markerPath, checkedAt.Add(time.Hour)) {
+		t.Fatal("newly recorded marker should be fresh")
 	}
 }

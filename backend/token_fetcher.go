@@ -27,38 +27,22 @@ func FetchSessionTokenWithParams(timeout int, retry int) (string, error) {
 		timeout = 15
 	}
 
+	paths, err := CurrentRuntimePaths()
+	if err != nil {
+		return "", err
+	}
+	exePath := filepath.Join(paths.BinDir, tokenHelperName())
+	info, statErr := os.Stat(exePath)
+	if statErr != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+		return "", fmt.Errorf("portable helper is missing: %s", exePath)
+	}
+
 	browserInstalled, browserPath, err := IsChromeInstalled()
 	if err != nil {
 		return "", fmt.Errorf("failed to check Chrome installation: %v", err)
 	}
 	if !browserInstalled {
 		return "", ErrChromeNotInstalled
-	}
-
-	spotiDir, err := getSpotiDownloaderDir()
-	if err != nil {
-		return "", err
-	}
-
-	if err := os.MkdirAll(spotiDir, 0755); err != nil {
-		return "", fmt.Errorf("failed to create .spotidownloader directory: %v", err)
-	}
-
-	binaryData, binaryName := getTokenBinary()
-	exePath := filepath.Join(spotiDir, binaryName)
-
-	needsUpdate := true
-	if info, err := os.Stat(exePath); err == nil {
-		if info.Size() == int64(len(binaryData)) {
-			needsUpdate = false
-		}
-	}
-
-	if needsUpdate {
-		err = os.WriteFile(exePath, binaryData, 0755)
-		if err != nil {
-			return "", fmt.Errorf("failed to write get_token binary: %v", err)
-		}
 	}
 
 	var lastErr error

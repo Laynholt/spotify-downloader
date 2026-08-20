@@ -72,15 +72,15 @@ type ffmpegRelease struct {
 }
 
 func GetFFmpegDir() (string, error) {
-	homeDir, err := os.UserHomeDir()
+	paths, err := CurrentRuntimePaths()
 	if err != nil {
-		return "", fmt.Errorf("failed to get home directory: %w", err)
+		return "", err
 	}
-	return filepath.Join(homeDir, ".spotidownloader"), nil
+	return paths.BinDir, nil
 }
 
 func GetFFmpegPath() (string, error) {
-	ffmpegDir, err := GetFFmpegDir()
+	paths, err := CurrentRuntimePaths()
 	if err != nil {
 		return "", err
 	}
@@ -90,21 +90,11 @@ func GetFFmpegPath() (string, error) {
 		ffmpegName = "ffmpeg.exe"
 	}
 
-	localPath := filepath.Join(ffmpegDir, ffmpegName)
-	if _, err := os.Stat(localPath); err == nil {
-		return localPath, nil
-	}
-
-	path, err := exec.LookPath(ffmpegName)
-	if err == nil {
-		return path, nil
-	}
-
-	return localPath, nil
+	return filepath.Join(paths.BinDir, ffmpegName), nil
 }
 
 func GetFFprobePath() (string, error) {
-	ffmpegDir, err := GetFFmpegDir()
+	paths, err := CurrentRuntimePaths()
 	if err != nil {
 		return "", err
 	}
@@ -114,17 +104,7 @@ func GetFFprobePath() (string, error) {
 		ffprobeName = "ffprobe.exe"
 	}
 
-	localPath := filepath.Join(ffmpegDir, ffprobeName)
-	if _, err := os.Stat(localPath); err == nil {
-		return localPath, nil
-	}
-
-	path, err := exec.LookPath(ffprobeName)
-	if err == nil {
-		return path, nil
-	}
-
-	return localPath, fmt.Errorf("ffprobe not found in app directory or system path")
+	return filepath.Join(paths.BinDir, ffprobeName), nil
 }
 
 func IsFFprobeInstalled() (bool, error) {
@@ -330,7 +310,7 @@ func downloadAndExtract(url, destDir string, progressCallback func(int), progres
 }
 
 func downloadAndExtractVerified(rawURL, expectedSHA256, destDir string, progressCallback func(int), progressStart, progressEnd int) error {
-	tmpFile, err := os.CreateTemp("", "ffmpeg-*")
+	tmpFile, err := CreateRunTemp("ffmpeg-*")
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %w", err)
 	}
