@@ -858,18 +858,10 @@ func ExtractLyrics(filePath string) (string, error) {
 	case ".flac":
 		return extractLyricsFromFlac(filePath)
 	case ".m4a":
-		return extractLyricsFromM4A(filePath)
+		return "", nil
 	default:
 		return "", fmt.Errorf("unsupported file format: %s", ext)
 	}
-}
-
-func extractLyricsFromM4A(filePath string) (string, error) {
-	metadata, err := ExtractFullMetadataFromFile(filePath)
-	if err != nil {
-		return "", err
-	}
-	return metadata.Lyrics, nil
 }
 
 func extractLyricsFromMp3(filePath string) (string, error) {

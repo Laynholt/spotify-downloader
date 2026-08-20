@@ -828,10 +828,18 @@ func ConvertAudioContext(ctx context.Context, req ConvertAudioRequest) ([]Conver
 
 			coverArtPath, _ = ExtractCoverArt(inputFile)
 			states[idx].coverArtPath = coverArtPath
-			lyrics, err = ExtractLyrics(inputFile)
-			if err != nil {
-				fmt.Printf("[FFmpeg] Warning: Failed to extract lyrics from %s: %v\n", inputFile, err)
-			} else if lyrics != "" {
+
+			// Metadata probing above already carries lyrics for formats that expose
+			// them through FFprobe. Only use the legacy file readers as a fallback
+			// for MP3/FLAC; never trigger a second non-context M4A probe here.
+			lyrics = inputMetadata.Lyrics
+			if lyrics == "" && inputExt != ".m4a" {
+				lyrics, err = ExtractLyrics(inputFile)
+				if err != nil {
+					fmt.Printf("[FFmpeg] Warning: Failed to extract lyrics from %s: %v\n", inputFile, err)
+				}
+			}
+			if lyrics != "" {
 				fmt.Printf("[FFmpeg] Lyrics extracted from %s: %d characters\n", inputFile, len(lyrics))
 			} else {
 				fmt.Printf("[FFmpeg] No lyrics found in %s\n", inputFile)
@@ -930,26 +938,6 @@ func ConvertAudioContext(ctx context.Context, req ConvertAudioRequest) ([]Conver
 				fmt.Printf("[FFmpeg] Warning: Failed to embed metadata: %v\n", err)
 			} else {
 				fmt.Printf("[FFmpeg] Metadata embedded successfully\n")
-			}
-
-			if lyrics != "" {
-				if err := EmbedLyricsOnlyContext(ctx, outputFile, lyrics); err != nil {
-					if ctxErr := ctx.Err(); ctxErr != nil {
-						result.Error = ctxErr.Error()
-						result.Success = false
-						mu.Lock()
-						results[idx] = result
-						mu.Unlock()
-						if coverArtPath != "" {
-							os.Remove(coverArtPath)
-						}
-						os.Remove(outputFile)
-						return
-					}
-					fmt.Printf("[FFmpeg] Warning: Failed to embed lyrics: %v\n", err)
-				} else {
-					fmt.Printf("[FFmpeg] Lyrics embedded successfully\n")
-				}
 			}
 
 			states[idx].committed = true

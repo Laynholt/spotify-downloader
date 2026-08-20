@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +25,11 @@ const (
 	testHelperBatchMode         = "SPOTI_DOWNLOAD_TEST_HELPER_BATCH_MODE"
 	testHelperBatchFirstMarker  = "SPOTI_DOWNLOAD_TEST_HELPER_BATCH_FIRST_MARKER"
 	testHelperBatchSecondMarker = "SPOTI_DOWNLOAD_TEST_HELPER_BATCH_SECOND_MARKER"
+	testHelperFFmpegSuccess     = "SPOTI_FAKE_FFMPEG_SUCCESS"
+	testHelperFFmpegCount       = "SPOTI_FAKE_FFMPEG_COUNT"
+	testHelperFFmpegMetadata    = "SPOTI_FAKE_FFMPEG_METADATA_COUNT"
+	testHelperFFprobeCount      = "SPOTI_FAKE_FFPROBE_COUNT"
+	testHelperFFprobeOutput     = "SPOTI_FAKE_FFPROBE_OUTPUT"
 )
 
 func TestMain(m *testing.M) {
@@ -183,8 +189,11 @@ func TestConvertAudioContextActiveCancellation(t *testing.T) {
 	installFakeFFmpegRuntime(t)
 	marker := filepath.Join(t.TempDir(), "ffmpeg-convert-started")
 	t.Setenv(testHelperMarker, marker)
+	probeCount := filepath.Join(t.TempDir(), "ffprobe-count")
+	t.Setenv(testHelperFFprobeCount, probeCount)
+	t.Setenv(testHelperFFprobeOutput, `{"format":{"duration":"1.0","tags":{"lyrics":"[00:00.50]line"}}}`)
 
-	inputPath := filepath.Join(t.TempDir(), "input.wav")
+	inputPath := filepath.Join(t.TempDir(), "input.m4a")
 	if err := os.WriteFile(inputPath, []byte("source"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -217,6 +226,11 @@ func TestConvertAudioContextActiveCancellation(t *testing.T) {
 	outputPath := filepath.Join(filepath.Dir(inputPath), "FLAC", "input.flac")
 	if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
 		t.Fatalf("canceled ConvertAudio left output: %v", err)
+	}
+	if data, err := os.ReadFile(probeCount); err != nil {
+		t.Fatalf("read ffprobe count: %v", err)
+	} else if count := strings.TrimSpace(string(data)); count != "1" {
+		t.Fatalf("canceled M4A conversion ffprobe calls = %s, want 1", count)
 	}
 }
 
@@ -417,6 +431,13 @@ func runManagedGrandchildHelper() int {
 }
 
 func runFakeFFmpegHelper() int {
+	incrementTestHelperCounter(os.Getenv(testHelperFFmpegCount))
+	for _, arg := range os.Args[1:] {
+		if arg == "-metadata" {
+			incrementTestHelperCounter(os.Getenv(testHelperFFmpegMetadata))
+			break
+		}
+	}
 	if len(os.Args) > 1 && os.Args[1] == "-version" {
 		if marker := os.Getenv(testHelperVersionMarker); marker != "" {
 			_ = os.WriteFile(marker, []byte("started"), 0600)
@@ -447,6 +468,9 @@ func runFakeFFmpegHelper() int {
 				_ = os.WriteFile(marker, []byte("started"), 0600)
 			}
 		}
+		if os.Getenv(testHelperFFmpegSuccess) != "" {
+			return 0
+		}
 	}
 	for {
 		time.Sleep(10 * time.Millisecond)
@@ -454,6 +478,7 @@ func runFakeFFmpegHelper() int {
 }
 
 func runFakeFFprobeHelper() int {
+	incrementTestHelperCounter(os.Getenv(testHelperFFprobeCount))
 	if len(os.Args) > 1 && os.Args[1] == "-version" {
 		return 0
 	}
@@ -463,8 +488,23 @@ func runFakeFFprobeHelper() int {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
-	_, _ = io.WriteString(os.Stdout, "{}")
+	output := os.Getenv(testHelperFFprobeOutput)
+	if output == "" {
+		output = "{}"
+	}
+	_, _ = io.WriteString(os.Stdout, output)
 	return 0
+}
+
+func incrementTestHelperCounter(path string) {
+	if path == "" {
+		return
+	}
+	count := 0
+	if data, err := os.ReadFile(path); err == nil {
+		count, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+	}
+	_ = os.WriteFile(path, []byte(strconv.Itoa(count+1)), 0600)
 }
 
 func installFakeFFmpegRuntime(t *testing.T) RuntimePaths {

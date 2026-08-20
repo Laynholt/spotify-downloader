@@ -30,6 +30,91 @@ func TestValidateLyricsDurationUsesProvidedDuration(t *testing.T) {
 	}
 }
 
+func TestExtractLyricsM4ADoesNotProbe(t *testing.T) {
+	installFakeFFmpegRuntime(t)
+	probeCount := filepath.Join(t.TempDir(), "ffprobe-count")
+	t.Setenv(testHelperFFprobeCount, probeCount)
+	t.Setenv(testHelperFFprobeOutput, `{"format":{"duration":"1.0","tags":{"lyrics":"[00:00.50]line"}}}`)
+
+	lyrics, err := ExtractLyrics(filepath.Join(t.TempDir(), "track.m4a"))
+	if err != nil {
+		t.Fatalf("extract m4a lyrics: %v", err)
+	}
+	if lyrics != "" {
+		t.Fatalf("m4a lyrics = %q, want empty legacy wrapper result", lyrics)
+	}
+	if count := readMetadataTestCounter(t, probeCount); count != 0 {
+		t.Fatalf("m4a ExtractLyrics ffprobe calls = %d, want 0", count)
+	}
+}
+
+func TestConvertAudioContextUsesOneProbeAndMetadataPassForLyrics(t *testing.T) {
+	systemFFmpeg, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skipf("ffmpeg not available: %v", err)
+	}
+	dir := t.TempDir()
+	inputPath := filepath.Join(dir, "source.mp3")
+	writeFFmpegFixture(t, systemFFmpeg, []string{
+		"-f", "lavfi", "-i", "sine=frequency=1000:duration=1", "-q:a", "2", "-y", inputPath,
+	})
+	tag, err := id3v2.Open(inputPath, id3v2.Options{Parse: true})
+	if err != nil {
+		t.Fatalf("open mp3 fixture: %v", err)
+	}
+	tag.AddUnsynchronisedLyricsFrame(id3v2.UnsynchronisedLyricsFrame{
+		Encoding:          id3v2.EncodingUTF8,
+		Language:          "eng",
+		ContentDescriptor: "",
+		Lyrics:            "[00:00.50]line",
+	})
+	if err := saveMP3Tag(tag, inputPath); err != nil {
+		t.Fatalf("save mp3 lyrics fixture: %v", err)
+	}
+
+	installFakeFFmpegRuntime(t)
+	t.Setenv(testHelperFFmpegSuccess, "1")
+	ffprobeCount := filepath.Join(dir, "ffprobe-count")
+	ffmpegMetadataCount := filepath.Join(dir, "ffmpeg-metadata-count")
+	t.Setenv(testHelperFFprobeCount, ffprobeCount)
+	t.Setenv(testHelperFFmpegMetadata, ffmpegMetadataCount)
+	t.Setenv(testHelperFFprobeOutput, `{"format":{"duration":"1.0","tags":{"lyrics":"[00:00.50]line"}}}`)
+
+	results, err := ConvertAudioContext(context.Background(), ConvertAudioRequest{
+		InputFiles:   []string{inputPath},
+		OutputFormat: "m4a",
+		Bitrate:      "128k",
+	})
+	if err != nil {
+		t.Fatalf("convert audio: %v", err)
+	}
+	if len(results) != 1 || !results[0].Success {
+		t.Fatalf("conversion results = %#v", results)
+	}
+	if count := readMetadataTestCounter(t, ffprobeCount); count != 1 {
+		t.Fatalf("conversion ffprobe calls = %d, want 1", count)
+	}
+	if count := readMetadataTestCounter(t, ffmpegMetadataCount); count != 1 {
+		t.Fatalf("metadata ffmpeg passes = %d, want 1", count)
+	}
+}
+
+func readMetadataTestCounter(t *testing.T, path string) int {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
+		t.Fatalf("read counter %s: %v", path, err)
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatalf("parse counter %s: %v", path, err)
+	}
+	return count
+}
+
 func TestFinalizeMediaWritesMP3TagsLyricsAndCoverInOnePass(t *testing.T) {
 	ffmpegPath, ffprobePath := installSystemFFmpegRuntime(t)
 	dir := t.TempDir()
