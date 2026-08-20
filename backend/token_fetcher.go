@@ -1,8 +1,11 @@
 package backend
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -32,6 +35,19 @@ func portableTokenHelperPath(paths RuntimePaths) (string, error) {
 }
 
 func FetchSessionTokenWithParams(timeout int, retry int) (string, error) {
+	return FetchSessionTokenWithParamsContext(context.Background(), timeout, retry)
+}
+
+// FetchSessionTokenWithParamsContext is the cancellation-aware token helper
+// used by context-bound pipeline retries. The legacy Background wrapper above
+// keeps existing callers and the public API unchanged.
+func FetchSessionTokenWithParamsContext(ctx context.Context, timeout int, retry int) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if timeout < 15 {
 		timeout = 15
 	}
@@ -60,6 +76,9 @@ func FetchSessionTokenWithParams(timeout int, retry int) (string, error) {
 	maxAttempts := retry + 1
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		fmt.Printf("[TokenFetcher] Attempt %d/%d (timeout: %ds)\n", attempt, maxAttempts, timeout)
 
 		args := []string{"--timeout", fmt.Sprintf("%d", timeout), "--retry", "1"}
@@ -68,14 +87,19 @@ func FetchSessionTokenWithParams(timeout int, retry int) (string, error) {
 		}
 
 		cmd := newTokenCmd(exePath, args...)
-		output, err := cmd.CombinedOutput()
+		output, err := tokenCommandOutputContext(ctx, cmd)
 		outputStr := strings.TrimSpace(string(output))
 
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return "", ctxErr
+			}
 			lastErr = fmt.Errorf("get_token execution failed (attempt %d): %v, output: %s", attempt, err, outputStr)
 			fmt.Printf("[TokenFetcher] %v\n", lastErr)
 			if attempt < maxAttempts {
-				time.Sleep(1 * time.Second)
+				if err := waitTokenRetryContext(ctx, time.Second); err != nil {
+					return "", err
+				}
 			}
 			continue
 		}
@@ -84,7 +108,9 @@ func FetchSessionTokenWithParams(timeout int, retry int) (string, error) {
 			lastErr = fmt.Errorf("get_token returned empty output (attempt %d)", attempt)
 			fmt.Printf("[TokenFetcher] %v\n", lastErr)
 			if attempt < maxAttempts {
-				time.Sleep(1 * time.Second)
+				if err := waitTokenRetryContext(ctx, time.Second); err != nil {
+					return "", err
+				}
 			}
 			continue
 		}
@@ -93,7 +119,9 @@ func FetchSessionTokenWithParams(timeout int, retry int) (string, error) {
 			lastErr = fmt.Errorf("get_token returned invalid token (attempt %d): %s", attempt, outputStr)
 			fmt.Printf("[TokenFetcher] %v\n", lastErr)
 			if attempt < maxAttempts {
-				time.Sleep(1 * time.Second)
+				if err := waitTokenRetryContext(ctx, time.Second); err != nil {
+					return "", err
+				}
 			}
 			continue
 		}
@@ -103,4 +131,47 @@ func FetchSessionTokenWithParams(timeout int, retry int) (string, error) {
 	}
 
 	return "", fmt.Errorf("failed to fetch token after %d attempts: %v", maxAttempts, lastErr)
+}
+
+func waitTokenRetryContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func tokenCommandOutputContext(ctx context.Context, cmd *exec.Cmd) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		return output.Bytes(), err
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+	select {
+	case err := <-done:
+		return output.Bytes(), err
+	case <-ctx.Done():
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		<-done
+		return output.Bytes(), ctx.Err()
+	}
 }

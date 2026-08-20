@@ -358,39 +358,55 @@ func (c *SpotifyMetadataClient) GetFilteredData(ctx context.Context, spotifyURL 
 }
 
 func (c *SpotifyMetadataClient) GetFilteredDataWithCache(ctx context.Context, cache *MetadataCache, spotifyURL string, batch bool, delay time.Duration) (interface{}, error) {
+	data, _, err := c.GetFilteredDataWithCacheOutcome(ctx, cache, spotifyURL, batch, delay)
+	return data, err
+}
+
+// GetFilteredDataWithCacheOutcome is the cache-aware variant used by pipeline
+// metadata enrichment. It preserves the existing filtered-data API while
+// exposing whether a track lookup was served from cache or loaded remotely.
+func (c *SpotifyMetadataClient) GetFilteredDataWithCacheOutcome(ctx context.Context, cache *MetadataCache, spotifyURL string, batch bool, delay time.Duration) (interface{}, CacheOutcome, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	parsed, err := parseSpotifyURI(spotifyURL)
 	if err != nil {
-		return nil, err
+		return nil, CacheMiss, err
 	}
 
 	var raw interface{}
+	outcome := CacheMiss
 	if parsed.Type == "track" {
-		raw, err = c.getCachedTrack(ctx, cache, parsed.ID)
+		raw, outcome, err = c.getCachedTrackWithOutcome(ctx, cache, parsed.ID)
 	} else {
 		raw, err = c.getRawSpotifyData(ctx, parsed, batch, delay)
 	}
 	if err != nil {
-		return nil, err
+		return nil, outcome, err
 	}
 
-	return c.processSpotifyData(ctx, raw)
+	processed, err := c.processSpotifyData(ctx, raw)
+	return processed, outcome, err
 }
 
 func (c *SpotifyMetadataClient) getCachedTrack(ctx context.Context, cache *MetadataCache, trackID string) (*apiTrackResponse, error) {
+	track, _, err := c.getCachedTrackWithOutcome(ctx, cache, trackID)
+	return track, err
+}
+
+func (c *SpotifyMetadataClient) getCachedTrackWithOutcome(ctx context.Context, cache *MetadataCache, trackID string) (*apiTrackResponse, CacheOutcome, error) {
 	if cache == nil {
-		return c.fetchTrack(ctx, trackID)
+		track, err := c.fetchTrack(ctx, trackID)
+		return track, CacheMiss, err
 	}
-	track, _, err := CachedLookup(ctx, cache, spotifyCacheKey(trackID), trackMetadataTTL,
+	track, outcome, err := CachedLookup(ctx, cache, spotifyCacheKey(trackID), trackMetadataTTL,
 		func(value *apiTrackResponse) bool {
 			return value != nil && (strings.TrimSpace(value.ID) != "" || strings.TrimSpace(value.Name) != "")
 		},
 		func(loadCtx context.Context) (*apiTrackResponse, error) {
 			return c.fetchTrack(loadCtx, trackID)
 		})
-	return track, err
+	return track, outcome, err
 }
 
 func (c *SpotifyMetadataClient) getRawSpotifyData(ctx context.Context, parsed spotifyURI, batch bool, delay time.Duration) (interface{}, error) {

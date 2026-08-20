@@ -75,7 +75,7 @@ type SpotiDownloader struct {
 	trackDeps         trackPipelineDeps
 	// refreshToken is a per-instance seam for deterministic pipeline retry
 	// tests. Production instances use refreshSessionToken below.
-	refreshToken func() error
+	refreshToken func(context.Context) error
 }
 
 type sessionTokenError struct {
@@ -284,7 +284,10 @@ func fetchTaggingMetadataWithOutcomes(ctx context.Context, cache *MetadataCache,
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			releaseDate, err := fetchTrackTaggingMetadataContext(ctx, cache, req.TrackID)
+			releaseDate, outcome, err := fetchTrackTaggingMetadataContextWithOutcome(ctx, cache, req.TrackID)
+			resultMu.Lock()
+			outcomes[spotifyCacheKey(req.TrackID)] = outcome
+			resultMu.Unlock()
 			if err != nil {
 				addWarning("Spotify metadata lookup failed: %v", err)
 				return
@@ -740,9 +743,19 @@ func isSessionTokenError(err error) bool {
 }
 
 func (s *SpotiDownloader) refreshSessionToken() error {
+	return s.refreshSessionTokenContext(context.Background())
+}
+
+func (s *SpotiDownloader) refreshSessionTokenContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	fmt.Println("Session token expired, fetching a fresh token...")
 
-	token, err := FetchSessionTokenWithParams(15, 1)
+	token, err := FetchSessionTokenWithParamsContext(ctx, 15, 1)
 	if err != nil {
 		return fmt.Errorf("failed to refresh session token: %w", err)
 	}
@@ -751,11 +764,14 @@ func (s *SpotiDownloader) refreshSessionToken() error {
 	return nil
 }
 
-func (s *SpotiDownloader) refreshSessionTokenForPipeline() error {
-	if s != nil && s.refreshToken != nil {
-		return s.refreshToken()
+func (s *SpotiDownloader) refreshSessionTokenForPipeline(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	return s.refreshSessionToken()
+	if s != nil && s.refreshToken != nil {
+		return s.refreshToken(ctx)
+	}
+	return s.refreshSessionTokenContext(ctx)
 }
 
 func withTokenRetry[T any](s *SpotiDownloader, fn func() (T, error)) (T, error) {
@@ -793,7 +809,7 @@ func (s *SpotiDownloader) IsFlacAvailableContext(ctx context.Context, trackID st
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	if refreshErr := s.refreshSessionToken(); refreshErr != nil {
+	if refreshErr := s.refreshSessionTokenContext(ctx); refreshErr != nil {
 		return false, refreshErr
 	}
 	return s.isFlacAvailableContext(ctx, trackID)
@@ -873,7 +889,7 @@ func (s *SpotiDownloader) GetDownloadLinkContext(ctx context.Context, trackID st
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if refreshErr := s.refreshSessionToken(); refreshErr != nil {
+	if refreshErr := s.refreshSessionTokenContext(ctx); refreshErr != nil {
 		return nil, refreshErr
 	}
 	return s.getDownloadLinkContext(ctx, trackID)
@@ -890,7 +906,7 @@ func (s *SpotiDownloader) getDownloadLinkContextWithRetry(ctx context.Context, t
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, ctxErr
 	}
-	if refreshErr := s.refreshSessionTokenForPipeline(); refreshErr != nil {
+	if refreshErr := s.refreshSessionTokenForPipeline(ctx); refreshErr != nil {
 		return nil, refreshErr
 	}
 	return s.getDownloadLinkContext(ctx, trackID)
@@ -974,7 +990,7 @@ func (s *SpotiDownloader) DownloadFileContext(ctx context.Context, downloadURL, 
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	if refreshErr := s.refreshSessionToken(); refreshErr != nil {
+	if refreshErr := s.refreshSessionTokenContext(ctx); refreshErr != nil {
 		return "", refreshErr
 	}
 	return s.downloadFileContext(ctx, downloadURL, outputBasePath, fallbackExt)
@@ -1084,7 +1100,7 @@ func (s *SpotiDownloader) downloadFileContextWithItemIDRetry(ctx context.Context
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return "", ctxErr
 	}
-	if refreshErr := s.refreshSessionTokenForPipeline(); refreshErr != nil {
+	if refreshErr := s.refreshSessionTokenForPipeline(ctx); refreshErr != nil {
 		return "", refreshErr
 	}
 	return s.downloadFileContextWithItemID(ctx, downloadURL, outputBasePath, fallbackExt, itemID)
@@ -1429,26 +1445,31 @@ func fetchTrackTaggingMetadata(trackID string) (string, string, bool) {
 }
 
 func fetchTrackTaggingMetadataContext(ctx context.Context, cache *MetadataCache, trackID string) (string, error) {
+	releaseDate, _, err := fetchTrackTaggingMetadataContextWithOutcome(ctx, cache, trackID)
+	return releaseDate, err
+}
+
+func fetchTrackTaggingMetadataContextWithOutcome(ctx context.Context, cache *MetadataCache, trackID string) (string, CacheOutcome, error) {
 	if strings.TrimSpace(trackID) == "" {
-		return "", fmt.Errorf("empty track ID")
+		return "", CacheMiss, fmt.Errorf("empty track ID")
 	}
 
 	client := NewSpotifyMetadataClient()
-	data, err := client.GetFilteredDataWithCache(ctx, cache, fmt.Sprintf("https://open.spotify.com/track/%s", trackID), false, 0)
+	data, outcome, err := client.GetFilteredDataWithCacheOutcome(ctx, cache, fmt.Sprintf("https://open.spotify.com/track/%s", trackID), false, 0)
 	if err != nil {
-		return "", err
+		return "", outcome, err
 	}
 
 	switch resp := data.(type) {
 	case TrackResponse:
-		return strings.TrimSpace(resp.Track.ReleaseDate), nil
+		return strings.TrimSpace(resp.Track.ReleaseDate), outcome, nil
 	case *TrackResponse:
 		if resp != nil {
-			return strings.TrimSpace(resp.Track.ReleaseDate), nil
+			return strings.TrimSpace(resp.Track.ReleaseDate), outcome, nil
 		}
 	}
 
-	return "", fmt.Errorf("Spotify metadata response did not contain track data")
+	return "", outcome, fmt.Errorf("Spotify metadata response did not contain track data")
 }
 
 func fetchGenreFromDeezer(trackID string) (string, error) {

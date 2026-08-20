@@ -509,6 +509,72 @@ func TestTrackPipelineDefaultMetadataPropagatesCacheOutcomes(t *testing.T) {
 	}
 }
 
+func TestTrackPipelineDefaultMetadataSpotifyCacheOutcomeMissThenHit(t *testing.T) {
+	var spotifyCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.Contains(r.URL.Path, "pathfinder") {
+			http.NotFound(w, r)
+			return
+		}
+		spotifyCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"trackUnion":{"id":"spotify-outcome-track","name":"Track","trackNumber":1,"discNumber":1,"artists":{"items":[{"profile":{"name":"Artist"}}]},"duration":{"totalMilliseconds":180000},"albumOfTrack":{"name":"Album","artists":{"items":[{"profile":{"name":"Artist"}}]},"date":{"isoString":"2024-01-02"},"tracks":{"totalCount":1},"copyright":{"items":[]}}}}}`))
+	}))
+	defer server.Close()
+
+	baseURL, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := server.Client()
+	transport := client.Transport
+	client.Transport = trackPipelineRoundTripper(func(req *http.Request) (*http.Response, error) {
+		clone := req.Clone(req.Context())
+		clone.URL.Scheme = baseURL.Scheme
+		clone.URL.Host = baseURL.Host
+		return transport.RoundTrip(clone)
+	})
+	previousFactory := metadataSpotifyClientFactory
+	metadataSpotifyClientFactory = func() *SpotifyClient {
+		return &SpotifyClient{client: client, accessToken: "access", clientToken: "client", clientVersion: "test", cookies: make(map[string]string)}
+	}
+	t.Cleanup(func() { metadataSpotifyClientFactory = previousFactory })
+
+	cache, warnings := OpenMetadataCache("", CacheOptions{})
+	if len(warnings) != 0 {
+		t.Fatalf("cache warnings = %v", warnings)
+	}
+	defer cache.Close()
+	s := &SpotiDownloader{metadataCache: cache}
+	req := TrackPipelineRequest{
+		TrackID:      "spotify-outcome-track",
+		BaseMetadata: Metadata{Title: "Track", Artist: "Artist", Album: "Album"},
+		EmbedGenre:   false,
+	}
+
+	first := trackPipelineMetadataCall(defaultTrackPipelineDeps, context.Background(), s, req)
+	if first.err != nil {
+		t.Fatalf("first metadata error = %v (warnings=%v)", first.err, first.warnings)
+	}
+	if got := first.tagging.ReleaseDate; got != "2024-01-02" {
+		t.Fatalf("first release date = %q, want 2024-01-02", got)
+	}
+	if got := first.cacheOutcomes[spotifyCacheKey(req.TrackID)]; got != CacheMiss {
+		t.Fatalf("first spotify outcome = %q, want %q (all=%v)", got, CacheMiss, first.cacheOutcomes)
+	}
+
+	second := trackPipelineMetadataCall(defaultTrackPipelineDeps, context.Background(), s, req)
+	if second.err != nil {
+		t.Fatalf("second metadata error = %v (warnings=%v)", second.err, second.warnings)
+	}
+	if got := second.cacheOutcomes[spotifyCacheKey(req.TrackID)]; got != CacheHit {
+		t.Fatalf("second spotify outcome = %q, want %q (all=%v)", got, CacheHit, second.cacheOutcomes)
+	}
+	if got := spotifyCalls.Load(); got != 1 {
+		t.Fatalf("spotify calls = %d, want one miss loader call", got)
+	}
+}
+
 func TestTrackPipelineRejectsLyricsCompletedAtAbsoluteDeadline(t *testing.T) {
 	req, _ := testTrackPipelineRequest(t)
 	req.EmbedLyrics = true
@@ -671,6 +737,179 @@ func TestTrackPipelineSynthesizedTimeoutsRecordBranchTimings(t *testing.T) {
 	}
 }
 
+func TestTrackPipelineLyricsDeadlineUsesInjectedContext(t *testing.T) {
+	req, _ := testTrackPipelineRequest(t)
+	req.EmbedGenre = false
+	req.BaseMetadata.Date = "2024-01-01"
+	req.BaseMetadata.ISRC = "ISRC-1"
+	startedAt := time.Unix(0, 0)
+	deadline := startedAt.Add(trackPipelineLyricsBudget)
+	timerCreated := make(chan struct{})
+	timerReady := make(chan time.Time, 1)
+	lyricsStarted := make(chan struct{})
+	lyricsCanceled := make(chan struct{})
+	var finalizations atomic.Int32
+	installPipelineDepsForTest(t, trackPipelineDeps{
+		resolveTarget: func(context.Context, *SpotiDownloader, TrackPipelineRequest) (string, string, error) {
+			return "source", ".mp3", nil
+		},
+		downloadAudio: func(_ context.Context, _ *SpotiDownloader, _ string, base, ext, _ string) (string, error) {
+			path := base + ext
+			return path, os.WriteFile(path, []byte("audio"), 0600)
+		},
+		convertAudio:  func(_ context.Context, path, _, _ string) (string, error) { return path, nil },
+		downloadCover: func(context.Context, *SpotiDownloader, string, string, bool) (string, error) { return "", nil },
+		lyrics: func(ctx context.Context, _ TrackPipelineRequest, _ int) (string, error) {
+			close(lyricsStarted)
+			select {
+			case <-ctx.Done():
+				close(lyricsCanceled)
+				return "", ctx.Err()
+			}
+		},
+		probeDuration: func(context.Context, string) (float64, error) { return 1, nil },
+		finalizeMedia: func(context.Context, string, Metadata, string) error {
+			finalizations.Add(1)
+			return nil
+		},
+		now: func() time.Time { return startedAt },
+		newTimer: func(time.Duration) <-chan time.Time {
+			close(timerCreated)
+			return timerReady
+		},
+		withDeadline: func(parent context.Context, gotDeadline time.Time) (context.Context, context.CancelFunc) {
+			if !gotDeadline.Equal(deadline) {
+				panic("unexpected lyrics deadline")
+			}
+			return context.WithCancel(parent)
+		},
+	})
+
+	resultCh := make(chan struct {
+		result TrackPipelineResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := (&SpotiDownloader{}).RunTrackPipeline(context.Background(), req)
+		resultCh <- struct {
+			result TrackPipelineResult
+			err    error
+		}{result, err}
+	}()
+	select {
+	case <-lyricsStarted:
+	case <-time.After(time.Second):
+		t.Fatal("lyrics did not start")
+	}
+	select {
+	case <-lyricsCanceled:
+		t.Fatal("lyrics context canceled before injected deadline")
+	default:
+	}
+	select {
+	case <-timerCreated:
+	case <-time.After(time.Second):
+		t.Fatal("lyrics timer was not created")
+	}
+	timerReady <- deadline
+	outcome := <-resultCh
+	if outcome.err != nil {
+		t.Fatal(outcome.err)
+	}
+	if finalizations.Load() != 1 {
+		t.Fatalf("finalizations = %d, want 1", finalizations.Load())
+	}
+	if outcome.result.Timings.LyricsMS != 0 {
+		t.Fatalf("lyrics timing = %d, want context cancellation completion to be discarded", outcome.result.Timings.LyricsMS)
+	}
+	if !strings.Contains(strings.Join(outcome.result.Warnings, ";"), "lyrics deadline exceeded") {
+		t.Fatalf("warnings = %#v", outcome.result.Warnings)
+	}
+}
+
+func TestTrackPipelineRefreshCancellationDuringResolverAndAudio(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*SpotiDownloader, *httptest.Server, TrackPipelineRequest)
+	}{
+		{name: "resolver", setup: func(s *SpotiDownloader, server *httptest.Server, _ TrackPipelineRequest) {
+			s.pipelineDeps.resolveTarget = trackPipelineResolveTarget
+		}},
+		{name: "audio", setup: func(s *SpotiDownloader, server *httptest.Server, _ TrackPipelineRequest) {
+			s.pipelineDeps.resolveTarget = func(context.Context, *SpotiDownloader, TrackPipelineRequest) (string, string, error) {
+				return server.URL, ".mp3", nil
+			}
+			s.pipelineDeps.downloadAudio = trackPipelineDownloadAudio
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req, paths := testTrackPipelineRequest(t)
+			req.EmbedLyrics = false
+			req.EmbedGenre = false
+			req.CoverURL = ""
+			req.BaseMetadata.Date = "2024-01-01"
+			req.BaseMetadata.ISRC = "ISRC-1"
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests.Add(1)
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte("unauthorized"))
+			}))
+			defer server.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			refreshStarted := make(chan struct{})
+			refreshStopped := make(chan struct{})
+			s := &SpotiDownloader{sessionToken: "expired", httpClient: tokenTestHTTPClient(server)}
+			s.refreshToken = func(refreshCtx context.Context) error {
+				close(refreshStarted)
+				<-refreshCtx.Done()
+				close(refreshStopped)
+				return refreshCtx.Err()
+			}
+			test.setup(s, server, req)
+
+			resultCh := make(chan error, 1)
+			started := time.Now()
+			go func() {
+				_, err := s.RunTrackPipeline(ctx, req)
+				resultCh <- err
+			}()
+			select {
+			case <-refreshStarted:
+			case <-time.After(time.Second):
+				t.Fatal("refresh helper did not start")
+			}
+			cancel()
+			select {
+			case err := <-resultCh:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("error = %v, want cancellation", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("pipeline did not stop after refresh cancellation")
+			}
+			if elapsed := time.Since(started); elapsed >= time.Second {
+				t.Fatalf("cancellation elapsed = %v, want <1s", elapsed)
+			}
+			select {
+			case <-refreshStopped:
+			default:
+				t.Fatal("refresh helper did not observe cancellation before return")
+			}
+			if test.name == "audio" {
+				if _, err := os.Stat(filepath.Join(paths.RunTempDir, SanitizeFilename(req.ItemID))); !os.IsNotExist(err) {
+					t.Fatalf("audio track temp still exists: %v", err)
+				}
+			}
+			if requests.Load() == 0 {
+				t.Fatal("expected first token-error request")
+			}
+		})
+	}
+}
+
 func TestTrackPipelineDefaultResolverRetriesSessionToken(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -685,7 +924,7 @@ func TestTrackPipelineDefaultResolverRetriesSessionToken(t *testing.T) {
 	defer server.Close()
 	var refreshes atomic.Int32
 	s := &SpotiDownloader{sessionToken: "expired", httpClient: tokenTestHTTPClient(server)}
-	s.refreshToken = func() error {
+	s.refreshToken = func(context.Context) error {
 		refreshes.Add(1)
 		s.sessionToken = "fresh"
 		return nil
@@ -716,7 +955,7 @@ func TestTrackPipelineDefaultAudioRetriesSessionToken(t *testing.T) {
 	defer server.Close()
 	var refreshes atomic.Int32
 	s := &SpotiDownloader{sessionToken: "expired", httpClient: tokenTestHTTPClient(server)}
-	s.refreshToken = func() error {
+	s.refreshToken = func(context.Context) error {
 		refreshes.Add(1)
 		s.sessionToken = "fresh"
 		return nil
@@ -744,7 +983,7 @@ func TestTrackPipelineResolverRetryStopsOnCancellation(t *testing.T) {
 	defer server.Close()
 	var refreshes atomic.Int32
 	s := &SpotiDownloader{sessionToken: "expired", httpClient: tokenTestHTTPClient(server)}
-	s.refreshToken = func() error {
+	s.refreshToken = func(context.Context) error {
 		refreshes.Add(1)
 		return nil
 	}

@@ -87,6 +87,7 @@ type trackPipelineDeps struct {
 	clock                  any
 	newTimer               any
 	withTimeout            any
+	withDeadline           any
 }
 
 // pipelineDeps is the test seam used by the backend package tests. Keep the
@@ -264,7 +265,7 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 	defer cancelCover()
 	metadataCtx, cancelMetadata := trackPipelineWithTimeout(deps, branchCtx, trackPipelineBranchBudget)
 	defer cancelMetadata()
-	lyricsCtx, cancelLyrics := context.WithDeadline(branchCtx, lyricsDeadline)
+	lyricsCtx, cancelLyrics := trackPipelineWithDeadline(deps, branchCtx, lyricsDeadline)
 	defer cancelLyrics()
 
 	audioBasePath := filepath.Join(trackDir, filenameBase)
@@ -617,6 +618,9 @@ func overlayTrackPipelineDeps(dst, src trackPipelineDeps) trackPipelineDeps {
 	if src.withTimeout != nil {
 		dst.withTimeout = src.withTimeout
 	}
+	if src.withDeadline != nil {
+		dst.withDeadline = src.withDeadline
+	}
 	return dst
 }
 
@@ -647,6 +651,13 @@ func trackPipelineWithTimeout(deps trackPipelineDeps, parent context.Context, ti
 		return f(parent, timeout)
 	}
 	return context.WithTimeout(parent, timeout)
+}
+
+func trackPipelineWithDeadline(deps trackPipelineDeps, parent context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
+	if f, ok := deps.withDeadline.(func(context.Context, time.Time) (context.Context, context.CancelFunc)); ok {
+		return f(parent, deadline)
+	}
+	return context.WithDeadline(parent, deadline)
 }
 
 func trackPipelineElapsedMS(now func() time.Time, started time.Time) int64 {
