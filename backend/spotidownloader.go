@@ -67,6 +67,12 @@ type SpotiDownloader struct {
 	sessionToken  string
 	httpClient    *http.Client
 	metadataCache *MetadataCache
+	// pipelineDeps is a package-internal seam for deterministic backend tests.
+	// Production instances leave it zero-valued and use the defaults in
+	// track_pipeline.go.
+	pipelineDeps      trackPipelineDeps
+	trackPipelineDeps trackPipelineDeps
+	trackDeps         trackPipelineDeps
 }
 
 type sessionTokenError struct {
@@ -930,6 +936,14 @@ func (s *SpotiDownloader) DownloadFileContext(ctx context.Context, downloadURL, 
 }
 
 func (s *SpotiDownloader) downloadFileContext(ctx context.Context, downloadURL, outputBasePath, fallbackExt string) (_ string, err error) {
+	return s.downloadFileContextWithItemID(ctx, downloadURL, outputBasePath, fallbackExt, "")
+}
+
+// downloadFileContextWithItemID is the track-scoped variant used by the
+// concurrent pipeline. Keeping the legacy wrapper above preserves the old
+// 25-argument DownloadTrack contract while allowing each pipeline to report
+// transfer progress against its own queue item.
+func (s *SpotiDownloader) downloadFileContextWithItemID(ctx context.Context, downloadURL, outputBasePath, fallbackExt, itemID string) (_ string, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -981,7 +995,16 @@ func (s *SpotiDownloader) downloadFileContext(ctx context.Context, downloadURL, 
 		}
 	}()
 
-	progressWriter := NewProgressWriter(out)
+	var progressWriter *ProgressWriter
+	if itemID != "" {
+		if resp.ContentLength >= 0 {
+			progressWriter = NewProgressWriterWithID(out, itemID, resp.ContentLength)
+		} else {
+			progressWriter = NewProgressWriterWithID(out, itemID)
+		}
+	} else {
+		progressWriter = NewProgressWriter(out, resp.ContentLength)
+	}
 
 	_, err = io.Copy(progressWriter, reader)
 	if err != nil {
@@ -1253,6 +1276,18 @@ func (s *SpotiDownloader) downloadCoverImage(coverURL, outputDir string, embedMa
 }
 
 func (s *SpotiDownloader) downloadCoverImageContext(ctx context.Context, coverURL, outputDir string, embedMaxQualityCover bool) (coverPath string, err error) {
+	_ = outputDir
+	paths, pathErr := CurrentRuntimePaths()
+	if pathErr != nil {
+		return "", pathErr
+	}
+	return s.downloadCoverImageContextToDir(ctx, coverURL, paths.RunTempDir, embedMaxQualityCover, "")
+}
+
+// downloadCoverImageContextToDir stages artwork in outputDir. The pipeline
+// passes its per-item runtime directory here so a cover can never leak into a
+// process-wide or user-profile temp directory.
+func (s *SpotiDownloader) downloadCoverImageContextToDir(ctx context.Context, coverURL, outputDir string, embedMaxQualityCover bool, _ string) (coverPath string, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1271,7 +1306,11 @@ func (s *SpotiDownloader) downloadCoverImageContext(ctx context.Context, coverUR
 	if err != nil {
 		return "", err
 	}
-	resp, err := s.httpClient.Do(req)
+	httpClient := s.httpClient
+	if httpClient == nil {
+		httpClient = newHTTPClient(60 * time.Second)
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -1286,7 +1325,13 @@ func (s *SpotiDownloader) downloadCoverImageContext(ctx context.Context, coverUR
 
 	_ = outputDir
 
-	out, err := CreateRunTemp("spotidownloader-cover-*.jpg")
+	if strings.TrimSpace(outputDir) == "" {
+		return "", fmt.Errorf("cover output directory is empty")
+	}
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return "", err
+	}
+	out, err := os.CreateTemp(outputDir, "spotidownloader-cover-*.jpg")
 	if err != nil {
 		return "", err
 	}
