@@ -1,12 +1,78 @@
 package backend
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"os/exec"
 )
+
+func TestEmbedMetadataContextMP3VerificationCancellation(t *testing.T) {
+	installFakeFFmpegRuntime(t)
+	marker := filepath.Join(t.TempDir(), "ffprobe-started")
+	t.Setenv("SPOTI_FAKE_FFPROBE_MARKER", marker)
+
+	filePath := filepath.Join(t.TempDir(), "track.mp3")
+	if err := os.WriteFile(filePath, []byte("audio"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		doneErr := verifyEmbeddedMetadataContext(ctx, filePath, Metadata{Title: "title"})
+		done <- doneErr
+	}()
+	if err := waitForFile(marker, time.Second); err != nil {
+		cancel()
+		t.Fatal("metadata verification helper did not start:", err)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("metadata verification cancellation error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("metadata verification ignored cancellation")
+	}
+}
+
+func TestEmbedLyricsOnlyContextM4ACancellation(t *testing.T) {
+	installFakeFFmpegRuntime(t)
+	marker := filepath.Join(t.TempDir(), "lyrics-started")
+	t.Setenv(testHelperMarker, marker)
+
+	filePath := filepath.Join(t.TempDir(), "track.m4a")
+	if err := os.WriteFile(filePath, []byte("audio"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		err := EmbedLyricsOnlyContext(ctx, filePath, "[00:00.00]test")
+		done <- err
+	}()
+	if err := waitForFile(marker, time.Second); err != nil {
+		cancel()
+		t.Fatal("lyrics helper did not start:", err)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("lyrics cancellation error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lyrics embedding ignored cancellation")
+	}
+	if _, err := os.Stat(filePath + ".tmp.m4a"); !os.IsNotExist(err) {
+		t.Fatalf("canceled lyrics embedding left temp output: %v", err)
+	}
+}
 
 func TestPromoteMP3TagTempFileReplacesOriginal(t *testing.T) {
 	dir := t.TempDir()

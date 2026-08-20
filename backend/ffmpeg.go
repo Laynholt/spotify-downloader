@@ -71,6 +71,8 @@ type ffmpegRelease struct {
 	Assets  []GitHubReleaseAsset `json:"assets"`
 }
 
+var ffmpegHTTPClientFactory = newHTTPClient
+
 func GetFFmpegDir() (string, error) {
 	paths, err := CurrentRuntimePaths()
 	if err != nil {
@@ -108,17 +110,40 @@ func GetFFprobePath() (string, error) {
 }
 
 func IsFFprobeInstalled() (bool, error) {
+	return IsFFprobeInstalledContext(context.Background())
+}
+
+func IsFFprobeInstalledContext(ctx context.Context) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	ffprobePath, err := GetFFprobePath()
 	if err != nil {
-		return false, nil
+		return false, err
 	}
 
-	cmd := newManagedCommand(context.Background(), ffprobePath, "-version")
+	cmd := newManagedCommand(ctx, ffprobePath, "-version")
 	err = cmd.Run()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, ctxErr
+	}
 	return err == nil, nil
 }
 
 func IsFFmpegInstalled() (bool, error) {
+	return IsFFmpegInstalledContext(context.Background())
+}
+
+func IsFFmpegInstalledContext(ctx context.Context) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	ffmpegPath, err := GetFFmpegPath()
 	if err != nil {
 		return false, err
@@ -128,12 +153,25 @@ func IsFFmpegInstalled() (bool, error) {
 		return false, nil
 	}
 
-	cmd := newManagedCommand(context.Background(), ffmpegPath, "-version")
+	cmd := newManagedCommand(ctx, ffmpegPath, "-version")
 	err = cmd.Run()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, ctxErr
+	}
 	return err == nil, nil
 }
 
 func DownloadFFmpeg(progressCallback func(int)) error {
+	return DownloadFFmpegContext(context.Background(), progressCallback)
+}
+
+func DownloadFFmpegContext(ctx context.Context, progressCallback func(int)) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	SetDownloadProgress(0)
 	SetDownloadSpeed(0)
@@ -150,29 +188,35 @@ func DownloadFFmpeg(progressCallback func(int)) error {
 	}
 
 	if runtime.GOOS == "darwin" {
-		ffmpegInstalled, _ := IsFFmpegInstalled()
-		ffprobeInstalled, _ := IsFFprobeInstalled()
+		ffmpegInstalled, err := IsFFmpegInstalledContext(ctx)
+		if err != nil {
+			return err
+		}
+		ffprobeInstalled, err := IsFFprobeInstalledContext(ctx)
+		if err != nil {
+			return err
+		}
 
 		if !ffmpegInstalled && !ffprobeInstalled {
-			if err := downloadAndExtract(evermeetFFmpegReleaseURL, ffmpegDir, progressCallback, 0, 50); err != nil {
+			if err := downloadAndExtractContext(ctx, evermeetFFmpegReleaseURL, ffmpegDir, progressCallback, 0, 50); err != nil {
 				return err
 			}
-			if err := downloadAndExtract(evermeetFFprobeReleaseURL, ffmpegDir, progressCallback, 50, 100); err != nil {
+			if err := downloadAndExtractContext(ctx, evermeetFFprobeReleaseURL, ffmpegDir, progressCallback, 50, 100); err != nil {
 				return err
 			}
 		} else if !ffmpegInstalled {
-			if err := downloadAndExtract(evermeetFFmpegReleaseURL, ffmpegDir, progressCallback, 0, 100); err != nil {
+			if err := downloadAndExtractContext(ctx, evermeetFFmpegReleaseURL, ffmpegDir, progressCallback, 0, 100); err != nil {
 				return err
 			}
 		} else if !ffprobeInstalled {
-			if err := downloadAndExtract(evermeetFFprobeReleaseURL, ffmpegDir, progressCallback, 0, 100); err != nil {
+			if err := downloadAndExtractContext(ctx, evermeetFFprobeReleaseURL, ffmpegDir, progressCallback, 0, 100); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 
-	release, err := fetchLatestFFmpegRelease()
+	release, err := fetchLatestFFmpegReleaseContext(ctx)
 	if err != nil {
 		return err
 	}
@@ -184,14 +228,14 @@ func DownloadFFmpeg(progressCallback func(int)) error {
 	if !ok {
 		return fmt.Errorf("ffmpeg release does not include checksums.sha256")
 	}
-	expectedHash, err := fetchReleaseAssetChecksum(asset.Name, checksumAsset)
+	expectedHash, err := fetchReleaseAssetChecksumContext(ctx, asset.Name, checksumAsset)
 	if err != nil {
 		return err
 	}
 
 	fmt.Printf("[FFmpeg] Downloading from: %s\n", asset.BrowserDownloadURL)
 
-	if err := downloadAndExtractVerified(asset.BrowserDownloadURL, expectedHash, ffmpegDir, progressCallback, 0, 100); err != nil {
+	if err := downloadAndExtractVerifiedContext(ctx, asset.BrowserDownloadURL, expectedHash, ffmpegDir, progressCallback, 0, 100); err != nil {
 		return err
 	}
 
@@ -244,18 +288,44 @@ func SelectFFmpegAsset(goos, goarch string, assets []GitHubReleaseAsset) (GitHub
 }
 
 func fetchLatestFFmpegRelease() (ffmpegRelease, error) {
-	client := newHTTPClient(30 * time.Second)
-	resp, err := client.Get(ffmpegBtbNLatestReleaseURL)
+	return fetchLatestFFmpegReleaseContext(context.Background())
+}
+
+func fetchLatestFFmpegReleaseContext(ctx context.Context) (ffmpegRelease, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return ffmpegRelease{}, err
+	}
+	client := ffmpegHTTPClientFactory(30 * time.Second)
+	req, err := newHTTPRequestWithContext(ctx, http.MethodGet, ffmpegBtbNLatestReleaseURL, nil)
 	if err != nil {
+		return ffmpegRelease{}, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ffmpegRelease{}, ctxErr
+		}
 		return ffmpegRelease{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ffmpegRelease{}, ctxErr
+		}
 		return ffmpegRelease{}, fmt.Errorf("GitHub returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	var release ffmpegRelease
 	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ffmpegRelease{}, ctxErr
+		}
+		return ffmpegRelease{}, err
+	}
+	if err := ctx.Err(); err != nil {
 		return ffmpegRelease{}, err
 	}
 	if len(release.Assets) == 0 {
@@ -265,20 +335,47 @@ func fetchLatestFFmpegRelease() (ffmpegRelease, error) {
 }
 
 func fetchReleaseAssetChecksum(assetName string, checksumAsset GitHubReleaseAsset) (string, error) {
+	return fetchReleaseAssetChecksumContext(context.Background(), assetName, checksumAsset)
+}
+
+func fetchReleaseAssetChecksumContext(ctx context.Context, assetName string, checksumAsset GitHubReleaseAsset) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if err := validateGitHubReleaseDownloadURL(checksumAsset.BrowserDownloadURL); err != nil {
 		return "", err
 	}
-	resp, err := newHTTPClient(30 * time.Second).Get(checksumAsset.BrowserDownloadURL)
+	client := ffmpegHTTPClientFactory(30 * time.Second)
+	req, err := newHTTPRequestWithContext(ctx, http.MethodGet, checksumAsset.BrowserDownloadURL, nil)
 	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		return "", fmt.Errorf("failed to download ffmpeg checksums: HTTP %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
 		return "", err
 	}
 	expectedHash := parseSHA256Sums(body)[assetName]
@@ -303,10 +400,24 @@ func downloadWithFallback(urls []string, destDir string, progressCallback func(i
 }
 
 func downloadAndExtract(url, destDir string, progressCallback func(int), progressStart, progressEnd int) error {
-	return downloadAndExtractVerified(url, "", destDir, progressCallback, progressStart, progressEnd)
+	return downloadAndExtractContext(context.Background(), url, destDir, progressCallback, progressStart, progressEnd)
 }
 
 func downloadAndExtractVerified(rawURL, expectedSHA256, destDir string, progressCallback func(int), progressStart, progressEnd int) error {
+	return downloadAndExtractVerifiedContext(context.Background(), rawURL, expectedSHA256, destDir, progressCallback, progressStart, progressEnd)
+}
+
+func downloadAndExtractContext(ctx context.Context, rawURL, destDir string, progressCallback func(int), progressStart, progressEnd int) error {
+	return downloadAndExtractVerifiedContext(ctx, rawURL, "", destDir, progressCallback, progressStart, progressEnd)
+}
+
+func downloadAndExtractVerifiedContext(ctx context.Context, rawURL, expectedSHA256, destDir string, progressCallback func(int), progressStart, progressEnd int) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	tmpFile, err := CreateRunTemp("ffmpeg-*")
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %w", err)
@@ -314,11 +425,11 @@ func downloadAndExtractVerified(rawURL, expectedSHA256, destDir string, progress
 	defer os.Remove(tmpFile.Name())
 	defer tmpFile.Close()
 
-	client := newHTTPClient(0)
+	client := ffmpegHTTPClientFactory(0)
 	if err := validateFFmpegDownloadURL(rawURL); err != nil {
 		return err
 	}
-	req, err := http.NewRequest("GET", rawURL, nil)
+	req, err := newHTTPRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
@@ -326,11 +437,17 @@ func downloadAndExtractVerified(rawURL, expectedSHA256, destDir string, progress
 
 	resp, err := client.Do(req)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return fmt.Errorf("failed to download: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return fmt.Errorf("failed to download: HTTP %d", resp.StatusCode)
 	}
 
@@ -349,6 +466,9 @@ func downloadAndExtractVerified(rawURL, expectedSHA256, destDir string, progress
 	buf := make([]byte, 32*1024)
 	hasher := sha256.New()
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
 			_, writeErr := tmpFile.Write(buf[:n])
@@ -404,11 +524,17 @@ func downloadAndExtractVerified(rawURL, expectedSHA256, destDir string, progress
 			break
 		}
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			return fmt.Errorf("failed to read response: %w", err)
 		}
 	}
 
 	tmpFile.Close()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if expectedSHA256 != "" && !strings.EqualFold(expectedSHA256, hex.EncodeToString(hasher.Sum(nil))) {
 		return fmt.Errorf("ffmpeg checksum mismatch")
 	}
@@ -622,7 +748,7 @@ func ConvertAudioContext(ctx context.Context, req ConvertAudioRequest) ([]Conver
 		return nil, fmt.Errorf("failed to get ffmpeg path: %w", err)
 	}
 
-	installed, err := IsFFmpegInstalled()
+	installed, err := IsFFmpegInstalledContext(ctx)
 	if err != nil || !installed {
 		return nil, fmt.Errorf("ffmpeg is not installed")
 	}
@@ -743,6 +869,8 @@ func ConvertAudioContext(ctx context.Context, req ConvertAudioRequest) ([]Conver
 			if err != nil {
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					result.Error = ctxErr.Error()
+					os.Remove(inputFile)
+					os.Remove(outputFile)
 				} else {
 					result.Error = fmt.Sprintf("conversion failed: %s - %s", err.Error(), string(output))
 				}
@@ -759,6 +887,8 @@ func ConvertAudioContext(ctx context.Context, req ConvertAudioRequest) ([]Conver
 
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				result.Error = ctxErr.Error()
+				os.Remove(inputFile)
+				os.Remove(outputFile)
 				mu.Lock()
 				results[idx] = result
 				mu.Unlock()
@@ -769,13 +899,38 @@ func ConvertAudioContext(ctx context.Context, req ConvertAudioRequest) ([]Conver
 			}
 
 			if err := EmbedMetadataContext(ctx, outputFile, inputMetadata, coverArtPath); err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					result.Error = ctxErr.Error()
+					result.Success = false
+					mu.Lock()
+					results[idx] = result
+					mu.Unlock()
+					os.Remove(inputFile)
+					os.Remove(outputFile)
+					if coverArtPath != "" {
+						os.Remove(coverArtPath)
+					}
+					return
+				}
 				fmt.Printf("[FFmpeg] Warning: Failed to embed metadata: %v\n", err)
 			} else {
 				fmt.Printf("[FFmpeg] Metadata embedded successfully\n")
 			}
 
 			if lyrics != "" {
-				if err := EmbedLyricsOnly(outputFile, lyrics); err != nil {
+				if err := EmbedLyricsOnlyContext(ctx, outputFile, lyrics); err != nil {
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						result.Error = ctxErr.Error()
+						result.Success = false
+						mu.Lock()
+						results[idx] = result
+						mu.Unlock()
+						if coverArtPath != "" {
+							os.Remove(coverArtPath)
+						}
+						os.Remove(outputFile)
+						return
+					}
 					fmt.Printf("[FFmpeg] Warning: Failed to embed lyrics: %v\n", err)
 				} else {
 					fmt.Printf("[FFmpeg] Lyrics embedded successfully\n")
@@ -797,6 +952,13 @@ func ConvertAudioContext(ctx context.Context, req ConvertAudioRequest) ([]Conver
 
 	wg.Wait()
 	if err := ctx.Err(); err != nil {
+		for _, inputFile := range req.InputFiles {
+			_ = os.Remove(inputFile)
+			inputExt := strings.ToLower(filepath.Ext(inputFile))
+			baseName := strings.TrimSuffix(filepath.Base(inputFile), inputExt)
+			outputFile := filepath.Join(filepath.Dir(inputFile), strings.ToUpper(req.OutputFormat), baseName+"."+strings.ToLower(req.OutputFormat))
+			_ = os.Remove(outputFile)
+		}
 		return results, err
 	}
 	return results, nil

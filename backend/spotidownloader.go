@@ -617,7 +617,7 @@ func convertDownloadedAudioContext(ctx context.Context, inputPath, outputBasePat
 		return inputPath, nil
 	}
 
-	ffmpegInstalled, err := IsFFmpegInstalled()
+	ffmpegInstalled, err := IsFFmpegInstalledContext(ctx)
 	if err != nil || !ffmpegInstalled {
 		if err != nil {
 			return "", fmt.Errorf("downloaded format mismatch (%s -> %s), and ffmpeg is unavailable: %w", currentExt, desiredExt, err)
@@ -632,6 +632,13 @@ func convertDownloadedAudioContext(ctx context.Context, inputPath, outputBasePat
 
 	outputPath := outputBasePath + desiredExt
 	tempOutputPath := outputBasePath + ".convert" + desiredExt
+	defer func() {
+		if ctx.Err() != nil {
+			_ = os.Remove(inputPath)
+			_ = os.Remove(tempOutputPath)
+			_ = os.Remove(outputPath)
+		}
+	}()
 	_ = os.Remove(tempOutputPath)
 
 	args := []string{
@@ -689,6 +696,10 @@ func convertDownloadedAudioContext(ctx context.Context, inputPath, outputBasePat
 	if err := MoveFileWithFallback(tempOutputPath, outputPath); err != nil {
 		_ = os.Remove(tempOutputPath)
 		return "", fmt.Errorf("failed to finalize converted file: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		_ = os.Remove(outputPath)
+		return "", err
 	}
 
 	return outputPath, nil
@@ -937,6 +948,9 @@ func (s *SpotiDownloader) downloadFileContext(ctx context.Context, downloadURL, 
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		err := statusError(resp.StatusCode, body)
 		if isSessionTokenError(err) {
 			return "", err
@@ -960,7 +974,7 @@ func (s *SpotiDownloader) downloadFileContext(ctx context.Context, downloadURL, 
 	}
 	defer func() {
 		_ = out.Close()
-		if err != nil {
+		if err != nil || ctx.Err() != nil {
 			_ = os.Remove(outputPath)
 		}
 	}()
@@ -968,6 +982,14 @@ func (s *SpotiDownloader) downloadFileContext(ctx context.Context, downloadURL, 
 	progressWriter := NewProgressWriter(out)
 
 	_, err = io.Copy(progressWriter, reader)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", ctxErr
+	}
 
 	if err == nil {
 		mbDownloaded := float64(progressWriter.GetTotal()) / (1024 * 1024)
@@ -1087,6 +1109,17 @@ func (s *SpotiDownloader) DownloadTrackContext(
 	}
 
 	var outputPath string
+	var coverPath string
+	defer func() {
+		if ctx.Err() != nil {
+			if outputPath != "" {
+				_ = os.Remove(outputPath)
+			}
+			if coverPath != "" {
+				_ = os.Remove(coverPath)
+			}
+		}
+	}()
 	var downloadCompleted bool
 	for attempt := 0; attempt < 2; attempt++ {
 		downloadURL, fileExt, err := resolveDownloadTarget()
@@ -1145,7 +1178,6 @@ func (s *SpotiDownloader) DownloadTrackContext(
 		return "", fmt.Errorf("failed to download file: retry limit reached")
 	}
 
-	var coverPath string
 	if coverURL != "" {
 		var coverErr error
 		coverPath, coverErr = s.downloadCoverImageContext(ctx, coverURL, outputDir, embedMaxQualityCover)
@@ -1215,7 +1247,7 @@ func (s *SpotiDownloader) downloadCoverImage(coverURL, outputDir string, embedMa
 	return s.downloadCoverImageContext(context.Background(), coverURL, outputDir, embedMaxQualityCover)
 }
 
-func (s *SpotiDownloader) downloadCoverImageContext(ctx context.Context, coverURL, outputDir string, embedMaxQualityCover bool) (string, error) {
+func (s *SpotiDownloader) downloadCoverImageContext(ctx context.Context, coverURL, outputDir string, embedMaxQualityCover bool) (coverPath string, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1241,6 +1273,9 @@ func (s *SpotiDownloader) downloadCoverImageContext(ctx context.Context, coverUR
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		return "", fmt.Errorf("failed to download cover: status %d", resp.StatusCode)
 	}
 
@@ -1250,7 +1285,12 @@ func (s *SpotiDownloader) downloadCoverImageContext(ctx context.Context, coverUR
 	if err != nil {
 		return "", err
 	}
-	defer out.Close()
+	defer func() {
+		_ = out.Close()
+		if err != nil || ctx.Err() != nil {
+			_ = os.Remove(out.Name())
+		}
+	}()
 
 	_, err = io.Copy(out, resp.Body)
 	if err != nil {
@@ -1258,6 +1298,9 @@ func (s *SpotiDownloader) downloadCoverImageContext(ctx context.Context, coverUR
 			return "", ctxErr
 		}
 		return "", err
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", ctxErr
 	}
 
 	return out.Name(), nil

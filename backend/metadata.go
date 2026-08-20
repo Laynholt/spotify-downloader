@@ -54,7 +54,7 @@ func EmbedMetadataContext(ctx context.Context, filePath string, metadata Metadat
 	case ".flac":
 		err = embedFlacMetadata(filePath, metadata, coverPath)
 	case ".mp3":
-		err = embedMp3Metadata(filePath, metadata, coverPath)
+		err = embedMp3MetadataContext(ctx, filePath, metadata, coverPath)
 	case ".m4a":
 		err = embedMetadataToM4AContext(ctx, filePath, metadata, coverPath)
 	default:
@@ -165,6 +165,16 @@ func embedFlacMetadata(filePath string, metadata Metadata, coverPath string) err
 }
 
 func embedMp3Metadata(filePath string, metadata Metadata, coverPath string) error {
+	return embedMp3MetadataContext(context.Background(), filePath, metadata, coverPath)
+}
+
+func embedMp3MetadataContext(ctx context.Context, filePath string, metadata Metadata, coverPath string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	tag, err := openMP3TagForWrite(filePath)
 	if err != nil {
 		return err
@@ -247,18 +257,27 @@ func embedMp3Metadata(filePath string, metadata Metadata, coverPath string) erro
 	}
 
 	if err := saveMP3Tag(tag, filePath); err != nil {
-		if fallbackErr := embedMetadataToMP3WithFFmpeg(filePath, metadata, coverPath); fallbackErr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if fallbackErr := embedMetadataToMP3WithFFmpegContext(ctx, filePath, metadata, coverPath); fallbackErr != nil {
 			return fmt.Errorf("failed to save MP3 tags: %w; ffmpeg fallback failed: %v", err, fallbackErr)
 		}
 		return nil
 	}
 
-	if err := verifyEmbeddedMetadata(filePath, metadata); err != nil {
-		if fallbackErr := embedMetadataToMP3WithFFmpeg(filePath, metadata, coverPath); fallbackErr != nil {
+	if err := verifyEmbeddedMetadataContext(ctx, filePath, metadata); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if fallbackErr := embedMetadataToMP3WithFFmpegContext(ctx, filePath, metadata, coverPath); fallbackErr != nil {
 			return fmt.Errorf("mp3 tags verification failed: %w; ffmpeg fallback failed: %v", err, fallbackErr)
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -363,8 +382,21 @@ func FinalizeTaggedAudioFile(filePath string) error {
 }
 
 func verifyEmbeddedMetadata(filePath string, metadata Metadata) error {
-	actual, err := ExtractFullMetadataFromFile(filePath)
+	return verifyEmbeddedMetadataContext(context.Background(), filePath, metadata)
+}
+
+func verifyEmbeddedMetadataContext(ctx context.Context, filePath string, metadata Metadata) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	actual, err := ExtractFullMetadataFromFileContext(ctx, filePath)
 	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 
@@ -385,6 +417,16 @@ func verifyEmbeddedMetadata(filePath string, metadata Metadata) error {
 }
 
 func embedMetadataToMP3WithFFmpeg(filePath string, metadata Metadata, coverPath string) error {
+	return embedMetadataToMP3WithFFmpegContext(context.Background(), filePath, metadata, coverPath)
+}
+
+func embedMetadataToMP3WithFFmpegContext(ctx context.Context, filePath string, metadata Metadata, coverPath string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	ffmpegPath, err := GetFFmpegPath()
 	if err != nil {
 		return fmt.Errorf("ffmpeg not found: %w", err)
@@ -468,18 +510,24 @@ func embedMetadataToMP3WithFFmpeg(filePath string, metadata Metadata, coverPath 
 
 	args = append(args, tmpOutputFile)
 
-	cmd := newManagedCommand(context.Background(), ffmpegPath, args...)
+	cmd := newManagedCommand(ctx, ffmpegPath, args...)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return fmt.Errorf("ffmpeg failed to embed mp3 metadata: %s - %w", string(output), err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	if err := replaceFileWithTemp(tmpOutputFile, filePath); err != nil {
 		return fmt.Errorf("failed to replace original MP3 file: %w", err)
 	}
 
-	return verifyEmbeddedMetadata(filePath, metadata)
+	return verifyEmbeddedMetadataContext(ctx, filePath, metadata)
 }
 
 func saveMP3Tag(tag *id3v2.Tag, filePath string) error {
@@ -510,12 +558,25 @@ func saveMP3Tag(tag *id3v2.Tag, filePath string) error {
 }
 
 func EmbedLyricsOnly(filepath string, lyrics string) error {
+	return EmbedLyricsOnlyContext(context.Background(), filepath, lyrics)
+}
+
+func EmbedLyricsOnlyContext(ctx context.Context, filepath string, lyrics string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if lyrics == "" {
 		return nil
 	}
 
-	validatedLyrics, err := validateLyricsDuration(lyrics, filepath)
+	validatedLyrics, err := validateLyricsDurationContext(ctx, lyrics, filepath)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		fmt.Printf("[EmbedLyricsOnly] Warning: Failed to validate lyrics duration: %v, using original lyrics\n", err)
 		validatedLyrics = lyrics
 	}
@@ -524,14 +585,18 @@ func EmbedLyricsOnly(filepath string, lyrics string) error {
 	ext := strings.ToLower(pathfilepath.Ext(filepath))
 	switch ext {
 	case ".flac":
-		return embedLyricsToFlac(filepath, lyrics)
+		err = embedLyricsToFlac(filepath, lyrics)
 	case ".mp3":
-		return embedLyricsToMp3(filepath, lyrics)
+		err = embedLyricsToMp3(filepath, lyrics)
 	case ".m4a":
-		return embedLyricsToM4A(filepath, lyrics)
+		err = embedLyricsToM4AContext(ctx, filepath, lyrics)
 	default:
-		return fmt.Errorf("unsupported file format for lyrics embedding: %s", ext)
+		err = fmt.Errorf("unsupported file format for lyrics embedding: %s", ext)
 	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	return err
 }
 
 func embedLyricsToFlac(filepath string, lyrics string) error {
@@ -608,6 +673,16 @@ func embedLyricsToMp3(filepath string, lyrics string) error {
 }
 
 func embedLyricsToM4A(filepath string, lyrics string) error {
+	return embedLyricsToM4AContext(context.Background(), filepath, lyrics)
+}
+
+func embedLyricsToM4AContext(ctx context.Context, filepath string, lyrics string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	ffmpegPath, err := GetFFmpegPath()
 	if err != nil {
@@ -622,7 +697,7 @@ func embedLyricsToM4A(filepath string, lyrics string) error {
 		}
 	}()
 
-	cmd := newManagedCommand(context.Background(), ffmpegPath,
+	cmd := newManagedCommand(ctx, ffmpegPath,
 		"-i", filepath,
 		"-map", "0",
 		"-map_metadata", "0",
@@ -636,8 +711,14 @@ func embedLyricsToM4A(filepath string, lyrics string) error {
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		fmt.Printf("[FFmpeg] Error embedding lyrics to M4A: %s\n", string(output))
 		return fmt.Errorf("ffmpeg failed to embed lyrics: %s - %w", string(output), err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	if err := replaceFileWithTemp(tmpOutputFile, filepath); err != nil {
@@ -916,9 +997,22 @@ func getDurationWithFFprobeContext(ctx context.Context, filepath string) (float6
 }
 
 func validateLyricsDuration(lyrics string, filepath string) (string, error) {
+	return validateLyricsDurationContext(context.Background(), lyrics, filepath)
+}
 
-	duration, err := GetAudioDuration(filepath)
+func validateLyricsDurationContext(ctx context.Context, lyrics string, filepath string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
+	duration, err := GetAudioDurationContext(ctx, filepath)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 
 		fmt.Printf("[ValidateLyrics] Warning: Could not get audio duration: %v, skipping validation\n", err)
 		return lyrics, nil
@@ -936,6 +1030,9 @@ func validateLyricsDuration(lyrics string, filepath string) (string, error) {
 	var validLines []string
 
 	for _, line := range lines {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		trimmedLine := strings.TrimSpace(line)
 		if trimmedLine == "" {
 			validLines = append(validLines, line)

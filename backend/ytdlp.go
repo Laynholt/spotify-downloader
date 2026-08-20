@@ -22,6 +22,8 @@ const (
 	ytDlpUpdateCheckTTL      = 24 * time.Hour
 )
 
+var ytDlpHTTPClientFactory = newHTTPClient
+
 type GitHubReleaseAsset struct {
 	Name               string `json:"name"`
 	BrowserDownloadURL string `json:"browser_download_url"`
@@ -138,6 +140,16 @@ func recordYtDlpReleaseCheck(markerPath string, checkedAt time.Time) error {
 }
 
 func CheckYtDlpInstalled() (YtDlpStatus, error) {
+	return CheckYtDlpInstalledContext(context.Background())
+}
+
+func CheckYtDlpInstalledContext(ctx context.Context) (YtDlpStatus, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return YtDlpStatus{Installed: false, Error: err.Error()}, err
+	}
 	path, err := GetYtDlpPath()
 	if err != nil {
 		return YtDlpStatus{Installed: false, Error: err.Error()}, err
@@ -152,11 +164,17 @@ func CheckYtDlpInstalled() (YtDlpStatus, error) {
 		return status, nil
 	}
 
-	cmd := newManagedCommand(context.Background(), path, "--version")
+	cmd := newManagedCommand(ctx, path, "--version")
 	output, err := cmd.Output()
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return status, ctxErr
+		}
 		status.Error = err.Error()
 		return status, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return status, err
 	}
 
 	status.Installed = true
@@ -165,14 +183,36 @@ func CheckYtDlpInstalled() (YtDlpStatus, error) {
 }
 
 func EnsureYtDlpInstalledOrUpdated() (YtDlpStatus, error) {
-	current, _ := CheckYtDlpInstalled()
+	return EnsureYtDlpInstalledOrUpdatedContext(context.Background())
+}
+
+func EnsureYtDlpInstalledOrUpdatedContext(ctx context.Context) (YtDlpStatus, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return YtDlpStatus{Error: err.Error()}, err
+	}
+	current, checkErr := CheckYtDlpInstalledContext(ctx)
+	if checkErr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return current, ctxErr
+		}
+	}
 	checkedAt := time.Now()
 	markerPath, markerErr := getYtDlpUpdateCheckPath()
 	if markerErr == nil && shouldSkipYtDlpReleaseCheck(current, markerPath, checkedAt) {
 		return current, nil
 	}
-	release, err := fetchLatestYtDlpRelease()
+	if err := ctx.Err(); err != nil {
+		return current, err
+	}
+	release, err := fetchLatestYtDlpReleaseContext(ctx)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			current.Error = ctxErr.Error()
+			return current, ctxErr
+		}
 		if current.Installed {
 			current.Warning = fmt.Sprintf("failed to check latest yt-dlp release: %v", err)
 			return current, nil
@@ -184,6 +224,9 @@ func EnsureYtDlpInstalledOrUpdated() (YtDlpStatus, error) {
 		if err := recordYtDlpReleaseCheck(markerPath, checkedAt); err != nil {
 			current.Warning = fmt.Sprintf("failed to record yt-dlp update check: %v", err)
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return current, err
 	}
 
 	current.Latest = strings.TrimPrefix(release.TagName, "v")
@@ -202,8 +245,12 @@ func EnsureYtDlpInstalledOrUpdated() (YtDlpStatus, error) {
 		return current, err
 	}
 
-	path, err := downloadYtDlpAsset(asset, release.Assets)
+	path, err := downloadYtDlpAssetContext(ctx, asset, release.Assets)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			current.Error = ctxErr.Error()
+			return current, ctxErr
+		}
 		if current.Installed {
 			current.Warning = fmt.Sprintf("failed to update yt-dlp: %v", err)
 			return current, nil
@@ -212,7 +259,7 @@ func EnsureYtDlpInstalledOrUpdated() (YtDlpStatus, error) {
 		return current, err
 	}
 
-	updated, checkErr := CheckYtDlpInstalled()
+	updated, checkErr := CheckYtDlpInstalledContext(ctx)
 	updated.Path = path
 	updated.Latest = current.Latest
 	updated.Updated = true
@@ -240,7 +287,7 @@ func DownloadWithYtDlpContext(ctx context.Context, req YtDlpDownloadRequest) YtD
 		return YtDlpDownloadResult{Error: "output base is required"}
 	}
 
-	status, err := EnsureYtDlpInstalledOrUpdated()
+	status, err := EnsureYtDlpInstalledOrUpdatedContext(ctx)
 	if err != nil {
 		return YtDlpDownloadResult{Error: err.Error()}
 	}
@@ -289,20 +336,46 @@ func DownloadWithYtDlpContext(ctx context.Context, req YtDlpDownloadRequest) YtD
 }
 
 func fetchLatestYtDlpRelease() (ytDlpRelease, error) {
-	client := newHTTPClient(30 * time.Second)
-	resp, err := client.Get(ytDlpLatestReleaseURL)
+	return fetchLatestYtDlpReleaseContext(context.Background())
+}
+
+func fetchLatestYtDlpReleaseContext(ctx context.Context) (ytDlpRelease, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return ytDlpRelease{}, err
+	}
+	client := ytDlpHTTPClientFactory(30 * time.Second)
+	req, err := newHTTPRequestWithContext(ctx, http.MethodGet, ytDlpLatestReleaseURL, nil)
 	if err != nil {
+		return ytDlpRelease{}, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ytDlpRelease{}, ctxErr
+		}
 		return ytDlpRelease{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ytDlpRelease{}, ctxErr
+		}
 		return ytDlpRelease{}, fmt.Errorf("GitHub returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	var release ytDlpRelease
 	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ytDlpRelease{}, ctxErr
+		}
+		return ytDlpRelease{}, err
+	}
+	if err := ctx.Err(); err != nil {
 		return ytDlpRelease{}, err
 	}
 	if strings.TrimSpace(release.TagName) == "" {
@@ -312,7 +385,17 @@ func fetchLatestYtDlpRelease() (ytDlpRelease, error) {
 }
 
 func downloadYtDlpAsset(asset GitHubReleaseAsset, releaseAssets []GitHubReleaseAsset) (string, error) {
-	path, err := GetYtDlpPath()
+	return downloadYtDlpAssetContext(context.Background(), asset, releaseAssets)
+}
+
+func downloadYtDlpAssetContext(ctx context.Context, asset GitHubReleaseAsset, releaseAssets []GitHubReleaseAsset) (path string, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	path, err = GetYtDlpPath()
 	if err != nil {
 		return "", err
 	}
@@ -323,18 +406,34 @@ func downloadYtDlpAsset(asset GitHubReleaseAsset, releaseAssets []GitHubReleaseA
 		return "", err
 	}
 
-	resp, err := newHTTPClient(5 * time.Minute).Get(asset.BrowserDownloadURL)
+	client := ytDlpHTTPClientFactory(5 * time.Minute)
+	req, err := newHTTPRequestWithContext(ctx, http.MethodGet, asset.BrowserDownloadURL, nil)
 	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		return "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		return "", fmt.Errorf("failed to download yt-dlp: HTTP %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	tmpPath := path + ".tmp"
+	defer func() {
+		if err != nil || ctx.Err() != nil {
+			_ = os.Remove(tmpPath)
+		}
+	}()
 	out, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
 	if err != nil {
 		return "", err
@@ -346,6 +445,9 @@ func downloadYtDlpAsset(asset GitHubReleaseAsset, releaseAssets []GitHubReleaseA
 	}
 	closeErr := out.Close()
 	if copyErr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		_ = os.Remove(tmpPath)
 		return "", copyErr
 	}
@@ -353,8 +455,11 @@ func downloadYtDlpAsset(asset GitHubReleaseAsset, releaseAssets []GitHubReleaseA
 		_ = os.Remove(tmpPath)
 		return "", closeErr
 	}
-	if err := verifyDownloadedAssetChecksum(asset.Name, hex.EncodeToString(hasher.Sum(nil)), releaseAssets); err != nil {
+	if err := verifyDownloadedAssetChecksumContext(ctx, asset.Name, hex.EncodeToString(hasher.Sum(nil)), releaseAssets); err != nil {
 		_ = os.Remove(tmpPath)
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
 		return "", err
 	}
 	if runtime.GOOS != "windows" {
@@ -379,6 +484,16 @@ func validateGitHubReleaseDownloadURL(rawURL string) error {
 }
 
 func verifyDownloadedAssetChecksum(assetName, actualHash string, releaseAssets []GitHubReleaseAsset) error {
+	return verifyDownloadedAssetChecksumContext(context.Background(), assetName, actualHash, releaseAssets)
+}
+
+func verifyDownloadedAssetChecksumContext(ctx context.Context, assetName, actualHash string, releaseAssets []GitHubReleaseAsset) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	checksumAsset, ok := findReleaseAsset("SHA2-256SUMS", releaseAssets)
 	if !ok {
 		return fmt.Errorf("yt-dlp release does not include SHA2-256SUMS")
@@ -386,17 +501,34 @@ func verifyDownloadedAssetChecksum(assetName, actualHash string, releaseAssets [
 	if err := validateGitHubReleaseDownloadURL(checksumAsset.BrowserDownloadURL); err != nil {
 		return err
 	}
-	resp, err := newHTTPClient(30 * time.Second).Get(checksumAsset.BrowserDownloadURL)
+	client := ytDlpHTTPClientFactory(30 * time.Second)
+	req, err := newHTTPRequestWithContext(ctx, http.MethodGet, checksumAsset.BrowserDownloadURL, nil)
 	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return fmt.Errorf("failed to download yt-dlp checksums: HTTP %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	expectedHash := parseSHA256Sums(body)[assetName]

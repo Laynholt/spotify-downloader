@@ -1,11 +1,117 @@
 package backend
 
 import (
+	"context"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestDownloadYtDlpAssetContextCancellationRemovesTemp(t *testing.T) {
+	paths := installRuntimePathsForCancellationTest(t)
+	started := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		_, _ = io.WriteString(w, "partial yt-dlp")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	previousFactory := ytDlpHTTPClientFactory
+	t.Cleanup(func() { ytDlpHTTPClientFactory = previousFactory })
+	ytDlpHTTPClientFactory = func(timeout time.Duration) *http.Client {
+		return &http.Client{Timeout: timeout, Transport: rewriteRoundTripper{base: server.URL}}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := downloadYtDlpAssetContext(ctx, GitHubReleaseAsset{
+			Name:               "yt-dlp",
+			BrowserDownloadURL: "https://github.com/example/yt-dlp",
+		}, nil)
+		done <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("yt-dlp asset request did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("yt-dlp cancellation error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("yt-dlp asset request ignored cancellation")
+	}
+	if _, err := os.Stat(filepath.Join(paths.BinDir, "yt-dlp.tmp")); !os.IsNotExist(err) {
+		t.Fatalf("partial yt-dlp temp file remains: %v", err)
+	}
+}
+
+func TestDownloadWithYtDlpContextFirstInstallCancellation(t *testing.T) {
+	installRuntimePathsForCancellationTest(t)
+	started := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	previousFactory := ytDlpHTTPClientFactory
+	t.Cleanup(func() { ytDlpHTTPClientFactory = previousFactory })
+	ytDlpHTTPClientFactory = func(timeout time.Duration) *http.Client {
+		return &http.Client{Timeout: timeout, Transport: rewriteRoundTripper{base: server.URL}}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan YtDlpDownloadResult, 1)
+	go func() {
+		done <- DownloadWithYtDlpContext(ctx, YtDlpDownloadRequest{
+			Query:       "https://example.invalid/track",
+			OutputBase:  filepath.Join(t.TempDir(), "track"),
+			AudioFormat: "mp3",
+		})
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("yt-dlp first-install release request did not start")
+	}
+	cancel()
+	select {
+	case result := <-done:
+		if result.Error != context.Canceled.Error() {
+			t.Fatalf("yt-dlp cancellation result = %#v, want context.Canceled", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("yt-dlp first-install cancellation ignored")
+	}
+}
+
+type rewriteRoundTripper struct{ base string }
+
+func (rt rewriteRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	clone := req.Clone(req.Context())
+	base, err := url.Parse(rt.base)
+	if err != nil {
+		return nil, err
+	}
+	clone.URL.Scheme = base.Scheme
+	clone.URL.Host = base.Host
+	return http.DefaultTransport.RoundTrip(clone)
+}
 
 func TestSelectYtDlpAssetForWindows(t *testing.T) {
 	assets := []GitHubReleaseAsset{
