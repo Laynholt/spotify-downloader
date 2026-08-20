@@ -1,11 +1,9 @@
 package backend
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -86,8 +84,8 @@ func FetchSessionTokenWithParamsContext(ctx context.Context, timeout int, retry 
 			args = append(args, "--browser-path", browserPath)
 		}
 
-		cmd := newTokenCmd(exePath, args...)
-		output, err := tokenCommandOutputContext(ctx, cmd)
+		cmd := newManagedCommand(ctx, exePath, args...)
+		output, err := cmd.CombinedOutput()
 		outputStr := strings.TrimSpace(string(output))
 
 		if err != nil {
@@ -144,34 +142,5 @@ func waitTokenRetryContext(ctx context.Context, delay time.Duration) error {
 		return ctx.Err()
 	case <-timer.C:
 		return nil
-	}
-}
-
-func tokenCommandOutputContext(ctx context.Context, cmd *exec.Cmd) ([]byte, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	var output bytes.Buffer
-	cmd.Stdout = &output
-	cmd.Stderr = &output
-	if err := cmd.Start(); err != nil {
-		return output.Bytes(), err
-	}
-	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Wait()
-	}()
-	select {
-	case err := <-done:
-		return output.Bytes(), err
-	case <-ctx.Done():
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		<-done
-		return output.Bytes(), ctx.Err()
 	}
 }
