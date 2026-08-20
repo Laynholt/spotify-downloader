@@ -1,7 +1,7 @@
 import { FetchSessionTokenWithParams } from "../../wailsjs/go/main/App";
 import { getSettings, isLikelySessionToken, MIN_TOKEN_TIMEOUT } from "./settings";
 import { logger } from "./logger";
-let isFetchingToken = false;
+let tokenFetchPromise: Promise<string> | null = null;
 let lastFetchTime = 0;
 let cachedSessionToken = "";
 let cachedSessionTokenExpiry = 0;
@@ -18,39 +18,48 @@ export async function ensureValidToken(forceRefresh: boolean = false): Promise<s
         logger.debug("session token: using cached token");
         return cachedSessionToken;
     }
-    if (isFetchingToken) {
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        return ensureValidToken(forceRefresh);
+    if (tokenFetchPromise) {
+        return tokenFetchPromise;
     }
     const now = Date.now();
     if (now - lastFetchTime < 2000) {
         await new Promise(resolve => setTimeout(resolve, 2000 - (now - lastFetchTime)));
     }
-    isFetchingToken = true;
-    lastFetchTime = Date.now();
-    try {
-        const timeout = Math.max(settings.tokenTimeout || MIN_TOKEN_TIMEOUT, MIN_TOKEN_TIMEOUT);
-        const retry = Math.max(settings.tokenRetry ?? 0, 0);
-        logger.info(`session token: fetching with browser window (timeout ${timeout}s, retry ${retry})`);
-        const response = await FetchSessionTokenWithParams(timeout, retry);
-        if (!isLikelySessionToken(response.token)) {
-            throw new Error("Session token fetch returned an empty or invalid token");
-        }
-        cachedSessionToken = response.token;
-        cachedSessionTokenExpiry = response.expires_at;
-        logger.success("session token: fetched successfully");
-        return response.token;
+    if (tokenFetchPromise) {
+        return tokenFetchPromise;
     }
-    catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        if (errorMessage.includes("CHROME_NOT_INSTALLED")) {
-            const message = errorMessage.replace("CHROME_NOT_INSTALLED: ", "");
-            window.dispatchEvent(new CustomEvent("chromeNotInstalled", { detail: { message } }));
-            throw new ChromeNotInstalledError(message);
+    lastFetchTime = Date.now();
+    const fetchPromise = (async () => {
+        try {
+            const timeout = Math.max(settings.tokenTimeout || MIN_TOKEN_TIMEOUT, MIN_TOKEN_TIMEOUT);
+            const retry = Math.max(settings.tokenRetry ?? 0, 0);
+            logger.info(`session token: fetching with browser window (timeout ${timeout}s, retry ${retry})`);
+            const response = await FetchSessionTokenWithParams(timeout, retry);
+            if (!isLikelySessionToken(response.token)) {
+                throw new Error("Session token fetch returned an empty or invalid token");
+            }
+            cachedSessionToken = response.token;
+            cachedSessionTokenExpiry = response.expires_at;
+            logger.success("session token: fetched successfully");
+            return response.token;
         }
-        throw error;
+        catch (error) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            if (errorMessage.includes("CHROME_NOT_INSTALLED")) {
+                const message = errorMessage.replace("CHROME_NOT_INSTALLED: ", "");
+                window.dispatchEvent(new CustomEvent("chromeNotInstalled", { detail: { message } }));
+                throw new ChromeNotInstalledError(message);
+            }
+            throw error;
+        }
+    })();
+    tokenFetchPromise = fetchPromise;
+    try {
+        return await fetchPromise;
     }
     finally {
-        isFetchingToken = false;
+        if (tokenFetchPromise === fetchPromise) {
+            tokenFetchPromise = null;
+        }
     }
 }
