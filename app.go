@@ -9,6 +9,7 @@ import (
 
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/afkarxyz/SpotiDownloader/backend"
@@ -19,6 +20,7 @@ type App struct {
 	ctx            context.Context
 	runtimePaths   backend.RuntimePaths
 	runtimeInitErr error
+	metadataCache  *backend.MetadataCache
 }
 
 const inlineLyricsWaitTimeout = 3 * time.Second
@@ -41,13 +43,43 @@ func (a *App) startup(ctx context.Context) {
 		return
 	}
 
+	var cacheReady atomic.Bool
+	cache, cacheWarnings := backend.OpenMetadataCache(a.runtimePaths.MetadataCacheFile, backend.CacheOptions{
+		MaxEntries: 5000,
+		WriteDelay: 100 * time.Millisecond,
+		OnWarning: func(message string) {
+			if cacheReady.Load() {
+				fmt.Printf("Metadata cache warning: %s\n", message)
+			}
+		},
+	})
+	cacheReady.Store(true)
+	for _, warning := range cacheWarnings {
+		fmt.Printf("Metadata cache warning: %s\n", warning)
+	}
+	if active := backend.InstallMetadataCache(cache); active != cache {
+		_ = cache.Close()
+		cache = active
+	}
+	a.metadataCache = cache
+
 	if err := backend.InitHistoryDB("SpotiDownloader"); err != nil {
 		fmt.Printf("Failed to init history DB: %v\n", err)
 	}
 }
 
 func (a *App) shutdown(ctx context.Context) {
+	if a.metadataCache != nil {
+		if err := a.metadataCache.Close(); err != nil {
+			fmt.Printf("Metadata cache close warning: %v\n", err)
+		}
+	}
 	backend.CloseHistoryDB()
+	if a.runtimeInitErr == nil {
+		if err := a.runtimePaths.CleanupRun(); err != nil {
+			fmt.Printf("Runtime cleanup warning: %v\n", err)
+		}
+	}
 }
 
 func (a *App) embedLyrics(filename, lyrics string) {
