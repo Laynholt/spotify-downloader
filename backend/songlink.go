@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 
 type SongLinkClient struct {
 	client           *http.Client
+	minCallDelay     time.Duration
 	lastAPICallTime  time.Time
 	apiCallCount     int
 	apiCallResetTime time.Time
@@ -50,11 +52,19 @@ type TrackAvailability struct {
 func NewSongLinkClient() *SongLinkClient {
 	return &SongLinkClient{
 		client:           newHTTPClient(30 * time.Second),
+		minCallDelay:     songLinkMinCallDelay,
 		apiCallResetTime: time.Now(),
 	}
 }
 
 func (s *SongLinkClient) waitForRequestSlot() {
+	s.waitForRequestSlotContext(context.Background())
+}
+
+func (s *SongLinkClient) waitForRequestSlotContext(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	now := time.Now()
 	if now.Sub(s.apiCallResetTime) >= time.Minute {
 		s.apiCallCount = 0
@@ -65,7 +75,13 @@ func (s *SongLinkClient) waitForRequestSlot() {
 		waitTime := time.Minute - now.Sub(s.apiCallResetTime)
 		if waitTime > 0 {
 			fmt.Printf("Rate limit reached, waiting %v...\n", waitTime.Round(time.Second))
-			time.Sleep(waitTime)
+			timer := time.NewTimer(waitTime)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
 			now = time.Now()
 		}
 		s.apiCallCount = 0
@@ -74,16 +90,36 @@ func (s *SongLinkClient) waitForRequestSlot() {
 
 	if !s.lastAPICallTime.IsZero() {
 		timeSinceLastCall := now.Sub(s.lastAPICallTime)
-		if timeSinceLastCall < songLinkMinCallDelay {
-			waitTime := songLinkMinCallDelay - timeSinceLastCall
+		minCallDelay := s.minCallDelay
+		if minCallDelay <= 0 {
+			minCallDelay = songLinkMinCallDelay
+		}
+		if timeSinceLastCall < minCallDelay {
+			waitTime := minCallDelay - timeSinceLastCall
 			fmt.Printf("Rate limiting: waiting %v...\n", waitTime.Round(time.Second))
-			time.Sleep(waitTime)
+			timer := time.NewTimer(waitTime)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
 		}
 	}
 }
 
 func (s *SongLinkClient) getLinksResponse(spotifyTrackID, region, action string) (*songLinkLinksResponse, error) {
-	s.waitForRequestSlot()
+	return s.getLinksResponseContext(context.Background(), spotifyTrackID, region, action)
+}
+
+func (s *SongLinkClient) getLinksResponseContext(ctx context.Context, spotifyTrackID, region, action string) (*songLinkLinksResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.waitForRequestSlotContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	spotifyBase, _ := base64.StdEncoding.DecodeString("aHR0cHM6Ly9vcGVuLnNwb3RpZnkuY29tL3RyYWNrLw==")
 	spotifyURL := fmt.Sprintf("%s%s", string(spotifyBase), spotifyTrackID)
@@ -94,7 +130,7 @@ func (s *SongLinkClient) getLinksResponse(spotifyTrackID, region, action string)
 		apiURL += fmt.Sprintf("&userCountry=%s", region)
 	}
 
-	req, err := http.NewRequest("GET", apiURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -102,34 +138,40 @@ func (s *SongLinkClient) getLinksResponse(spotifyTrackID, region, action string)
 	fmt.Println(action)
 
 	var resp *http.Response
-	err = RetryWithBackoff(songLinkMaxRetries, songLinkRetryDelay, songLinkRetryDelay, func(int) error {
-		var reqErr error
-		resp, reqErr = s.client.Do(req)
-		if reqErr != nil {
-			return reqErr
+	var lastErr error
+	for attempt, delay := 1, songLinkRetryDelay; attempt <= songLinkMaxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-
-		s.lastAPICallTime = time.Now()
-		s.apiCallCount++
-
-		if resp.StatusCode == http.StatusTooManyRequests {
-			resp.Body.Close()
-			resp = nil
-			fmt.Printf("Rate limited by API, waiting %v before retry...\n", songLinkRetryDelay)
-			return fmt.Errorf("song.link API rate limited request")
-		}
-
-		if resp.StatusCode != http.StatusOK {
+		resp, err = s.client.Do(req)
+		if err == nil {
+			s.lastAPICallTime = time.Now()
+			s.apiCallCount++
+			if resp.StatusCode == http.StatusOK {
+				break
+			}
 			statusCode := resp.StatusCode
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			resp = nil
-			return fmt.Errorf("API returned status %d", statusCode)
+			if statusCode == http.StatusTooManyRequests {
+				fmt.Printf("Rate limited by API, waiting %v before retry...\n", songLinkRetryDelay)
+				lastErr = fmt.Errorf("song.link API rate limited request")
+			} else {
+				lastErr = fmt.Errorf("API returned status %d", statusCode)
+			}
+		} else {
+			lastErr = err
 		}
-
-		return nil
-	})
-	if err != nil {
-		return nil, err
+		if attempt == songLinkMaxRetries {
+			return nil, lastErr
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
 	}
 	defer resp.Body.Close()
 
@@ -251,7 +293,14 @@ func checkQobuzAvailability(isrc string) bool {
 }
 
 func (s *SongLinkClient) GetDeezerURLFromSpotify(spotifyTrackID string) (string, error) {
-	songLinkResp, err := s.getLinksResponse(spotifyTrackID, "", "Getting Deezer URL from song.link...")
+	return s.GetDeezerURLFromSpotifyContext(context.Background(), spotifyTrackID)
+}
+
+func (s *SongLinkClient) GetDeezerURLFromSpotifyContext(ctx context.Context, spotifyTrackID string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	songLinkResp, err := s.getLinksResponseContext(ctx, spotifyTrackID, "", "Getting Deezer URL from song.link...")
 	if err != nil {
 		return "", fmt.Errorf("failed to get Deezer URL: %w", err)
 	}
@@ -267,6 +316,13 @@ func (s *SongLinkClient) GetDeezerURLFromSpotify(spotifyTrackID string) (string,
 }
 
 func getDeezerISRC(deezerURL string) (string, error) {
+	return getDeezerISRCContext(context.Background(), deezerURL)
+}
+
+func getDeezerISRCContext(ctx context.Context, deezerURL string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	trackID := parseDeezerTrackID(deezerURL)
 	if trackID == "" {
 		return "", fmt.Errorf("could not extract track ID from Deezer URL: %s", deezerURL)
@@ -274,8 +330,12 @@ func getDeezerISRC(deezerURL string) (string, error) {
 
 	apiURL := fmt.Sprintf("https://api.deezer.com/track/%s", trackID)
 
-	client := newHTTPClient(10 * time.Second)
-	resp, err := client.Get(apiURL)
+	client := metadataHTTPClientFactory(10 * time.Second)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create Deezer API request: %w", err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to call Deezer API: %w", err)
 	}
@@ -315,13 +375,24 @@ func parseDeezerTrackID(deezerURL string) string {
 }
 
 func getDeezerGenreByID(genreID int64) (string, error) {
+	return getDeezerGenreByIDContext(context.Background(), genreID)
+}
+
+func getDeezerGenreByIDContext(ctx context.Context, genreID int64) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if genreID <= 0 {
 		return "", fmt.Errorf("invalid Deezer genre ID: %d", genreID)
 	}
 
 	apiURL := fmt.Sprintf("https://api.deezer.com/genre/%d", genreID)
-	client := newHTTPClient(10 * time.Second)
-	resp, err := client.Get(apiURL)
+	client := metadataHTTPClientFactory(10 * time.Second)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create Deezer genre API request: %w", err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to call Deezer genre API: %w", err)
 	}
@@ -346,14 +417,25 @@ func getDeezerGenreByID(genreID int64) (string, error) {
 }
 
 func getDeezerGenreFromTrackURL(deezerURL string) (string, error) {
+	return getDeezerGenreFromTrackURLContext(context.Background(), deezerURL)
+}
+
+func getDeezerGenreFromTrackURLContext(ctx context.Context, deezerURL string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	trackID := parseDeezerTrackID(deezerURL)
 	if trackID == "" {
 		return "", fmt.Errorf("could not extract track ID from Deezer URL: %s", deezerURL)
 	}
 
 	apiURL := fmt.Sprintf("https://api.deezer.com/track/%s", trackID)
-	client := newHTTPClient(10 * time.Second)
-	resp, err := client.Get(apiURL)
+	client := metadataHTTPClientFactory(10 * time.Second)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create Deezer track API request: %w", err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to call Deezer track API: %w", err)
 	}
@@ -376,41 +458,44 @@ func getDeezerGenreFromTrackURL(deezerURL string) (string, error) {
 	}
 
 	if deezerTrack.GenreID > 0 {
-		if genre, err := getDeezerGenreByID(deezerTrack.GenreID); err == nil && genre != "" {
+		if genre, err := getDeezerGenreByIDContext(ctx, deezerTrack.GenreID); err == nil && genre != "" {
 			return genre, nil
 		}
 	}
 
 	if deezerTrack.Album.GenreID > 0 {
-		if genre, err := getDeezerGenreByID(deezerTrack.Album.GenreID); err == nil && genre != "" {
+		if genre, err := getDeezerGenreByIDContext(ctx, deezerTrack.Album.GenreID); err == nil && genre != "" {
 			return genre, nil
 		}
 	}
 
 	if deezerTrack.Album.ID > 0 {
 		albumURL := fmt.Sprintf("https://api.deezer.com/album/%d", deezerTrack.Album.ID)
-		albumResp, err := client.Get(albumURL)
-		if err == nil {
-			defer albumResp.Body.Close()
-			if albumResp.StatusCode == 200 {
-				var deezerAlbum struct {
-					GenreID int64 `json:"genre_id"`
-					Genres  struct {
-						Data []struct {
-							Name string `json:"name"`
-						} `json:"data"`
-					} `json:"genres"`
-				}
-				if json.NewDecoder(albumResp.Body).Decode(&deezerAlbum) == nil {
-					for _, g := range deezerAlbum.Genres.Data {
-						name := strings.TrimSpace(g.Name)
-						if name != "" {
-							return name, nil
-						}
+		albumReq, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, albumURL, nil)
+		if reqErr == nil {
+			albumResp, err := client.Do(albumReq)
+			if err == nil {
+				defer albumResp.Body.Close()
+				if albumResp.StatusCode == 200 {
+					var deezerAlbum struct {
+						GenreID int64 `json:"genre_id"`
+						Genres  struct {
+							Data []struct {
+								Name string `json:"name"`
+							} `json:"data"`
+						} `json:"genres"`
 					}
-					if deezerAlbum.GenreID > 0 {
-						if genre, err := getDeezerGenreByID(deezerAlbum.GenreID); err == nil && genre != "" {
-							return genre, nil
+					if json.NewDecoder(albumResp.Body).Decode(&deezerAlbum) == nil {
+						for _, g := range deezerAlbum.Genres.Data {
+							name := strings.TrimSpace(g.Name)
+							if name != "" {
+								return name, nil
+							}
+						}
+						if deezerAlbum.GenreID > 0 {
+							if genre, err := getDeezerGenreByIDContext(ctx, deezerAlbum.GenreID); err == nil && genre != "" {
+								return genre, nil
+							}
 						}
 					}
 				}
@@ -422,17 +507,31 @@ func getDeezerGenreFromTrackURL(deezerURL string) (string, error) {
 }
 
 func (s *SongLinkClient) GetGenre(spotifyID string) (string, error) {
-	deezerURL, err := s.GetDeezerURLFromSpotify(spotifyID)
+	return s.GetGenreContext(context.Background(), spotifyID)
+}
+
+func (s *SongLinkClient) GetGenreContext(ctx context.Context, spotifyID string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	deezerURL, err := s.GetDeezerURLFromSpotifyContext(ctx, spotifyID)
 	if err != nil {
 		return "", err
 	}
-	return getDeezerGenreFromTrackURL(deezerURL)
+	return getDeezerGenreFromTrackURLContext(ctx, deezerURL)
 }
 
 func (s *SongLinkClient) GetISRC(spotifyID string) (string, error) {
-	deezerURL, err := s.GetDeezerURLFromSpotify(spotifyID)
+	return s.GetISRCContext(context.Background(), spotifyID)
+}
+
+func (s *SongLinkClient) GetISRCContext(ctx context.Context, spotifyID string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	deezerURL, err := s.GetDeezerURLFromSpotifyContext(ctx, spotifyID)
 	if err != nil {
 		return "", err
 	}
-	return getDeezerISRC(deezerURL)
+	return getDeezerISRCContext(ctx, deezerURL)
 }

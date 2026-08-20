@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -130,7 +131,13 @@ func UpdateTrackMetadata(req TrackMetadataUpdateRequest) TrackMetadataUpdateResu
 
 	metadata := BuildTrackMetadataPayload(req)
 	if req.EmbedGenre || metadata.Date == "" {
-		tagging := <-fetchTaggingMetadataInBackground(req.TrackID, req.TrackName, req.ArtistName, req.AlbumName, req.ReleaseDate, req.UseSingleGenre, req.EmbedGenre)
+		tagging, warnings := fetchTaggingMetadata(context.Background(), CurrentMetadataCache(), TaggingMetadataRequest{
+			TrackID: req.TrackID, TrackName: req.TrackName, ArtistName: req.ArtistName, AlbumName: req.AlbumName,
+			ReleaseDate: req.ReleaseDate, UseSingleGenre: req.UseSingleGenre, EmbedGenre: req.EmbedGenre,
+		})
+		for _, warning := range warnings {
+			fmt.Printf("Warning: %s\n", warning)
+		}
 		if metadata.Date == "" {
 			metadata.Date = strings.TrimSpace(tagging.ReleaseDate)
 		}

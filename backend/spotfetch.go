@@ -2,6 +2,7 @@ package backend
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -58,12 +59,19 @@ func (c *SpotifyClient) generateTOTP() (string, int, error) {
 }
 
 func (c *SpotifyClient) getAccessToken() error {
+	return c.getAccessTokenContext(context.Background())
+}
+
+func (c *SpotifyClient) getAccessTokenContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	totpCode, version, err := c.generateTOTP()
 	if err != nil {
 		return err
 	}
 
-	req, err := http.NewRequest("GET", "https://open.spotify.com/api/token", nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://open.spotify.com/api/token", nil)
 	if err != nil {
 		return err
 	}
@@ -108,7 +116,14 @@ func (c *SpotifyClient) getAccessToken() error {
 }
 
 func (c *SpotifyClient) getSessionInfo() error {
-	req, err := http.NewRequest("GET", "https://open.spotify.com", nil)
+	return c.getSessionInfoContext(context.Background())
+}
+
+func (c *SpotifyClient) getSessionInfoContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://open.spotify.com", nil)
 	if err != nil {
 		return err
 	}
@@ -157,11 +172,18 @@ func (c *SpotifyClient) getSessionInfo() error {
 }
 
 func (c *SpotifyClient) getClientToken() error {
+	return c.getClientTokenContext(context.Background())
+}
+
+func (c *SpotifyClient) getClientTokenContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if c.clientID == "" || c.deviceID == "" || c.clientVersion == "" {
-		if err := c.getSessionInfo(); err != nil {
+		if err := c.getSessionInfoContext(ctx); err != nil {
 			return err
 		}
-		if err := c.getAccessToken(); err != nil {
+		if err := c.getAccessTokenContext(ctx); err != nil {
 			return err
 		}
 	}
@@ -186,7 +208,7 @@ func (c *SpotifyClient) getClientToken() error {
 		return err
 	}
 
-	req, err := http.NewRequest("POST", "https://clienttoken.spotify.com/v1/clienttoken", bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://clienttoken.spotify.com/v1/clienttoken", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return err
 	}
@@ -222,18 +244,32 @@ func (c *SpotifyClient) getClientToken() error {
 }
 
 func (c *SpotifyClient) Initialize() error {
-	if err := c.getSessionInfo(); err != nil {
+	return c.InitializeContext(context.Background())
+}
+
+func (c *SpotifyClient) InitializeContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := c.getSessionInfoContext(ctx); err != nil {
 		return err
 	}
-	if err := c.getAccessToken(); err != nil {
+	if err := c.getAccessTokenContext(ctx); err != nil {
 		return err
 	}
-	return c.getClientToken()
+	return c.getClientTokenContext(ctx)
 }
 
 func (c *SpotifyClient) Query(payload map[string]interface{}) (map[string]interface{}, error) {
+	return c.QueryContext(context.Background(), payload)
+}
+
+func (c *SpotifyClient) QueryContext(ctx context.Context, payload map[string]interface{}) (map[string]interface{}, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if c.accessToken == "" || c.clientToken == "" {
-		if err := c.Initialize(); err != nil {
+		if err := c.InitializeContext(ctx); err != nil {
 			return nil, err
 		}
 	}
@@ -243,7 +279,7 @@ func (c *SpotifyClient) Query(payload map[string]interface{}) (map[string]interf
 		return nil, err
 	}
 
-	req, err := http.NewRequest("POST", "https://api-partner.spotify.com/pathfinder/v2/query", bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://api-partner.spotify.com/pathfinder/v2/query", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, err
 	}

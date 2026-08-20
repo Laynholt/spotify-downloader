@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -26,11 +27,45 @@ const (
 	networkRetryAttempts = 3
 	networkRetryDelay    = 750 * time.Millisecond
 	networkRetryMaxDelay = 3 * time.Second
+	trackMetadataTTL     = 7 * 24 * time.Hour
+	artistGenreTTL       = 30 * 24 * time.Hour
 )
 
+func spotifyCacheKey(trackID string) string      { return "spotify:" + trackID }
+func isrcCacheKey(trackID string) string         { return "isrc:" + trackID }
+func chosicTrackCacheKey(trackID string) string  { return "chosic-track:" + trackID }
+func artistGenreCacheKey(artistID string) string { return "genre:" + artistID }
+
+func trimGenreList(genres []string) []string {
+	trimmed := make([]string, 0, len(genres))
+	seen := make(map[string]struct{}, len(genres))
+	for _, genre := range genres {
+		genre = strings.TrimSpace(genre)
+		if genre == "" {
+			continue
+		}
+		key := strings.ToLower(genre)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		trimmed = append(trimmed, genre)
+	}
+	return trimmed
+}
+
+func cachedMetadataLookup[T any](ctx context.Context, cache *MetadataCache, key string, ttl time.Duration, cacheable func(T) bool, load func(context.Context) (T, error)) (T, CacheOutcome, error) {
+	if cache == nil {
+		value, err := load(ctx)
+		return value, CacheMiss, err
+	}
+	return CachedLookup(ctx, cache, key, ttl, cacheable, load)
+}
+
 type SpotiDownloader struct {
-	sessionToken string
-	httpClient   *http.Client
+	sessionToken  string
+	httpClient    *http.Client
+	metadataCache *MetadataCache
 }
 
 type sessionTokenError struct {
@@ -81,6 +116,34 @@ type taggingMetadataResult struct {
 	Genre       string
 }
 
+type TaggingMetadataRequest struct {
+	TrackID        string
+	TrackName      string
+	ArtistName     string
+	AlbumName      string
+	ReleaseDate    string
+	UseSingleGenre bool
+	EmbedGenre     bool
+}
+
+type cachedISRCMetadata struct {
+	ISRC    string
+	Genre   string
+	Warning string
+}
+
+var (
+	metadataHTTPClientFactory = func(timeout time.Duration) *http.Client {
+		return newHTTPClient(timeout)
+	}
+	metadataSongLinkClientFactory = func() *SongLinkClient {
+		return NewSongLinkClient()
+	}
+	metadataChosicClientFactory = func() (*chosicClient, error) {
+		return newChosicClient()
+	}
+)
+
 func NewSpotiDownloader(sessionToken string) *SpotiDownloader {
 	preferredToken := getPreferredSessionToken(sessionToken)
 	if preferredToken != "" {
@@ -88,8 +151,9 @@ func NewSpotiDownloader(sessionToken string) *SpotiDownloader {
 	}
 
 	return &SpotiDownloader{
-		sessionToken: preferredToken,
-		httpClient:   newHTTPClient(60 * time.Second),
+		sessionToken:  preferredToken,
+		httpClient:    newHTTPClient(60 * time.Second),
+		metadataCache: CurrentMetadataCache(),
 	}
 }
 
@@ -153,107 +217,163 @@ func (s *SpotiDownloader) doRequestWithNetworkRetry(req *http.Request) (*http.Re
 	return resp, nil
 }
 
+func fetchTaggingMetadata(ctx context.Context, cache *MetadataCache, req TaggingMetadataRequest) (taggingMetadataResult, []string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	result := taggingMetadataResult{ReleaseDate: strings.TrimSpace(req.ReleaseDate)}
+	trackID := strings.TrimSpace(req.TrackID)
+	if trackID == "" {
+		return result, nil
+	}
+	req.TrackID = trackID
+
+	warnings := make([]string, 0, 4)
+	var warningMu sync.Mutex
+	addWarning := func(format string, args ...interface{}) {
+		warningMu.Lock()
+		warnings = append(warnings, fmt.Sprintf(format, args...))
+		warningMu.Unlock()
+	}
+
+	var wg sync.WaitGroup
+	var resultMu sync.Mutex
+	var musicBrainzGenre string
+	var fallbackGenre string
+
+	if result.ReleaseDate == "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			releaseDate, err := fetchTrackTaggingMetadataContext(ctx, cache, req.TrackID)
+			if err != nil {
+				addWarning("Spotify metadata lookup failed: %v", err)
+				return
+			}
+			if releaseDate != "" {
+				resultMu.Lock()
+				result.ReleaseDate = strings.TrimSpace(releaseDate)
+				resultMu.Unlock()
+			}
+		}()
+	}
+
+	if req.EmbedGenre {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cached, _, err := cachedMetadataLookup(ctx, cache, isrcCacheKey(req.TrackID), trackMetadataTTL,
+				func(value cachedISRCMetadata) bool {
+					return strings.TrimSpace(value.ISRC) != "" && strings.TrimSpace(value.Genre) != ""
+				},
+				func(loadCtx context.Context) (cachedISRCMetadata, error) {
+					client := metadataSongLinkClientFactory()
+					isrc, lookupErr := client.GetISRCContext(loadCtx, req.TrackID)
+					isrc = strings.TrimSpace(isrc)
+					if lookupErr != nil || isrc == "" {
+						if lookupErr == nil {
+							lookupErr = fmt.Errorf("empty ISRC")
+						}
+						return cachedISRCMetadata{}, lookupErr
+					}
+
+					meta, musicBrainzErr := FetchMusicBrainzMetadataContext(loadCtx, isrc, req.TrackName, req.ArtistName, req.AlbumName, req.UseSingleGenre, req.EmbedGenre)
+					if musicBrainzErr != nil {
+						return cachedISRCMetadata{ISRC: isrc, Warning: musicBrainzErr.Error()}, nil
+					}
+					return cachedISRCMetadata{ISRC: isrc, Genre: strings.TrimSpace(meta.Genre)}, nil
+				})
+			if err != nil {
+				addWarning("ISRC/MusicBrainz lookup failed: %v", err)
+				return
+			}
+			resultMu.Lock()
+			result.ISRC = strings.TrimSpace(cached.ISRC)
+			musicBrainzGenre = strings.TrimSpace(cached.Genre)
+			resultMu.Unlock()
+			if strings.TrimSpace(cached.Warning) != "" {
+				addWarning("MusicBrainz lookup failed: %s", strings.TrimSpace(cached.Warning))
+			}
+		}()
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			artistID, _, err := cachedMetadataLookup(ctx, cache, chosicTrackCacheKey(req.TrackID), trackMetadataTTL,
+				func(value string) bool { return strings.TrimSpace(value) != "" },
+				func(loadCtx context.Context) (string, error) {
+					client, clientErr := metadataChosicClientFactory()
+					if clientErr != nil {
+						return "", clientErr
+					}
+					return client.fetchArtistIDContext(loadCtx, req.TrackID)
+				})
+			if err != nil {
+				addWarning("Chosic track lookup failed: %v", err)
+				return
+			}
+			artistID = strings.TrimSpace(artistID)
+			if artistID == "" {
+				return
+			}
+
+			genres, _, err := cachedMetadataLookup(ctx, cache, artistGenreCacheKey(artistID), artistGenreTTL,
+				func(value []string) bool { return len(trimGenreList(value)) > 0 },
+				func(loadCtx context.Context) ([]string, error) {
+					client, clientErr := metadataChosicClientFactory()
+					if clientErr != nil {
+						return nil, clientErr
+					}
+					return client.fetchArtistGenresContext(loadCtx, artistID)
+				})
+			if err == nil {
+				genres = trimGenreList(genres)
+			}
+			if err != nil || len(genres) == 0 {
+				if err != nil {
+					addWarning("Chosic artist lookup failed: %v", err)
+				}
+				if deezerGenre, deezerErr := fetchGenreFromDeezerContext(ctx, req.TrackID); deezerErr == nil {
+					resultMu.Lock()
+					fallbackGenre = strings.TrimSpace(deezerGenre)
+					resultMu.Unlock()
+				}
+				return
+			}
+
+			genre := strings.TrimSpace(genres[0])
+			if !req.UseSingleGenre {
+				genre = strings.TrimSpace(strings.Join(genres, ", "))
+			}
+			resultMu.Lock()
+			fallbackGenre = genre
+			resultMu.Unlock()
+		}()
+	}
+
+	wg.Wait()
+	resultMu.Lock()
+	if musicBrainzGenre != "" {
+		result.Genre = musicBrainzGenre
+	} else {
+		result.Genre = strings.TrimSpace(fallbackGenre)
+	}
+	resultMu.Unlock()
+	sort.Strings(warnings)
+	return result, warnings
+}
+
 func fetchTaggingMetadataInBackground(trackID, trackName, artistName, albumName, releaseDate string, useSingleGenre, embedGenre bool) <-chan taggingMetadataResult {
 	resultCh := make(chan taggingMetadataResult, 1)
-
 	go func() {
 		defer close(resultCh)
-
-		result := taggingMetadataResult{
-			ReleaseDate: strings.TrimSpace(releaseDate),
-		}
-		if strings.TrimSpace(trackID) == "" {
-			resultCh <- result
-			return
-		}
-
-		startedAt := time.Now()
-		var wg sync.WaitGroup
-		var mu sync.Mutex
-		var musicBrainzGenre string
-		var fallbackGenre string
-
-		if result.ReleaseDate == "" {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				if fetchedReleaseDate, _, _ := fetchTrackTaggingMetadata(trackID); fetchedReleaseDate != "" {
-					mu.Lock()
-					result.ReleaseDate = strings.TrimSpace(fetchedReleaseDate)
-					mu.Unlock()
-				}
-			}()
-		}
-
-		if embedGenre {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-
-				client := NewSongLinkClient()
-				isrc, err := client.GetISRC(trackID)
-				if err != nil || isrc == "" {
-					return
-				}
-
-				mu.Lock()
-				result.ISRC = isrc
-				mu.Unlock()
-
-				fmt.Println("Fetching MusicBrainz metadata...")
-				fetchedMeta, err := FetchMusicBrainzMetadata(isrc, trackName, artistName, albumName, useSingleGenre, embedGenre)
-				if err != nil {
-					fmt.Printf("Warning: Failed to fetch MusicBrainz metadata: %v\n", err)
-					return
-				}
-
-				mu.Lock()
-				musicBrainzGenre = strings.TrimSpace(fetchedMeta.Genre)
-				mu.Unlock()
-			}()
-
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-
-				if chosicGenres, err := fetchGenresFromChosic(trackID); err == nil && len(chosicGenres) > 0 {
-					genre := strings.TrimSpace(chosicGenres[0])
-					if !useSingleGenre {
-						genre = strings.TrimSpace(strings.Join(chosicGenres, ", "))
-					}
-					if genre != "" {
-						mu.Lock()
-						fallbackGenre = genre
-						mu.Unlock()
-						return
-					}
-				}
-
-				if deezerGenre, err := fetchGenreFromDeezer(trackID); err == nil && deezerGenre != "" {
-					mu.Lock()
-					fallbackGenre = strings.TrimSpace(deezerGenre)
-					mu.Unlock()
-				}
-			}()
-		}
-
-		wg.Wait()
-
-		mu.Lock()
-		if musicBrainzGenre != "" {
-			result.Genre = musicBrainzGenre
-		} else {
-			result.Genre = fallbackGenre
-		}
-		mu.Unlock()
-
-		if elapsed := time.Since(startedAt); elapsed > time.Second {
-			fmt.Printf("Tagging metadata fetched in %.1fs\n", elapsed.Seconds())
-		}
-
+		result, _ := fetchTaggingMetadata(context.Background(), CurrentMetadataCache(), TaggingMetadataRequest{
+			TrackID: trackID, TrackName: trackName, ArtistName: artistName, AlbumName: albumName,
+			ReleaseDate: releaseDate, UseSingleGenre: useSingleGenre, EmbedGenre: embedGenre,
+		})
 		resultCh <- result
 	}()
-
 	return resultCh
 }
 
@@ -775,7 +895,17 @@ func (s *SpotiDownloader) DownloadTrack(
 
 	outputDir = NormalizePath(outputDir)
 
-	metaChan := fetchTaggingMetadataInBackground(trackID, trackName, artistName, albumName, releaseDate, useSingleGenre, embedGenre)
+	metaChan := make(chan taggingMetadataResult, 1)
+	go func() {
+		result, warnings := fetchTaggingMetadata(context.Background(), s.metadataCache, TaggingMetadataRequest{
+			TrackID: trackID, TrackName: trackName, ArtistName: artistName, AlbumName: albumName,
+			ReleaseDate: releaseDate, UseSingleGenre: useSingleGenre, EmbedGenre: embedGenre,
+		})
+		for _, warning := range warnings {
+			fmt.Printf("Warning: %s\n", warning)
+		}
+		metaChan <- result
+	}()
 
 	filenameArtist := artistName
 	filenameAlbumArtist := albumArtist
@@ -941,37 +1071,48 @@ func (s *SpotiDownloader) downloadCoverImage(coverURL, outputDir string, embedMa
 }
 
 func fetchTrackTaggingMetadata(trackID string) (string, string, bool) {
-	if strings.TrimSpace(trackID) == "" {
-		return "", "", false
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
-
-	client := NewSpotifyMetadataClient()
-	data, err := client.GetFilteredData(ctx, fmt.Sprintf("https://open.spotify.com/track/%s", trackID), false, 0)
+	releaseDate, err := fetchTrackTaggingMetadataContext(ctx, CurrentMetadataCache(), trackID)
 	if err != nil {
 		return "", "", false
+	}
+	return releaseDate, "", false
+}
+
+func fetchTrackTaggingMetadataContext(ctx context.Context, cache *MetadataCache, trackID string) (string, error) {
+	if strings.TrimSpace(trackID) == "" {
+		return "", fmt.Errorf("empty track ID")
+	}
+
+	client := NewSpotifyMetadataClient()
+	data, err := client.GetFilteredDataWithCache(ctx, cache, fmt.Sprintf("https://open.spotify.com/track/%s", trackID), false, 0)
+	if err != nil {
+		return "", err
 	}
 
 	switch resp := data.(type) {
 	case TrackResponse:
-		return strings.TrimSpace(resp.Track.ReleaseDate), "", false
+		return strings.TrimSpace(resp.Track.ReleaseDate), nil
 	case *TrackResponse:
 		if resp != nil {
-			return strings.TrimSpace(resp.Track.ReleaseDate), "", false
+			return strings.TrimSpace(resp.Track.ReleaseDate), nil
 		}
 	}
 
-	return "", "", false
+	return "", fmt.Errorf("Spotify metadata response did not contain track data")
 }
 
 func fetchGenreFromDeezer(trackID string) (string, error) {
+	return fetchGenreFromDeezerContext(context.Background(), trackID)
+}
+
+func fetchGenreFromDeezerContext(ctx context.Context, trackID string) (string, error) {
 	if strings.TrimSpace(trackID) == "" {
 		return "", fmt.Errorf("empty track ID")
 	}
-	client := NewSongLinkClient()
-	genre, err := client.GetGenre(trackID)
+	client := metadataSongLinkClientFactory()
+	genre, err := client.GetGenreContext(ctx, trackID)
 	if err != nil {
 		return "", err
 	}

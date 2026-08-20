@@ -207,7 +207,11 @@ func (a *App) GetSpotifyMetadata(req SpotifyMetadataRequest) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(req.Timeout*float64(time.Second)))
 	defer cancel()
 
-	data, err := backend.GetFilteredSpotifyData(ctx, req.URL, req.Batch, time.Duration(req.Delay*float64(time.Second)))
+	cache := a.metadataCache
+	if cache == nil {
+		cache = backend.CurrentMetadataCache()
+	}
+	data, err := backend.GetFilteredSpotifyDataWithCache(ctx, cache, req.URL, req.Batch, time.Duration(req.Delay*float64(time.Second)))
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch metadata: %v", err)
 	}

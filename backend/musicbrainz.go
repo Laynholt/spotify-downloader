@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,6 +11,10 @@ import (
 )
 
 var AppVersion = "7.2.0"
+
+var musicBrainzHTTPClientFactory = func(timeout time.Duration) *http.Client {
+	return metadataHTTPClientFactory(timeout)
+}
 
 const musicBrainzAPIBase = "https://musicbrainz.org/ws/2"
 
@@ -52,13 +57,20 @@ type MusicBrainzRecordingResponse struct {
 }
 
 func FetchMusicBrainzMetadata(isrc, title, artist, album string, useSingleGenre bool, embedGenre bool) (Metadata, error) {
+	return FetchMusicBrainzMetadataContext(context.Background(), isrc, title, artist, album, useSingleGenre, embedGenre)
+}
+
+func FetchMusicBrainzMetadataContext(ctx context.Context, isrc, title, artist, album string, useSingleGenre bool, embedGenre bool) (Metadata, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var meta Metadata
 
 	if !embedGenre {
 		return meta, nil
 	}
 
-	client := newHTTPClient(10 * time.Second)
+	client := musicBrainzHTTPClientFactory(10 * time.Second)
 
 	queries := make([]string, 0, 2)
 	if strings.TrimSpace(isrc) != "" {
@@ -113,7 +125,7 @@ func FetchMusicBrainzMetadata(isrc, title, artist, album string, useSingleGenre 
 	}
 
 	for _, query := range queries {
-		mbResp, err := queryMusicBrainzRecordings(client, query)
+		mbResp, err := queryMusicBrainzRecordingsContext(ctx, client, query)
 		if err != nil {
 			continue
 		}
@@ -181,31 +193,53 @@ func escapeMusicBrainzQuery(s string) string {
 }
 
 func queryMusicBrainzRecordings(client *http.Client, query string) (*MusicBrainzRecordingResponse, error) {
+	return queryMusicBrainzRecordingsContext(context.Background(), client, query)
+}
+
+func queryMusicBrainzRecordingsContext(ctx context.Context, client *http.Client, query string) (*MusicBrainzRecordingResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	reqURL := fmt.Sprintf("%s/recording?query=%s&fmt=json&inc=releases+artist-credits+tags+media+release-groups+labels", musicBrainzAPIBase, url.QueryEscape(query))
 
-	req, err := http.NewRequest("GET", reqURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", fmt.Sprintf("SpotiDownloader/%s ( support@exyezed.cc )", AppVersion))
 
 	var resp *http.Response
-	err = RetryWithBackoff(3, 500*time.Millisecond, 2*time.Second, func(int) error {
-		var reqErr error
-		resp, reqErr = client.Do(req)
-		if reqErr != nil {
-			return reqErr
+	var lastErr error
+	for attempt, delay := 1, 500*time.Millisecond; attempt <= 3; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		if resp.StatusCode != http.StatusOK {
+		resp, lastErr = client.Do(req)
+		if lastErr == nil && resp.StatusCode == http.StatusOK {
+			break
+		}
+		if resp != nil {
 			statusCode := resp.StatusCode
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			resp = nil
-			return fmt.Errorf("MusicBrainz API returned status: %d", statusCode)
+			lastErr = fmt.Errorf("MusicBrainz API returned status: %d", statusCode)
 		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
+		if attempt == 3 {
+			return nil, lastErr
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+		if delay < 2*time.Second {
+			delay *= 2
+		}
+	}
+	if resp == nil {
+		return nil, lastErr
 	}
 	defer resp.Body.Close()
 
