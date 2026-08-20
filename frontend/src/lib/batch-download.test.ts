@@ -4,6 +4,7 @@ import {
     buildBatchDownloadWorkItems,
     isUnauthorizedDownloadError,
     reduceBatchFilePaths,
+    runWithUnauthorizedRetry,
     type BatchDownloadWorkItem,
 } from "./batch-download";
 
@@ -70,5 +71,96 @@ describe("batch download source ordering", () => {
 
     it("does not treat an ordinary download failure as unauthorized", () => {
         expect(isUnauthorizedDownloadError("network timeout")).toBe(false);
+    });
+
+    it("refreshes once when Wails rejects the first download with unauthorized", async () => {
+        const tokens: string[] = [];
+        let refreshes = 0;
+
+        const result = await runWithUnauthorizedRetry({
+            initialToken: "stale-token",
+            execute: async (token) => {
+                tokens.push(token);
+                if (tokens.length === 1) {
+                    throw new Error("401 unauthorized");
+                }
+                return { success: true, token };
+            },
+            refreshToken: async () => {
+                refreshes++;
+                return "fresh-token";
+            },
+            isUnauthorizedResult: () => false,
+        });
+
+        expect(result).toEqual({ success: true, token: "fresh-token" });
+        expect(tokens).toEqual(["stale-token", "fresh-token"]);
+        expect(refreshes).toBe(1);
+    });
+
+    it("rethrows a non-unauthorized Wails rejection without refreshing", async () => {
+        let attempts = 0;
+        let refreshes = 0;
+
+        await expect(runWithUnauthorizedRetry({
+            initialToken: "token",
+            execute: async () => {
+                attempts++;
+                throw new Error("network timeout");
+            },
+            refreshToken: async () => {
+                refreshes++;
+                return "unused";
+            },
+            isUnauthorizedResult: () => false,
+        })).rejects.toThrow("network timeout");
+
+        expect(attempts).toBe(1);
+        expect(refreshes).toBe(0);
+    });
+
+    it("does not retry a second unauthorized rejection", async () => {
+        let attempts = 0;
+        let refreshes = 0;
+
+        await expect(runWithUnauthorizedRetry({
+            initialToken: "stale-token",
+            execute: async () => {
+                attempts++;
+                throw "403 unauthorized";
+            },
+            refreshToken: async () => {
+                refreshes++;
+                return "fresh-token";
+            },
+            isUnauthorizedResult: () => false,
+        })).rejects.toBe("403 unauthorized");
+
+        expect(attempts).toBe(2);
+        expect(refreshes).toBe(1);
+    });
+
+    it("also refreshes once for a resolved unauthorized response", async () => {
+        const tokens: string[] = [];
+        let refreshes = 0;
+
+        const result = await runWithUnauthorizedRetry({
+            initialToken: "stale-token",
+            execute: async (token) => {
+                tokens.push(token);
+                return tokens.length === 1
+                    ? { success: false, error: "ERR_UNAUTHORIZED" }
+                    : { success: true, token };
+            },
+            refreshToken: async () => {
+                refreshes++;
+                return "fresh-token";
+            },
+            isUnauthorizedResult: (response) => !response.success && isUnauthorizedDownloadError(response.error),
+        });
+
+        expect(result).toEqual({ success: true, token: "fresh-token" });
+        expect(tokens).toEqual(["stale-token", "fresh-token"]);
+        expect(refreshes).toBe(1);
     });
 });

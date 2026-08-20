@@ -9,7 +9,7 @@ import { logger } from "@/lib/logger";
 import { findDuplicateTrackEntriesByTitle, logDuplicateTracks, type DuplicateTrackEntry } from "@/lib/duplicate-tracks";
 import { addBatchResult, createEmptyBatchSummary, type BatchDownloadSummary, type BatchTrackResult, type BatchTrackStatus } from "@/lib/batch-summary";
 import type { DownloadResponse, SuspiciousRedownloadRequest, SuspiciousRedownloadResult, TrackMetadata, TrackMetadataUpdateRequest, TrackMetadataUpdateResult } from "@/types/api";
-import { buildBatchDownloadWorkItems, isUnauthorizedDownloadError, reduceBatchFilePaths, type BatchDownloadWorkerResult, type BatchDownloadWorkItem } from "@/lib/batch-download";
+import { buildBatchDownloadWorkItems, isUnauthorizedDownloadError, reduceBatchFilePaths, runWithUnauthorizedRetry, type BatchDownloadWorkerResult, type BatchDownloadWorkItem } from "@/lib/batch-download";
 import { runBoundedPool, type PoolResult } from "@/lib/download-pool";
 import { formatCacheOutcomes, formatPipelineTimings } from "@/lib/download-timings";
 interface CheckFileExistenceRequest {
@@ -1087,13 +1087,16 @@ export function useDownload() {
             activeWorkers++;
             peakActive = Math.max(peakActive, activeWorkers);
             try {
-                let token = sessionToken;
-                let response = await downloadTrack(requestFor(item, token));
-                if (!response.success && isUnauthorizedDownloadError(response.error)) {
-                    token = await ensureValidToken(true);
-                    requireSessionToken(token);
-                    response = await downloadTrack(requestFor(item, token));
-                }
+                const response = await runWithUnauthorizedRetry({
+                    initialToken: sessionToken,
+                    execute: (token) => downloadTrack(requestFor(item, token)),
+                    refreshToken: async () => {
+                        const token = await ensureValidToken(true);
+                        requireSessionToken(token);
+                        return token;
+                    },
+                    isUnauthorizedResult: (result) => !result.success && isUnauthorizedDownloadError(result.error),
+                });
                 return { item, response };
             }
             finally {

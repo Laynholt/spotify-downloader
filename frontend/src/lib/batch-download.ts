@@ -17,9 +17,44 @@ export interface BatchDownloadWorkerResult {
     response: DownloadResponse;
 }
 
-export function isUnauthorizedDownloadError(error?: string): boolean {
-    const message = (error || "").toLowerCase();
+export interface UnauthorizedRetryOptions<T> {
+    initialToken: string;
+    execute: (token: string) => Promise<T>;
+    refreshToken: () => Promise<string>;
+    isUnauthorizedResult: (result: T) => boolean;
+}
+
+function downloadErrorMessage(error: unknown): string {
+    if (typeof error === "string") return error;
+    if (error instanceof Error) return error.message;
+    if (error && typeof error === "object") {
+        const candidate = error as { message?: unknown; error?: unknown };
+        if (typeof candidate.message === "string") return candidate.message;
+        if (typeof candidate.error === "string") return candidate.error;
+    }
+    return error == null ? "" : String(error);
+}
+
+export function isUnauthorizedDownloadError(error?: unknown): boolean {
+    const message = downloadErrorMessage(error).toLowerCase();
     return message.includes("unauthorized") || message.includes("403") || message.includes("401") || message.includes("err_unauthorized");
+}
+
+/** Retry one download after refreshing the token, whether Wails resolves or rejects the first unauthorized call. */
+export async function runWithUnauthorizedRetry<T>(options: UnauthorizedRetryOptions<T>): Promise<T> {
+    let firstResult: T;
+    try {
+        firstResult = await options.execute(options.initialToken);
+    }
+    catch (error) {
+        if (!isUnauthorizedDownloadError(error)) throw error;
+        const refreshedToken = await options.refreshToken();
+        return options.execute(refreshedToken);
+    }
+
+    if (!options.isUnauthorizedResult(firstResult)) return firstResult;
+    const refreshedToken = await options.refreshToken();
+    return options.execute(refreshedToken);
 }
 
 /** Build only the tracks that still need a download while retaining source indices. */
