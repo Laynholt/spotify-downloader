@@ -95,6 +95,43 @@ func TestStartingItemDoesNotResetAnother(t *testing.T) {
 	}
 }
 
+func TestQueueIDsAndAttemptsStayIsolated(t *testing.T) {
+	ClearAllDownloads()
+	t.Cleanup(ClearAllDownloads)
+
+	if err := AddQueueItem("playlist:a", "job-a-1", "Track", "Artist", "Album", "spotify-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := AddQueueItem("playlist:b", "job-b-1", "Track", "Artist", "Album", "spotify-1"); err != nil {
+		t.Fatal(err)
+	}
+	StartDownloadItem("job-a-1")
+	UpdateItemPhase("job-a-1", PhaseDownloading, "audio")
+
+	queue := GetDownloadQueue()
+	if queue.Queue[0].QueueID != "playlist:a" || queue.Queue[1].QueueID != "playlist:b" {
+		t.Fatalf("queue IDs lost: %#v", queue.Queue)
+	}
+	if queue.Queue[1].Phase != PhaseQueued {
+		t.Fatalf("second attempt mutated: %#v", queue.Queue[1])
+	}
+}
+
+func TestAddQueueItemRejectsEmptyAndDuplicateIDs(t *testing.T) {
+	ClearAllDownloads()
+	t.Cleanup(ClearAllDownloads)
+
+	if err := AddQueueItem("playlist:a", "", "Track", "Artist", "Album", "spotify-1"); err == nil {
+		t.Fatal("AddQueueItem accepted an empty job ID")
+	}
+	if err := AddQueueItem("playlist:a", "job-a-1", "Track", "Artist", "Album", "spotify-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := AddQueueItem("playlist:b", "job-a-1", "Track", "Artist", "Album", "spotify-1"); err == nil {
+		t.Fatal("AddQueueItem accepted a duplicate job ID")
+	}
+}
+
 func TestDownloadQueueAggregate(t *testing.T) {
 	resetProgressStateForTest(t)
 	defer resetProgressStateForTest(t)

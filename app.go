@@ -18,14 +18,19 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
+type activeDownload struct {
+	QueueID string
+	Context context.Context
+	Cancel  context.CancelFunc
+}
+
 type App struct {
 	ctx                    context.Context
 	runtimePaths           backend.RuntimePaths
 	runtimeInitErr         error
 	metadataCache          *backend.MetadataCache
 	activeMu               sync.Mutex
-	activeDownloads        map[string]context.CancelFunc
-	activeContexts         map[string]context.Context
+	activeDownloads        map[string]activeDownload
 	runTrackPipeline       func(context.Context, backend.TrackPipelineRequest) (backend.TrackPipelineResult, error)
 	moveSuspiciousDownload func(string, string) (string, error)
 }
@@ -123,6 +128,7 @@ type DownloadRequest struct {
 	EmbedLyrics          bool   `json:"embed_lyrics,omitempty"`
 	EmbedMaxQualityCover bool   `json:"embed_max_quality_cover,omitempty"`
 	ItemID               string `json:"item_id,omitempty"`
+	QueueID              string `json:"queue_id,omitempty"`
 	PlaylistName         string `json:"playlist_name,omitempty"`
 	PlaylistOwner        string `json:"playlist_owner,omitempty"`
 	UseFirstArtistOnly   bool   `json:"use_first_artist_only,omitempty"`
@@ -236,7 +242,7 @@ func (a *App) DownloadTrack(req DownloadRequest) (DownloadResponse, error) {
 	}
 
 	itemID := ensureDownloadQueueItem(req)
-	trackCtx, cleanup := a.beginTrack(itemID)
+	trackCtx, cleanup := a.beginTrack(itemID, req.QueueID)
 	defer cleanup()
 	backend.StartDownloadItem(itemID)
 

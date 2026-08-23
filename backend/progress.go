@@ -48,6 +48,7 @@ type PipelineTimings struct {
 
 type DownloadItem struct {
 	ID           string         `json:"id"`
+	QueueID      string         `json:"queue_id"`
 	TrackName    string         `json:"track_name"`
 	ArtistName   string         `json:"artist_name"`
 	AlbumName    string         `json:"album_name"`
@@ -68,6 +69,8 @@ type DownloadItem struct {
 	Warning         string          `json:"warning"`
 	Timings         PipelineTimings `json:"timings"`
 }
+
+const defaultDownloadQueueID = "adhoc:single"
 
 var (
 	downloadQueue     []DownloadItem
@@ -246,10 +249,24 @@ func GetCurrentItemID() string {
 	return ""
 }
 
-func AddToQueue(id, trackName, artistName, albumName, spotifyID string) {
+func AddQueueItem(queueID, id, trackName, artistName, albumName, spotifyID string) error {
 	downloadQueueLock.Lock()
+	if strings.TrimSpace(id) == "" {
+		downloadQueueLock.Unlock()
+		return fmt.Errorf("download job ID is required")
+	}
+	for _, item := range downloadQueue {
+		if item.ID == id {
+			downloadQueueLock.Unlock()
+			return fmt.Errorf("download job ID %q already exists", id)
+		}
+	}
+	if queueID == "" {
+		queueID = defaultDownloadQueueID
+	}
 	downloadQueue = append(downloadQueue, DownloadItem{
 		ID:         id,
+		QueueID:    queueID,
 		TrackName:  trackName,
 		ArtistName: artistName,
 		AlbumName:  albumName,
@@ -264,6 +281,11 @@ func AddToQueue(id, trackName, artistName, albumName, spotifyID string) {
 		sessionStartTime = time.Now().Unix()
 	}
 	sessionStartLock.Unlock()
+	return nil
+}
+
+func AddToQueue(id, trackName, artistName, albumName, spotifyID string) {
+	_ = AddQueueItem(defaultDownloadQueueID, id, trackName, artistName, albumName, spotifyID)
 }
 
 func StartDownloadItem(id string) {

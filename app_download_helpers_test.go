@@ -62,6 +62,79 @@ func TestCancelActiveDownloadsCancelsEveryTrackContext(t *testing.T) {
 	}
 }
 
+func TestCancelDownloadQueueCancelsOnlySelectedQueue(t *testing.T) {
+	backend.ClearAllDownloads()
+	t.Cleanup(backend.ClearAllDownloads)
+
+	started := make(chan struct{}, 3)
+	app := &App{
+		ctx: context.Background(),
+		runTrackPipeline: func(ctx context.Context, _ backend.TrackPipelineRequest) (backend.TrackPipelineResult, error) {
+			started <- struct{}{}
+			<-ctx.Done()
+			return backend.TrackPipelineResult{}, ctx.Err()
+		},
+	}
+
+	var wg sync.WaitGroup
+	for _, req := range []DownloadRequest{
+		{QueueID: "playlist:a", ItemID: "job-a-1", TrackID: "track-a-1", SessionToken: "session-token", TrackName: "Track A1", OutputDir: t.TempDir()},
+		{QueueID: "playlist:a", ItemID: "job-a-2", TrackID: "track-a-2", SessionToken: "session-token", TrackName: "Track A2", OutputDir: t.TempDir()},
+		{QueueID: "playlist:b", ItemID: "job-b-1", TrackID: "track-b-1", SessionToken: "session-token", TrackName: "Track B1", OutputDir: t.TempDir()},
+	} {
+		if err := backend.AddQueueItem(req.QueueID, req.ItemID, req.TrackName, req.ArtistName, req.AlbumName, req.TrackID); err != nil {
+			t.Fatal(err)
+		}
+		wg.Add(1)
+		go func(req DownloadRequest) {
+			defer wg.Done()
+			_, _ = app.DownloadTrack(req)
+		}(req)
+	}
+
+	for i := 0; i < 3; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("pipeline did not start all active jobs")
+		}
+	}
+
+	if got := app.CancelDownloadQueue("playlist:a"); got != 2 {
+		t.Fatalf("CancelDownloadQueue(playlist:a) = %d, want 2", got)
+	}
+	if got := app.CancelActiveDownloads(); got != 1 {
+		t.Fatalf("CancelActiveDownloads() = %d, want 1 remaining queue B job", got)
+	}
+	wg.Wait()
+
+	queue := backend.GetDownloadQueue()
+	if queue.CancelledCount != 3 {
+		t.Fatalf("cancelled queue items = %d, want 3", queue.CancelledCount)
+	}
+}
+
+func TestAddDownloadJobUsesProvidedIdentity(t *testing.T) {
+	backend.ClearAllDownloads()
+	t.Cleanup(backend.ClearAllDownloads)
+
+	app := &App{}
+	jobID, err := app.AddDownloadJob("playlist:a", "frontend-job-1", "spotify-1", "Track", "Artist", "Album")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobID != "frontend-job-1" {
+		t.Fatalf("AddDownloadJob returned %q, want frontend-job-1", jobID)
+	}
+	queue := backend.GetDownloadQueue()
+	if len(queue.Queue) != 1 || queue.Queue[0].ID != "frontend-job-1" || queue.Queue[0].QueueID != "playlist:a" {
+		t.Fatalf("queued job = %#v", queue.Queue)
+	}
+	if _, err := app.AddDownloadJob("playlist:b", "frontend-job-1", "spotify-1", "Track", "Artist", "Album"); err == nil {
+		t.Fatal("AddDownloadJob accepted a duplicate frontend job ID")
+	}
+}
+
 func TestDownloadCompletesAfterFinalization(t *testing.T) {
 	backend.ClearAllDownloads()
 	t.Cleanup(backend.ClearAllDownloads)
@@ -379,7 +452,7 @@ func TestCancelActiveDownloadsIsIdempotentAfterTrackCleanup(t *testing.T) {
 	backend.ClearAllDownloads()
 	t.Cleanup(backend.ClearAllDownloads)
 	app := &App{ctx: context.Background()}
-	ctx, cleanup := app.beginTrack("item-cleanup")
+	ctx, cleanup := app.beginTrack("item-cleanup", "")
 	if ctx == nil {
 		t.Fatal("beginTrack returned nil context")
 	}

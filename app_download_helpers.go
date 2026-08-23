@@ -49,6 +49,13 @@ func ensureDownloadQueueItem(req DownloadRequest) string {
 	return itemID
 }
 
+func (a *App) AddDownloadJob(queueID, jobID, spotifyID, trackName, artistName, albumName string) (string, error) {
+	if err := backend.AddQueueItem(queueID, jobID, trackName, artistName, albumName, spotifyID); err != nil {
+		return "", err
+	}
+	return jobID, nil
+}
+
 func primaryTrackID(req DownloadRequest) string {
 	if req.TrackID != "" {
 		return req.TrackID

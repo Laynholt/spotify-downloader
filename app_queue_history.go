@@ -11,7 +11,17 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
-func (a *App) beginTrack(itemID string) (context.Context, func()) {
+const defaultAppQueueID = "adhoc:single"
+
+func normalizeAppQueueID(queueID string) string {
+	if queueID == "" {
+		return defaultAppQueueID
+	}
+	return queueID
+}
+
+func (a *App) beginTrack(itemID, queueID string) (context.Context, func()) {
+	queueID = normalizeAppQueueID(queueID)
 	parent := a.ctx
 	if parent == nil {
 		parent = context.Background()
@@ -20,25 +30,25 @@ func (a *App) beginTrack(itemID string) (context.Context, func()) {
 
 	a.activeMu.Lock()
 	if a.activeDownloads == nil {
-		a.activeDownloads = make(map[string]context.CancelFunc)
+		a.activeDownloads = make(map[string]activeDownload)
 	}
-	if a.activeContexts == nil {
-		a.activeContexts = make(map[string]context.Context)
+	previous, hadPrevious := a.activeDownloads[itemID]
+	a.activeDownloads[itemID] = activeDownload{
+		QueueID: queueID,
+		Context: trackCtx,
+		Cancel:  cancel,
 	}
-	if previous := a.activeDownloads[itemID]; previous != nil {
-		previous()
-	}
-	a.activeDownloads[itemID] = cancel
-	a.activeContexts[itemID] = trackCtx
 	a.activeMu.Unlock()
+	if hadPrevious && previous.Cancel != nil {
+		previous.Cancel()
+	}
 
 	var cleanupOnce sync.Once
 	cleanup := func() {
 		cleanupOnce.Do(func() {
 			cancel()
 			a.activeMu.Lock()
-			if current, ok := a.activeContexts[itemID]; ok && current == trackCtx {
-				delete(a.activeContexts, itemID)
+			if current, ok := a.activeDownloads[itemID]; ok && current.Context == trackCtx {
 				delete(a.activeDownloads, itemID)
 			}
 			a.activeMu.Unlock()
@@ -47,27 +57,52 @@ func (a *App) beginTrack(itemID string) (context.Context, func()) {
 	return trackCtx, cleanup
 }
 
-// CancelActiveDownloads cancels every track context currently owned by the
-// application. Each DownloadTrack call maps its resulting cancellation to the
-// queue exactly once after the pipeline returns.
-func (a *App) CancelActiveDownloads() int {
+// CancelDownloadQueue cancels every active track context owned by queueID.
+// Each DownloadTrack call maps its resulting cancellation to the queue exactly
+// once after the pipeline returns.
+func (a *App) CancelDownloadQueue(queueID string) int {
+	queueID = normalizeAppQueueID(queueID)
+
 	a.activeMu.Lock()
-	ids := make([]string, 0, len(a.activeDownloads))
-	cancels := make([]context.CancelFunc, 0, len(a.activeDownloads))
-	for itemID, cancel := range a.activeDownloads {
-		ids = append(ids, itemID)
-		if cancel != nil {
-			cancels = append(cancels, cancel)
+	cancels := make([]context.CancelFunc, 0)
+	targeted := 0
+	for itemID, active := range a.activeDownloads {
+		if active.QueueID != queueID {
+			continue
+		}
+		delete(a.activeDownloads, itemID)
+		targeted++
+		if active.Cancel != nil {
+			cancels = append(cancels, active.Cancel)
 		}
 	}
-	a.activeDownloads = make(map[string]context.CancelFunc)
-	a.activeContexts = make(map[string]context.Context)
 	a.activeMu.Unlock()
 
 	for _, cancel := range cancels {
 		cancel()
 	}
-	return len(ids)
+	return targeted
+}
+
+// CancelActiveDownloads cancels every track context currently owned by the
+// application. Each DownloadTrack call maps its resulting cancellation to the
+// queue exactly once after the pipeline returns.
+func (a *App) CancelActiveDownloads() int {
+	a.activeMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(a.activeDownloads))
+	targeted := len(a.activeDownloads)
+	for itemID, active := range a.activeDownloads {
+		delete(a.activeDownloads, itemID)
+		if active.Cancel != nil {
+			cancels = append(cancels, active.Cancel)
+		}
+	}
+	a.activeMu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+	return targeted
 }
 
 func (a *App) GetDownloadProgress() backend.ProgressInfo {
