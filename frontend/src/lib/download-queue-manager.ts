@@ -109,8 +109,8 @@ export function createDynamicDownloadScheduler<TPayload, TResult>(
     options: DynamicDownloadSchedulerOptions<TPayload, TResult>,
 ): DynamicDownloadScheduler<TPayload, TResult> {
     const { concurrency, execute, classifyResult, cancelBackendQueue } = options;
-    if (!Number.isFinite(concurrency) || !Number.isInteger(concurrency) || concurrency <= 0) {
-        throw new RangeError("concurrency must be a positive integer");
+    if (!Number.isFinite(concurrency) || !Number.isInteger(concurrency) || concurrency <= 0 || concurrency > 3) {
+        throw new RangeError("concurrency must be an integer from 1 through 3");
     }
 
     const now = options.now ?? Date.now;
@@ -176,9 +176,12 @@ export function createDynamicDownloadScheduler<TPayload, TResult>(
             jobs: [],
             cancelled: false,
         };
+        const isFirstQueue = queueOrder.length === 0;
         queues.set(queue.id, queue);
         queueOrder.push(queue.id);
-        rotationCursor = queueOrder.length - 1;
+        if (isFirstQueue) {
+            rotationCursor = 0;
+        }
         return queue;
     };
 
@@ -208,7 +211,10 @@ export function createDynamicDownloadScheduler<TPayload, TResult>(
             const queueId = queueOrder[index];
             const queue = queueId === undefined ? undefined : queues.get(queueId);
             if (queue && !queue.cancelled && queue.jobs.some(job => job.status === "queued")) {
-                rotationCursor = (index + 1) % queueOrder.length;
+                // Keep the cursor as the next absolute queue position. Keeping a
+                // value equal to the old queue count lets an appended queue take
+                // the next slot without resetting fairness to the newest queue.
+                rotationCursor = index + 1;
                 return queue;
             }
         }

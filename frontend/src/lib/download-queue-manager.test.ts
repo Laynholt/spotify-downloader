@@ -300,6 +300,49 @@ describe("createDynamicDownloadScheduler", () => {
             now: monotonicTestClock(),
         })).toThrow(RangeError);
     });
+
+    it("rejects a concurrency above the hard global peak of three", () => {
+        expect(() => createDynamicDownloadScheduler<JobPayload, Result>({
+            concurrency: 4,
+            execute: async () => ({ status: "completed" }),
+            classifyResult: (result) => result.status,
+            cancelBackendQueue: vi.fn(async () => 0),
+            now: monotonicTestClock(),
+        })).toThrow(RangeError);
+    });
+
+    it("preserves waiting queue order when A is active and B then C are appended", async () => {
+        const started: string[] = [];
+        const gates = new Map<string, ReturnType<typeof deferred<Result>>>();
+        const scheduler = createDynamicDownloadScheduler<JobPayload, Result>({
+            concurrency: 1,
+            execute: async (job) => {
+                started.push(job.id);
+                const gate = deferred<Result>();
+                gates.set(job.id, gate);
+                return gate.promise;
+            },
+            classifyResult: (result) => result.status,
+            cancelBackendQueue: vi.fn(async () => 0),
+            now: monotonicTestClock(),
+        });
+
+        enqueueMany(scheduler, "playlist:a", ["a1"]);
+        enqueueMany(scheduler, "playlist:b", ["b1"]);
+        enqueueMany(scheduler, "playlist:c", ["c1"]);
+        expect(started).toEqual(["a1"]);
+
+        gates.get("a1")!.resolve({ status: "completed" });
+        await flushPromises();
+        expect(started).toEqual(["a1", "b1"]);
+
+        gates.get("b1")!.resolve({ status: "completed" });
+        await flushPromises();
+        expect(started).toEqual(["a1", "b1", "c1"]);
+        gates.get("c1")!.resolve({ status: "completed" });
+        await flushPromises();
+        await scheduler.dispose();
+    });
 });
 
 export type SchedulerTestSnapshot = DownloadSchedulerSnapshot<JobPayload, Result>;
