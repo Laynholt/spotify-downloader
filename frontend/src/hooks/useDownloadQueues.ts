@@ -165,7 +165,7 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
             })();
             return backendCancellation;
         };
-        const settleExistingItem = async (settle: () => Promise<void>): Promise<void> => {
+        const settleRegisteredItem = async (settle: () => Promise<void>): Promise<void> => {
             if (signal.aborted) throw new Error("Download cancelled");
             const cancelOnAbort = () => void cancelRegisteredItem();
             signal.addEventListener("abort", cancelOnAbort, { once: true });
@@ -213,13 +213,13 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
                         throw new Error("Download cancelled");
                     }
                     if (!metadataResult.success) {
-                        await settleExistingItem(() => api.markDownloadItemFailed(
+                        await settleRegisteredItem(() => api.markDownloadItemFailed(
                             backendItemId,
                             metadataResult.error || metadataResult.message || "Metadata update failed",
                         ));
                         return metadataResult;
                     }
-                    await settleExistingItem(() => api.skipDownloadItem(backendItemId, existingFilePath));
+                    await settleRegisteredItem(() => api.skipDownloadItem(backendItemId, existingFilePath));
                     return {
                         ...metadataResult,
                         file: metadataResult.file || existingFilePath,
@@ -227,7 +227,7 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
                         metadata_updated: true,
                     };
                 }
-                await settleExistingItem(() => api.skipDownloadItem(backendItemId, existingFilePath));
+                await settleRegisteredItem(() => api.skipDownloadItem(backendItemId, existingFilePath));
                 return {
                     success: true,
                     message: "File already exists",
@@ -267,14 +267,17 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
                         await cancelRegisteredItem();
                     }
                     else {
-                        await api.markDownloadItemFailed(backendItemId, error instanceof Error ? error.message : String(error));
+                        await settleRegisteredItem(() => api.markDownloadItemFailed(
+                            backendItemId,
+                            error instanceof Error ? error.message : String(error),
+                        ));
                     }
                 }
                 catch {
                     // Backend cleanup is best effort; preserve the original scheduler result.
                 }
             }
-            if (cancelled) {
+            if (cancelled || signal.aborted) {
                 return cancelledResponse(error);
             }
             throw error;

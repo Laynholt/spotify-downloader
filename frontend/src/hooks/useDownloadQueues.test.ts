@@ -255,6 +255,42 @@ describe("createDownloadQueueHarness", () => {
         await harness.dispose();
     });
 
+    it("cancels the backend item before an in-flight fallback failure mark can terminalize it", async () => {
+        const markStarted = deferred<void>();
+        const releaseMark = deferred<void>();
+        let backendStatus = "queued";
+        const cancelDownloadItem = vi.fn(async () => {
+            if (backendStatus === "queued") backendStatus = "cancelled";
+        });
+        const markDownloadItemFailed = vi.fn(async () => {
+            markStarted.resolve(undefined);
+            await releaseMark.promise;
+            if (backendStatus === "queued") backendStatus = "failed";
+        });
+        const harness = createDownloadQueueHarness({
+            api: backendApi({
+                cancelDownloadItem,
+                ensureValidToken: async () => { throw new Error("token unavailable"); },
+                markDownloadItemFailed,
+            }),
+        });
+
+        await harness.enqueueAll(playlistA, [track("one", 0)], args);
+        await markStarted.promise;
+        await harness.stopQueue(playlistA.id);
+        await flushPromises();
+
+        expect(cancelDownloadItem).toHaveBeenCalledTimes(1);
+        expect(backendStatus).toBe("cancelled");
+        releaseMark.resolve(undefined);
+        await flushPromises();
+        expect(markDownloadItemFailed).toHaveBeenCalledTimes(1);
+        expect(cancelDownloadItem).toHaveBeenCalledTimes(1);
+        expect(backendStatus).toBe("cancelled");
+        expect(harness.snapshot().queues[playlistA.id].jobs[0].status).toBe("cancelled");
+        await harness.dispose();
+    });
+
     it("notifies idle for a queue whose only candidate is immediately unavailable", async () => {
         const onQueueIdle = vi.fn();
         const harness = createDownloadQueueHarness({ onQueueIdle });
