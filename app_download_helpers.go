@@ -45,7 +45,7 @@ func ensureDownloadQueueItem(req DownloadRequest) string {
 
 	trackIDForItemID := primaryTrackID(req)
 	itemID := fmt.Sprintf("%s-%d", trackIDForItemID, time.Now().UnixNano())
-	backend.AddToQueue(itemID, req.TrackName, req.ArtistName, req.AlbumName, trackIDForItemID)
+	_ = backend.AddQueueItem(req.QueueID, itemID, req.TrackName, req.ArtistName, req.AlbumName, trackIDForItemID)
 	return itemID
 }
 

@@ -62,15 +62,37 @@ func TestCancelActiveDownloadsCancelsEveryTrackContext(t *testing.T) {
 	}
 }
 
+func TestEnsureDownloadQueueItemPreservesRequestQueueID(t *testing.T) {
+	backend.ClearAllDownloads()
+	t.Cleanup(backend.ClearAllDownloads)
+
+	req := DownloadRequest{
+		QueueID:    "playlist:a",
+		TrackID:    "track-a",
+		TrackName:  "Track A",
+		ArtistName: "Artist",
+		AlbumName:  "Album",
+	}
+	itemID := ensureDownloadQueueItem(req)
+	queue := backend.GetDownloadQueue()
+	if len(queue.Queue) != 1 || queue.Queue[0].ID != itemID || queue.Queue[0].QueueID != "playlist:a" {
+		t.Fatalf("implicit queue item = %#v, want queue playlist:a", queue.Queue)
+	}
+}
+
 func TestCancelDownloadQueueCancelsOnlySelectedQueue(t *testing.T) {
 	backend.ClearAllDownloads()
 	t.Cleanup(backend.ClearAllDownloads)
 
-	started := make(chan struct{}, 3)
+	started := make(chan string, 3)
+	var queueBContext context.Context
 	app := &App{
 		ctx: context.Background(),
-		runTrackPipeline: func(ctx context.Context, _ backend.TrackPipelineRequest) (backend.TrackPipelineResult, error) {
-			started <- struct{}{}
+		runTrackPipeline: func(ctx context.Context, req backend.TrackPipelineRequest) (backend.TrackPipelineResult, error) {
+			if req.ItemID == "job-b-1" {
+				queueBContext = ctx
+			}
+			started <- req.ItemID
 			<-ctx.Done()
 			return backend.TrackPipelineResult{}, ctx.Err()
 		},
@@ -102,6 +124,12 @@ func TestCancelDownloadQueueCancelsOnlySelectedQueue(t *testing.T) {
 
 	if got := app.CancelDownloadQueue("playlist:a"); got != 2 {
 		t.Fatalf("CancelDownloadQueue(playlist:a) = %d, want 2", got)
+	}
+	if queueBContext == nil {
+		t.Fatal("queue B pipeline context was not captured")
+	}
+	if err := queueBContext.Err(); err != nil {
+		t.Fatalf("queue B context ended after cancelling queue A: %v", err)
 	}
 	if got := app.CancelActiveDownloads(); got != 1 {
 		t.Fatalf("CancelActiveDownloads() = %d, want 1 remaining queue B job", got)
