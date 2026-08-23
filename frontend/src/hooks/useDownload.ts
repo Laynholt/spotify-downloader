@@ -380,18 +380,18 @@ export function queuePeakActive(jobs: ReadonlyArray<{ startedAt?: number; finish
     return peak;
 }
 
-export function takeUnloggedActiveJobs<TJob extends { id: string; status: string }>(
+export function takeUnloggedStartedJobs<TJob extends { id: string; startedAt?: number }>(
     jobs: readonly TJob[],
     loggedIds: Set<string>,
 ): TJob[] {
-    const newlyActive: TJob[] = [];
+    const newlyStarted: TJob[] = [];
     for (const job of jobs) {
-        if (job.status === "active" && !loggedIds.has(job.id)) {
+        if (job.startedAt !== undefined && !loggedIds.has(job.id)) {
             loggedIds.add(job.id);
-            newlyActive.push(job);
+            newlyStarted.push(job);
         }
     }
-    return newlyActive;
+    return newlyStarted;
 }
 
 export interface QueueCompatibilityLog {
@@ -451,7 +451,7 @@ export function useDownload() {
     const [isRedownloadingSuspicious, setIsRedownloadingSuspicious] = useState(false);
     const shouldStopDownloadRef = useRef(false);
     const latestQueueIdRef = useRef<string | null>(null);
-    const loggedActiveJobIdsRef = useRef<Set<string>>(new Set());
+    const loggedStartedJobIdsRef = useRef<Set<string>>(new Set());
     const loggedTerminalJobIdsRef = useRef<Set<string>>(new Set());
     const suspiciousRedownloadRequestsRef = useRef<Map<string, Map<string, SuspiciousRedownloadRequest>>>(new Map());
     const failedRedownloadRequestsRef = useRef<Map<string, Map<string, SuspiciousRedownloadRequest>>>(new Map());
@@ -735,11 +735,11 @@ export function useDownload() {
     });
     useEffect(() => {
         const queues = Object.values(downloadQueues.snapshot.queues);
-        const newlyActiveJobs = takeUnloggedActiveJobs(
+        const newlyStartedJobs = takeUnloggedStartedJobs(
             queues.flatMap((queue) => queue.jobs),
-            loggedActiveJobIdsRef.current,
+            loggedStartedJobIdsRef.current,
         );
-        for (const job of newlyActiveJobs) {
+        for (const job of newlyStartedJobs) {
             const track = job.payload.track;
             logger.info(`starting download: ${track.name || "Unknown track"} - ${track.artists || ""}`);
         }

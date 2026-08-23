@@ -153,6 +153,33 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
     const executeSpotify: ExecuteSpotify = async (job, signal) => {
         let backendItemId = "";
         let downloadStarted = false;
+        let backendCancellation: Promise<void> | undefined;
+        const cancelRegisteredItem = (): Promise<void> => {
+            backendCancellation ??= (async () => {
+                try {
+                    await api.cancelDownloadItem(backendItemId);
+                }
+                catch {
+                    // Backend cancellation is best effort; keep the local result cancelled.
+                }
+            })();
+            return backendCancellation;
+        };
+        const settleExistingItem = async (settle: () => Promise<void>): Promise<void> => {
+            if (signal.aborted) throw new Error("Download cancelled");
+            const cancelOnAbort = () => void cancelRegisteredItem();
+            signal.addEventListener("abort", cancelOnAbort, { once: true });
+            try {
+                await settle();
+            }
+            finally {
+                signal.removeEventListener("abort", cancelOnAbort);
+            }
+            if (signal.aborted) {
+                await cancelRegisteredItem();
+                throw new Error("Download cancelled");
+            }
+        };
         try {
             if (options.executeSpotify) {
                 return await options.executeSpotify(job, signal);
@@ -186,10 +213,13 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
                         throw new Error("Download cancelled");
                     }
                     if (!metadataResult.success) {
-                        await api.markDownloadItemFailed(backendItemId, metadataResult.error || metadataResult.message || "Metadata update failed");
+                        await settleExistingItem(() => api.markDownloadItemFailed(
+                            backendItemId,
+                            metadataResult.error || metadataResult.message || "Metadata update failed",
+                        ));
                         return metadataResult;
                     }
-                    await api.skipDownloadItem(backendItemId, existingFilePath);
+                    await settleExistingItem(() => api.skipDownloadItem(backendItemId, existingFilePath));
                     return {
                         ...metadataResult,
                         file: metadataResult.file || existingFilePath,
@@ -197,7 +227,7 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
                         metadata_updated: true,
                     };
                 }
-                await api.skipDownloadItem(backendItemId, existingFilePath);
+                await settleExistingItem(() => api.skipDownloadItem(backendItemId, existingFilePath));
                 return {
                     success: true,
                     message: "File already exists",
@@ -234,7 +264,7 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
             if (backendItemId && !downloadStarted) {
                 try {
                     if (cancelled) {
-                        await api.cancelDownloadItem(backendItemId);
+                        await cancelRegisteredItem();
                     }
                     else {
                         await api.markDownloadItemFailed(backendItemId, error instanceof Error ? error.message : String(error));

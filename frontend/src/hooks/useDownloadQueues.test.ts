@@ -71,20 +71,21 @@ it("calculates queue peak from actual overlaps", async () => {
     }
 });
 
-it("returns every newly active concurrent job exactly once", async () => {
+it("returns every newly started job exactly once even when only its terminal snapshot is observed", async () => {
     vi.stubGlobal("window", { navigator: { platform: "Win32" } });
-    const { takeUnloggedActiveJobs } = await import("./useDownload");
+    const { takeUnloggedStartedJobs } = await import("./useDownload");
     try {
         const loggedIds = new Set<string>();
         const jobs = [
-            { id: "job-a", status: "active" },
-            { id: "job-b", status: "active" },
-            { id: "job-c", status: "active" },
+            { id: "job-a", status: "active", startedAt: 0 },
+            { id: "job-b", status: "active", startedAt: 1 },
+            { id: "job-c", status: "active", startedAt: 2 },
             { id: "job-d", status: "queued" },
+            { id: "job-e", status: "completed", startedAt: 3 },
         ];
 
-        expect(takeUnloggedActiveJobs(jobs, loggedIds).map((job) => job.id)).toEqual(["job-a", "job-b", "job-c"]);
-        expect(takeUnloggedActiveJobs(jobs, loggedIds)).toEqual([]);
+        expect(takeUnloggedStartedJobs(jobs, loggedIds).map((job) => job.id)).toEqual(["job-a", "job-b", "job-c", "job-e"]);
+        expect(takeUnloggedStartedJobs(jobs, loggedIds)).toEqual([]);
     }
     finally {
         vi.unstubAllGlobals();
@@ -308,6 +309,81 @@ describe("createDownloadQueueHarness", () => {
         expect(downloadTrack).not.toHaveBeenCalled();
         expect(updateExistingFile).toHaveBeenCalledWith(expect.objectContaining({ spotify_id: "one" }), 0, "existing.mp3");
         expect(skipDownloadItem).toHaveBeenCalledWith(expect.any(String), "existing.mp3");
+        await harness.dispose();
+    });
+
+    it("cancels the backend item before an in-flight existing-file failure can terminalize it", async () => {
+        const markStarted = deferred<void>();
+        const releaseMark = deferred<void>();
+        let backendStatus = "queued";
+        const cancelDownloadItem = vi.fn(async () => {
+            if (backendStatus === "queued") backendStatus = "cancelled";
+        });
+        const markDownloadItemFailed = vi.fn(async () => {
+            markStarted.resolve(undefined);
+            await releaseMark.promise;
+            if (backendStatus === "queued") backendStatus = "failed";
+        });
+        const harness = createDownloadQueueHarness({
+            api: backendApi({ cancelDownloadItem, markDownloadItemFailed }),
+        });
+        const existingArgs: CollectionDownloadArgs = {
+            settings: { updateMetadataForExistingFiles: true } as Settings,
+            existingFileFor: () => "existing.mp3",
+            updateExistingFile: async () => ({
+                success: false,
+                message: "Metadata update failed",
+                error: "metadata failure",
+            }),
+        };
+
+        await harness.enqueueAll(playlistA, [track("one", 0)], existingArgs);
+        await markStarted.promise;
+        await harness.stopQueue(playlistA.id);
+        await flushPromises();
+
+        expect(cancelDownloadItem).toHaveBeenCalledTimes(1);
+        expect(backendStatus).toBe("cancelled");
+        releaseMark.resolve(undefined);
+        await flushPromises();
+        expect(markDownloadItemFailed).toHaveBeenCalledTimes(1);
+        expect(backendStatus).toBe("cancelled");
+        expect(harness.snapshot().queues[playlistA.id].jobs[0].status).toBe("cancelled");
+        await harness.dispose();
+    });
+
+    it("cancels the backend item before an in-flight existing-file skip can terminalize it", async () => {
+        const skipStarted = deferred<void>();
+        const releaseSkip = deferred<void>();
+        let backendStatus = "queued";
+        const cancelDownloadItem = vi.fn(async () => {
+            if (backendStatus === "queued") backendStatus = "cancelled";
+        });
+        const skipDownloadItem = vi.fn(async () => {
+            skipStarted.resolve(undefined);
+            await releaseSkip.promise;
+            if (backendStatus === "queued") backendStatus = "skipped";
+        });
+        const harness = createDownloadQueueHarness({
+            api: backendApi({ cancelDownloadItem, skipDownloadItem }),
+        });
+        const existingArgs: CollectionDownloadArgs = {
+            settings: {} as Settings,
+            existingFileFor: () => "existing.mp3",
+        };
+
+        await harness.enqueueAll(playlistA, [track("one", 0)], existingArgs);
+        await skipStarted.promise;
+        await harness.stopQueue(playlistA.id);
+        await flushPromises();
+
+        expect(cancelDownloadItem).toHaveBeenCalledTimes(1);
+        expect(backendStatus).toBe("cancelled");
+        releaseSkip.resolve(undefined);
+        await flushPromises();
+        expect(skipDownloadItem).toHaveBeenCalledTimes(1);
+        expect(backendStatus).toBe("cancelled");
+        expect(harness.snapshot().queues[playlistA.id].jobs[0].status).toBe("cancelled");
         await harness.dispose();
     });
 
