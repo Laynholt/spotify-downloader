@@ -149,6 +149,7 @@ export interface DownloadResponse {
     file?: string;
     error?: string;
     already_exists?: boolean;
+    metadata_updated?: boolean;
     item_id?: string;
     moved_original_path?: string;
     replacement_path?: string;

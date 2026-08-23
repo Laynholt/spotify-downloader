@@ -49,17 +49,183 @@ const playlistA = { id: "playlist:a", title: "Playlist A", kind: "playlist" as c
 const playlistB = { id: "playlist:b", title: "Playlist B", kind: "playlist" as const };
 const args: CollectionDownloadArgs = { settings: {} as Settings };
 
+it("calculates queue peak from actual overlaps", async () => {
+    vi.stubGlobal("window", { navigator: { platform: "Win32" } });
+    const { queuePeakActive } = await import("./useDownload");
+    try {
+        expect(queuePeakActive([
+            { startedAt: 0, finishedAt: 10 },
+            { startedAt: 0, finishedAt: 20 },
+            { startedAt: 0, finishedAt: 30 },
+            { startedAt: 10, finishedAt: 40 },
+        ])).toBe(3);
+        expect(queuePeakActive([
+            { finishedAt: 0 },
+            { startedAt: 1, finishedAt: 2 },
+        ])).toBe(1);
+        expect(queuePeakActive([{ startedAt: 0, finishedAt: 0 }])).toBe(1);
+    }
+    finally {
+        vi.unstubAllGlobals();
+    }
+});
+
 function backendApi(overrides: Partial<DownloadQueueApi> = {}): DownloadQueueApi {
     return {
         addDownloadJob: async (_queueId, jobId) => `backend:${jobId}`,
         cancelDownloadQueue: async () => 0,
         downloadTrack: async () => ({ success: true, message: "Downloaded" }),
         ensureValidToken: async () => "token",
+        markDownloadItemFailed: async () => undefined,
+        skipDownloadItem: async () => undefined,
         ...overrides,
     };
 }
 
 describe("createDownloadQueueHarness", () => {
+    it("does not append a playlist name to an already resolved output directory", async () => {
+        const requests: DownloadRequest[] = [];
+        const harness = createDownloadQueueHarness({
+            api: backendApi({
+                downloadTrack: async (request) => {
+                    requests.push(request);
+                    return { success: true, message: "Downloaded" };
+                },
+            }),
+        });
+
+        await harness.enqueueAll(playlistA, [track("one", 0)], {
+            settings: { downloadPath: "C:/Music" } as Settings,
+            playlistName: "Playlist A",
+        });
+        await waitFor(() => harness.snapshot().queues[playlistA.id].jobs[0]?.status === "completed");
+
+        expect(requests[0]).toMatchObject({ output_dir: "C:/Music" });
+        expect(requests[0]).not.toHaveProperty("playlist_name");
+        await harness.dispose();
+    });
+
+    it("does not start DownloadTrack after stopping during backend registration", async () => {
+        const registration = deferred<string>();
+        const downloadTrack = vi.fn(async () => ({ success: true, message: "Downloaded" }));
+        const markDownloadItemFailed = vi.fn(async () => undefined);
+        const harness = createDownloadQueueHarness({
+            api: backendApi({
+                addDownloadJob: async () => registration.promise,
+                downloadTrack,
+                markDownloadItemFailed,
+            }),
+        });
+
+        await harness.enqueueAll(playlistA, [track("one", 0)], args);
+        await flushPromises();
+        const stopped = harness.stopQueue(playlistA.id);
+        registration.resolve("backend-item");
+        await stopped;
+        await flushPromises();
+
+        expect(downloadTrack).not.toHaveBeenCalled();
+        expect(markDownloadItemFailed).toHaveBeenCalledWith("backend-item", expect.stringContaining("cancel"));
+        await harness.dispose();
+    });
+
+    it("does not start DownloadTrack after stopping during the initial token wait", async () => {
+        const initialToken = deferred<string>();
+        const downloadTrack = vi.fn(async () => ({ success: true, message: "Downloaded" }));
+        const markDownloadItemFailed = vi.fn(async () => undefined);
+        const harness = createDownloadQueueHarness({
+            api: backendApi({
+                ensureValidToken: async () => initialToken.promise,
+                downloadTrack,
+                markDownloadItemFailed,
+            }),
+        });
+
+        await harness.enqueueAll(playlistA, [track("one", 0)], args);
+        await flushPromises();
+        const stopped = harness.stopQueue(playlistA.id);
+        initialToken.resolve("token");
+        await stopped;
+        await flushPromises();
+
+        expect(downloadTrack).not.toHaveBeenCalled();
+        expect(markDownloadItemFailed).toHaveBeenCalledWith(expect.any(String), expect.stringContaining("cancel"));
+        await harness.dispose();
+    });
+
+    it("marks a registered backend item failed when the initial token cannot be obtained", async () => {
+        const markDownloadItemFailed = vi.fn(async () => undefined);
+        const harness = createDownloadQueueHarness({
+            api: backendApi({
+                ensureValidToken: async () => { throw new Error("token unavailable"); },
+                markDownloadItemFailed,
+            }),
+        });
+
+        await harness.enqueueAll(playlistA, [track("one", 0)], args);
+        await waitFor(() => harness.snapshot().queues[playlistA.id].jobs[0]?.status === "failed");
+
+        expect(markDownloadItemFailed).toHaveBeenCalledWith(expect.any(String), "token unavailable");
+        await harness.dispose();
+    });
+
+    it("notifies idle for a queue whose only candidate is immediately unavailable", async () => {
+        const onQueueIdle = vi.fn();
+        const harness = createDownloadQueueHarness({ onQueueIdle });
+
+        await harness.enqueueAll(playlistA, [track(undefined, 0)], args);
+        await flushPromises();
+
+        expect(onQueueIdle).toHaveBeenCalledTimes(1);
+        await harness.dispose();
+    });
+
+    it("notifies idle when Download All is repeated after the queue is terminal", async () => {
+        const onQueueIdle = vi.fn();
+        const harness = createDownloadQueueHarness({ onQueueIdle, api: backendApi() });
+        const onlyTrack = track("one", 0);
+
+        await harness.enqueueAll(playlistA, [onlyTrack], args);
+        await waitFor(() => harness.snapshot().queues[playlistA.id].jobs[0]?.status === "completed");
+        await flushPromises();
+        await harness.enqueueAll(playlistA, [onlyTrack], args);
+        await flushPromises();
+
+        expect(onQueueIdle).toHaveBeenCalledTimes(2);
+        await harness.dispose();
+    });
+
+    it("preflights existing files and updates metadata instead of downloading them", async () => {
+        const downloadTrack = vi.fn(async () => ({ success: true, message: "Downloaded" }));
+        const skipDownloadItem = vi.fn(async () => undefined);
+        const updateExistingFile = vi.fn(async () => ({
+            success: true,
+            message: "Metadata updated",
+            file: "existing.mp3",
+            already_exists: true,
+            metadata_updated: true,
+        }));
+        const harness = createDownloadQueueHarness({
+            api: backendApi({
+                downloadTrack,
+                skipDownloadItem,
+            }),
+        });
+        const existingArgs = {
+            settings: { updateMetadataForExistingFiles: true } as Settings,
+            existingFileFor: () => "existing.mp3",
+            updateExistingFile,
+        } as CollectionDownloadArgs;
+
+        await harness.enqueueAll(playlistA, [track("one", 0)], existingArgs);
+        await waitFor(() => harness.snapshot().queues[playlistA.id].jobs[0]?.status === "skipped");
+
+        expect(downloadTrack).not.toHaveBeenCalled();
+        expect(updateExistingFile).toHaveBeenCalledWith(expect.objectContaining({ spotify_id: "one" }), 0, "existing.mp3");
+        expect(skipDownloadItem).toHaveBeenCalledWith(expect.any(String), "existing.mp3");
+        await harness.dispose();
+    });
+
     it("keeps a playlist queue live while more tracks are appended", async () => {
         const gates = new Map<string, ReturnType<typeof deferred<DownloadResponse>>>();
         const harness = createDownloadQueueHarness({

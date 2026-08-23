@@ -1,5 +1,5 @@
 import { useEffect, useRef, useSyncExternalStore } from "react";
-import { addDownloadJob, cancelDownloadQueue, downloadTrack } from "@/lib/api";
+import { addDownloadJob, cancelDownloadQueue, downloadTrack, markDownloadItemFailed, skipDownloadItem } from "@/lib/api";
 import { isUnauthorizedDownloadError, runWithUnauthorizedRetry } from "@/lib/batch-download";
 import {
     buildSpotifyCandidate,
@@ -26,6 +26,8 @@ export interface CollectionDownloadArgs {
     isAlbum?: boolean;
     m3u8OutputDir?: string;
     requestFor?: (track: TrackMetadata, sourceIndex: number) => RequestSeed;
+    existingFileFor?: (track: TrackMetadata, sourceIndex: number) => string | undefined;
+    updateExistingFile?: (track: TrackMetadata, sourceIndex: number, filePath: string) => Promise<DownloadResponse>;
 }
 
 export interface TrackDownloadArgs extends CollectionDownloadArgs {
@@ -37,6 +39,8 @@ export interface DownloadQueueApi {
     cancelDownloadQueue(queueId: string): Promise<number>;
     downloadTrack(request: DownloadRequest): Promise<DownloadResponse>;
     ensureValidToken(force?: boolean): Promise<string>;
+    markDownloadItemFailed(itemId: string, error: string): Promise<void>;
+    skipDownloadItem(itemId: string, filePath: string): Promise<void>;
 }
 
 export interface UseDownloadQueuesResult {
@@ -77,9 +81,11 @@ const defaultApi: DownloadQueueApi = {
         const { ensureValidToken } = await import("@/lib/token-manager");
         return await ensureValidToken(force);
     },
+    markDownloadItemFailed,
+    skipDownloadItem,
 };
 
-function defaultRequest(track: TrackMetadata, settings: Settings, sourceIndex: number, args: CollectionDownloadArgs): RequestSeed {
+function defaultRequest(track: TrackMetadata, settings: Settings, sourceIndex: number): RequestSeed {
     return {
         track_id: track.spotify_id || "",
         track_name: track.name || "",
@@ -108,8 +114,6 @@ function defaultRequest(track: TrackMetadata, settings: Settings, sourceIndex: n
         use_first_artist_only: settings.useFirstArtistOnly,
         use_single_genre: settings.useSingleGenre,
         embed_genre: settings.embedGenre,
-        playlist_name: args.playlistName,
-        playlist_owner: args.playlistOwner,
     };
 }
 
@@ -139,10 +143,13 @@ function classifySpotifyResult(response: DownloadResponse) {
 export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions = {}): DownloadQueueHarness {
     const api: DownloadQueueApi = { ...defaultApi, ...options.api };
     const requestByJobId = new Map<string, RequestSeed>();
+    const existingPathByJobId = new Map<string, string>();
     const argsByQueueId = new Map<string, CollectionDownloadArgs>();
     const busyQueueIds = new Set<string>();
     const idleWorkByQueueId = new Map<string, Promise<void>>();
     const executeSpotify: ExecuteSpotify = async (job, signal) => {
+        let backendItemId = "";
+        let downloadStarted = false;
         try {
             if (options.executeSpotify) {
                 return await options.executeSpotify(job, signal);
@@ -155,7 +162,8 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
                 throw new Error(`Missing request for download job ${job.id}`);
             }
             const track = job.payload.track;
-            const backendItemId = await api.addDownloadJob(
+            const args = argsByQueueId.get(job.queueId);
+            backendItemId = await api.addDownloadJob(
                 job.queueId,
                 job.id,
                 track.spotify_id ?? "",
@@ -164,21 +172,69 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
                 track.album_name || "",
             );
             scheduler.setBackendItemId(job.id, backendItemId);
+            if (signal.aborted) {
+                throw new Error("Download cancelled");
+            }
+            const existingFilePath = existingPathByJobId.get(job.id);
+            if (existingFilePath) {
+                if (args?.settings.updateMetadataForExistingFiles && args.updateExistingFile) {
+                    const metadataResult = await args.updateExistingFile(track, job.sourceIndex, existingFilePath);
+                    if (signal.aborted) {
+                        throw new Error("Download cancelled");
+                    }
+                    if (!metadataResult.success) {
+                        await api.markDownloadItemFailed(backendItemId, metadataResult.error || metadataResult.message || "Metadata update failed");
+                        return metadataResult;
+                    }
+                    await api.skipDownloadItem(backendItemId, existingFilePath);
+                    return {
+                        ...metadataResult,
+                        file: metadataResult.file || existingFilePath,
+                        already_exists: true,
+                        metadata_updated: true,
+                    };
+                }
+                await api.skipDownloadItem(backendItemId, existingFilePath);
+                return {
+                    success: true,
+                    message: "File already exists",
+                    file: existingFilePath,
+                    already_exists: true,
+                };
+            }
+            const initialToken = await api.ensureValidToken(false);
+            if (signal.aborted) {
+                throw new Error("Download cancelled");
+            }
             return await runWithUnauthorizedRetry({
-                initialToken: await api.ensureValidToken(false),
-                execute: async (sessionToken) => await api.downloadTrack({
-                    ...request,
-                    session_token: sessionToken,
-                    queue_id: job.queueId,
-                    item_id: backendItemId,
-                    force: job.force,
-                }),
+                initialToken,
+                execute: async (sessionToken) => {
+                    if (signal.aborted) {
+                        throw new Error("Download cancelled");
+                    }
+                    downloadStarted = true;
+                    return await api.downloadTrack({
+                        ...request,
+                        session_token: sessionToken,
+                        queue_id: job.queueId,
+                        item_id: backendItemId,
+                        force: job.force,
+                    });
+                },
                 refreshToken: async () => await api.ensureValidToken(true),
                 isUnauthorizedResult: (result) => !result.success && isUnauthorizedDownloadError(result.error),
                 shouldStop: () => signal.aborted,
             });
         }
         catch (error) {
+            if (backendItemId && !downloadStarted) {
+                try {
+                    await api.markDownloadItemFailed(backendItemId, error instanceof Error ? error.message : String(error));
+                }
+                catch {
+                    // Backend cleanup is best effort; preserve the original scheduler result.
+                }
+            }
             if (signal.aborted || isCancellation(error)) {
                 return cancelledResponse(error);
             }
@@ -192,6 +248,26 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
         classifyResult: classifySpotifyResult,
         cancelBackendQueue: api.cancelDownloadQueue,
     });
+    const scheduleQueueIdle = (queue: DownloadQueueSnapshot<MediaJobPayload, MediaJobResult>, snapshot: DownloadSchedulerSnapshot<MediaJobPayload, MediaJobResult>): void => {
+        const callback = options.onQueueIdle;
+        if (!callback) {
+            return;
+        }
+        const previous = idleWorkByQueueId.get(queue.id) ?? Promise.resolve();
+        const work = previous.then(
+            async () => await callback(queue, snapshot, argsByQueueId.get(queue.id)),
+            async () => await callback(queue, snapshot, argsByQueueId.get(queue.id)),
+        );
+        idleWorkByQueueId.set(queue.id, work);
+        void work.then(
+            () => {
+                if (idleWorkByQueueId.get(queue.id) === work) idleWorkByQueueId.delete(queue.id);
+            },
+            () => {
+                if (idleWorkByQueueId.get(queue.id) === work) idleWorkByQueueId.delete(queue.id);
+            },
+        );
+    };
 
     const unsubscribeIdleWatcher = scheduler.subscribe(() => {
         const snapshot = scheduler.getSnapshot();
@@ -201,24 +277,7 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
                 busyQueueIds.add(queue.id);
             }
             else if (busyQueueIds.delete(queue.id)) {
-                const callback = options.onQueueIdle;
-                if (!callback) {
-                    continue;
-                }
-                const previous = idleWorkByQueueId.get(queue.id) ?? Promise.resolve();
-                const work = previous.then(
-                    async () => await callback(queue, snapshot, argsByQueueId.get(queue.id)),
-                    async () => await callback(queue, snapshot, argsByQueueId.get(queue.id)),
-                );
-                idleWorkByQueueId.set(queue.id, work);
-                void work.then(
-                    () => {
-                        if (idleWorkByQueueId.get(queue.id) === work) idleWorkByQueueId.delete(queue.id);
-                    },
-                    () => {
-                        if (idleWorkByQueueId.get(queue.id) === work) idleWorkByQueueId.delete(queue.id);
-                    },
-                );
+                scheduleQueueIdle(queue, snapshot);
             }
         }
     });
@@ -241,36 +300,62 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
             position: sourceIndex + 1,
         });
         argsByQueueId.set(queue.id, args);
-        requestByJobId.set(candidate.id, args.requestFor?.(track, sourceIndex) ?? defaultRequest(track, args.settings, sourceIndex, args));
+        requestByJobId.set(candidate.id, args.requestFor?.(track, sourceIndex) ?? defaultRequest(track, args.settings, sourceIndex));
+        const existingFilePath = args.existingFileFor?.(track, sourceIndex);
+        if (existingFilePath) {
+            existingPathByJobId.set(candidate.id, existingFilePath);
+        }
         const decision = scheduler.enqueue(candidate, policy);
         if (!decision.added) {
             requestByJobId.delete(candidate.id);
+            existingPathByJobId.delete(candidate.id);
         }
         else if (decision.jobId && decision.jobId !== candidate.id) {
             const request = requestByJobId.get(candidate.id);
             requestByJobId.delete(candidate.id);
             if (request) requestByJobId.set(decision.jobId, request);
+            const existingPath = existingPathByJobId.get(candidate.id);
+            existingPathByJobId.delete(candidate.id);
+            if (existingPath) existingPathByJobId.set(decision.jobId, existingPath);
         }
         return decision;
     };
 
+    const notifyQueueIdleIfSettled = (queueId: string): void => {
+        const snapshot = scheduler.getSnapshot();
+        const queue = snapshot.queues[queueId];
+        if (queue && queue.counts.active === 0 && queue.counts.queued === 0) {
+            scheduleQueueIdle(queue, snapshot);
+        }
+    };
+
     return {
         snapshot: () => scheduler.getSnapshot(),
-        enqueueAll: async (queue, tracks, args) => tracks.map((track, sourceIndex) =>
-            enqueue(queue, track, sourceIndex, args, "unseen-only")),
+        enqueueAll: async (queue, tracks, args) => {
+            const decisions = tracks.map((track, sourceIndex) =>
+                enqueue(queue, track, sourceIndex, args, "unseen-only"));
+            notifyQueueIdleIfSettled(queue.id);
+            return decisions;
+        },
         enqueueSelected: async (queue, tracks, selectedIds, args) => {
             const selected = new Set(selectedIds);
-            return tracks.flatMap((track, sourceIndex) => selected.has(track.spotify_id || "")
+            const decisions = tracks.flatMap((track, sourceIndex) => selected.has(track.spotify_id || "")
                 ? [enqueue(queue, track, sourceIndex, args, "unseen-only")]
                 : []);
+            notifyQueueIdleIfSettled(queue.id);
+            return decisions;
         },
-        retryTrack: async (queue, track, args) =>
-            enqueue(queue, track, args.sourceIndex ?? 0, args, "retry-terminal"),
+        retryTrack: async (queue, track, args) => {
+            const decision = enqueue(queue, track, args.sourceIndex ?? 0, args, "retry-terminal");
+            notifyQueueIdleIfSettled(queue.id);
+            return decision;
+        },
         stopQueue: async (queueId) => await scheduler.cancelQueue(queueId),
         subscribe: (listener) => scheduler.subscribe(listener),
         dispose: async () => {
             unsubscribeIdleWatcher();
             requestByJobId.clear();
+            existingPathByJobId.clear();
             argsByQueueId.clear();
             idleWorkByQueueId.clear();
             await scheduler.dispose();
