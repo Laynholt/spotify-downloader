@@ -130,6 +130,8 @@ export function createDynamicDownloadScheduler<TPayload, TResult>(
         for (const [queueId, queue] of queues) {
             const jobs = queue.jobs.map(job => {
                 const { settled: _settled, controller: _controller, ...publicJob } = job;
+                void _settled;
+                void _controller;
                 return Object.freeze({ ...publicJob });
             });
             const counts: QueueCounts = {
