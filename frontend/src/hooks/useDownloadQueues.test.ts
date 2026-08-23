@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { DownloadResponse, DownloadRequest, TrackMetadata } from "@/types/api";
 import type { Settings } from "@/lib/settings";
+import { createEmptyBatchSummary } from "@/lib/batch-summary";
 import {
     createDownloadQueueHarness,
     type CollectionDownloadArgs,
@@ -70,9 +71,84 @@ it("calculates queue peak from actual overlaps", async () => {
     }
 });
 
+it("returns every newly active concurrent job exactly once", async () => {
+    vi.stubGlobal("window", { navigator: { platform: "Win32" } });
+    const { takeUnloggedActiveJobs } = await import("./useDownload");
+    try {
+        const loggedIds = new Set<string>();
+        const jobs = [
+            { id: "job-a", status: "active" },
+            { id: "job-b", status: "active" },
+            { id: "job-c", status: "active" },
+            { id: "job-d", status: "queued" },
+        ];
+
+        expect(takeUnloggedActiveJobs(jobs, loggedIds).map((job) => job.id)).toEqual(["job-a", "job-b", "job-c"]);
+        expect(takeUnloggedActiveJobs(jobs, loggedIds)).toEqual([]);
+    }
+    finally {
+        vi.unstubAllGlobals();
+    }
+});
+
+it("formats every terminal queue outcome and batch timing for scalar logs", async () => {
+    vi.stubGlobal("window", { navigator: { platform: "Win32" } });
+    const { batchCompletionLog, queueTerminalLog } = await import("./useDownload");
+    try {
+        const outcomes = [
+            ["completed", "info", "downloaded"],
+            ["skipped", "info", "skipped"],
+            ["failed", "error", "failed"],
+            ["unavailable", "error", "unavailable"],
+            ["suspicious", "warning", "suspicious"],
+            ["cancelled", "info", "cancelled"],
+        ] as const;
+
+        for (const [status, level, label] of outcomes) {
+            expect(queueTerminalLog({
+                status,
+                error: `${status} detail`,
+                payload: { track: track("one", 0) },
+            } as Parameters<typeof queueTerminalLog>[0])).toMatchObject({
+                level,
+                message: expect.stringContaining(label),
+            });
+        }
+
+        const message = batchCompletionLog({
+            ...createEmptyBatchSummary("summary"),
+            downloaded: 1,
+            cancelled: 1,
+            elapsedMs: 1250,
+            peakActive: 3,
+        });
+        expect(message).toContain("elapsed 1.25s");
+        expect(message).toContain("peak active 3");
+    }
+    finally {
+        vi.unstubAllGlobals();
+    }
+});
+
+it("carries the owning queue on an opened batch summary", async () => {
+    vi.stubGlobal("window", { navigator: { platform: "Win32" } });
+    const { withBatchSummaryQueue } = await import("./useDownload");
+    try {
+        const latestEnqueuedQueueId = playlistB.id;
+        const openedSummary = withBatchSummaryQueue(createEmptyBatchSummary("Playlist A"), playlistA.id);
+
+        expect(openedSummary.queueId).toBe(playlistA.id);
+        expect(openedSummary.queueId).not.toBe(latestEnqueuedQueueId);
+    }
+    finally {
+        vi.unstubAllGlobals();
+    }
+});
+
 function backendApi(overrides: Partial<DownloadQueueApi> = {}): DownloadQueueApi {
     return {
         addDownloadJob: async (_queueId, jobId) => `backend:${jobId}`,
+        cancelDownloadItem: async () => undefined,
         cancelDownloadQueue: async () => 0,
         downloadTrack: async () => ({ success: true, message: "Downloaded" }),
         ensureValidToken: async () => "token",
@@ -109,9 +185,11 @@ describe("createDownloadQueueHarness", () => {
         const registration = deferred<string>();
         const downloadTrack = vi.fn(async () => ({ success: true, message: "Downloaded" }));
         const markDownloadItemFailed = vi.fn(async () => undefined);
+        const cancelDownloadItem = vi.fn(async () => undefined);
         const harness = createDownloadQueueHarness({
             api: backendApi({
                 addDownloadJob: async () => registration.promise,
+                cancelDownloadItem,
                 downloadTrack,
                 markDownloadItemFailed,
             }),
@@ -125,7 +203,8 @@ describe("createDownloadQueueHarness", () => {
         await flushPromises();
 
         expect(downloadTrack).not.toHaveBeenCalled();
-        expect(markDownloadItemFailed).toHaveBeenCalledWith("backend-item", expect.stringContaining("cancel"));
+        expect(cancelDownloadItem).toHaveBeenCalledWith("backend-item");
+        expect(markDownloadItemFailed).not.toHaveBeenCalled();
         await harness.dispose();
     });
 
@@ -133,8 +212,10 @@ describe("createDownloadQueueHarness", () => {
         const initialToken = deferred<string>();
         const downloadTrack = vi.fn(async () => ({ success: true, message: "Downloaded" }));
         const markDownloadItemFailed = vi.fn(async () => undefined);
+        const cancelDownloadItem = vi.fn(async () => undefined);
         const harness = createDownloadQueueHarness({
             api: backendApi({
+                cancelDownloadItem,
                 ensureValidToken: async () => initialToken.promise,
                 downloadTrack,
                 markDownloadItemFailed,
@@ -149,14 +230,17 @@ describe("createDownloadQueueHarness", () => {
         await flushPromises();
 
         expect(downloadTrack).not.toHaveBeenCalled();
-        expect(markDownloadItemFailed).toHaveBeenCalledWith(expect.any(String), expect.stringContaining("cancel"));
+        expect(cancelDownloadItem).toHaveBeenCalledWith(expect.any(String));
+        expect(markDownloadItemFailed).not.toHaveBeenCalled();
         await harness.dispose();
     });
 
     it("marks a registered backend item failed when the initial token cannot be obtained", async () => {
         const markDownloadItemFailed = vi.fn(async () => undefined);
+        const cancelDownloadItem = vi.fn(async () => undefined);
         const harness = createDownloadQueueHarness({
             api: backendApi({
+                cancelDownloadItem,
                 ensureValidToken: async () => { throw new Error("token unavailable"); },
                 markDownloadItemFailed,
             }),
@@ -166,6 +250,7 @@ describe("createDownloadQueueHarness", () => {
         await waitFor(() => harness.snapshot().queues[playlistA.id].jobs[0]?.status === "failed");
 
         expect(markDownloadItemFailed).toHaveBeenCalledWith(expect.any(String), "token unavailable");
+        expect(cancelDownloadItem).not.toHaveBeenCalled();
         await harness.dispose();
     });
 
@@ -223,6 +308,47 @@ describe("createDownloadQueueHarness", () => {
         expect(downloadTrack).not.toHaveBeenCalled();
         expect(updateExistingFile).toHaveBeenCalledWith(expect.objectContaining({ spotify_id: "one" }), 0, "existing.mp3");
         expect(skipDownloadItem).toHaveBeenCalledWith(expect.any(String), "existing.mp3");
+        await harness.dispose();
+    });
+
+    it("uses the original position for a single-track preflight", async () => {
+        const observedSourceIndices: number[] = [];
+        const indexedArgs: CollectionDownloadArgs = {
+            settings: {} as Settings,
+            sourceIndexFor: () => 4,
+            existingFileFor: (_track: TrackMetadata, sourceIndex: number) => {
+                observedSourceIndices.push(sourceIndex);
+                return "existing.mp3";
+            },
+        };
+        const harness = createDownloadQueueHarness({ api: backendApi() });
+
+        await harness.retryTrack(playlistA, track("five", 4), indexedArgs);
+        await waitFor(() => harness.snapshot().queues[playlistA.id].jobs[0]?.status === "skipped");
+
+        expect(harness.snapshot().queues[playlistA.id].jobs[0].sourceIndex).toBe(4);
+        expect(observedSourceIndices).toEqual([4]);
+        await harness.dispose();
+    });
+
+    it("preserves selected tracks' original playlist source indices", async () => {
+        const selectedTracks = [track("two", 1), track("four", 3)];
+        const requestedSourceIndices: number[] = [];
+        const indexedArgs: CollectionDownloadArgs = {
+            settings: {} as Settings,
+            sourceIndexFor: (_track: TrackMetadata, selectedIndex: number) => [1, 3][selectedIndex],
+            requestFor: (_track: TrackMetadata, sourceIndex: number) => {
+                requestedSourceIndices.push(sourceIndex);
+                return { position: sourceIndex + 1 };
+            },
+        };
+        const harness = createDownloadQueueHarness({ api: backendApi() });
+
+        await harness.enqueueSelected(playlistA, selectedTracks, ["two", "four"], indexedArgs);
+        await waitFor(() => harness.snapshot().queues[playlistA.id].counts.completed === 2);
+
+        expect(harness.snapshot().queues[playlistA.id].jobs.map((job) => job.sourceIndex)).toEqual([1, 3]);
+        expect(requestedSourceIndices).toEqual([1, 3]);
         await harness.dispose();
     });
 

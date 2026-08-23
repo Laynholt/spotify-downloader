@@ -131,6 +131,10 @@ func (a *App) MarkDownloadItemFailed(itemID, errorMsg string) {
 	backend.FailDownloadItem(itemID, errorMsg)
 }
 
+func (a *App) CancelDownloadItem(itemID string) {
+	backend.CancelDownloadItem(itemID)
+}
+
 func (a *App) SkipDownloadItem(itemID, filePath string) {
 	backend.SkipDownloadItem(itemID, filePath)
 }

@@ -1,5 +1,5 @@
 import type { DownloadResponse, TrackMetadata } from "@/types/api";
-import type { DownloadJob } from "./download-queue-manager";
+import type { DownloadJob, DownloadJobStatus } from "./download-queue-manager";
 import type { BatchTrackPathInfo } from "@/hooks/useDownload";
 
 export interface BatchDownloadWorkItem {
@@ -13,6 +13,11 @@ export interface BatchDownloadSourceEntry {
     pathInfo: BatchTrackPathInfo;
 }
 
+export interface TrackSourceEntry {
+    track: TrackMetadata;
+    sourceIndex: number;
+}
+
 export interface BatchDownloadWorkerResult {
     item: BatchDownloadWorkItem;
     response: DownloadResponse;
@@ -24,6 +29,17 @@ export interface UnauthorizedRetryOptions<T> {
     refreshToken: () => Promise<string>;
     isUnauthorizedResult: (result: T) => boolean;
     shouldStop?: () => boolean;
+}
+
+/** Filter selected tracks without losing their positions in the source playlist. */
+export function selectTracksWithSourceIndices(
+    tracks: readonly TrackMetadata[],
+    selectedIds: readonly string[],
+): TrackSourceEntry[] {
+    const selected = new Set(selectedIds);
+    return tracks.flatMap((track, sourceIndex) => selected.has(track.spotify_id || "")
+        ? [{ track, sourceIndex }]
+        : []);
 }
 
 function downloadErrorMessage(error: unknown): string {
@@ -103,4 +119,29 @@ export function orderedQueueFilePaths<TPayload>(
     return [...paths.entries()]
         .sort(([left], [right]) => left - right)
         .map(([, file]) => file);
+}
+
+const terminalQueueStatuses = new Set<DownloadJobStatus>([
+    "completed",
+    "skipped",
+    "failed",
+    "suspicious",
+    "cancelled",
+    "unavailable",
+]);
+
+/** Keep the latest terminal attempt for each track, using array order to break timestamp ties. */
+export function latestTerminalQueueJobs<TPayload, TResult>(
+    jobs: readonly DownloadJob<TPayload, TResult>[],
+): DownloadJob<TPayload, TResult>[] {
+    const latestByTrack = new Map<string, DownloadJob<TPayload, TResult>>();
+    for (const job of jobs) {
+        if (!terminalQueueStatuses.has(job.status)) continue;
+        const previous = latestByTrack.get(job.trackKey);
+        if (!previous || job.enqueuedAt >= previous.enqueuedAt) {
+            latestByTrack.set(job.trackKey, job);
+        }
+    }
+    return [...latestByTrack.values()]
+        .sort((left, right) => left.sourceIndex - right.sourceIndex || left.enqueuedAt - right.enqueuedAt);
 }

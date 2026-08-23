@@ -8,9 +8,10 @@ import { logger } from "@/lib/logger";
 import { logDuplicateTracks } from "@/lib/duplicate-tracks";
 import { addBatchResult, createEmptyBatchSummary, type BatchDownloadSummary, type BatchTrackResult, type BatchTrackStatus } from "@/lib/batch-summary";
 import type { DownloadResponse, SuspiciousRedownloadRequest, SuspiciousRedownloadResult, TrackMetadata, TrackMetadataUpdateRequest, TrackMetadataUpdateResult } from "@/types/api";
-import { orderedQueueFilePaths } from "@/lib/batch-download";
+import { latestTerminalQueueJobs, orderedQueueFilePaths, selectTracksWithSourceIndices } from "@/lib/batch-download";
 import { useDownloadQueues, type CollectionDownloadArgs } from "@/hooks/useDownloadQueues";
-import type { DownloadQueueContext } from "@/lib/download-jobs";
+import type { DownloadQueueContext, MediaJobPayload, MediaJobResult } from "@/lib/download-jobs";
+import type { DownloadJob } from "@/lib/download-queue-manager";
 export interface BatchTrackPathInfo {
     displayArtist: string;
     displayAlbumArtist: string;
@@ -24,6 +25,14 @@ export interface SuspiciousTrackInfo {
     expectedDurationSeconds?: number;
     actualDurationSeconds?: number;
     durationDeltaSeconds?: number;
+}
+
+export interface QueueOwnedBatchSummary extends BatchDownloadSummary {
+    queueId: string;
+}
+
+export function withBatchSummaryQueue(summary: BatchDownloadSummary, queueId: string): QueueOwnedBatchSummary {
+    return { ...summary, queueId };
 }
 
 function extensionForAudioFormat(audioFormat: string): string {
@@ -237,12 +246,16 @@ async function findExistingFilePaths(
     playlistName?: string,
     isAlbum?: boolean,
     context = "batch download",
+    sourceIndices?: readonly number[],
 ): Promise<Map<number, string>> {
-    const entries = tracks.map((track, sourceIndex) => ({
-        track,
-        sourceIndex,
-        pathInfo: buildBatchTrackPathInfo(track, settings, playlistName, isAlbum, sourceIndex + 1),
-    }));
+    const entries = tracks.map((track, arrayIndex) => {
+        const sourceIndex = sourceIndices?.[arrayIndex] ?? arrayIndex;
+        return {
+            track,
+            sourceIndex,
+            pathInfo: buildBatchTrackPathInfo(track, settings, playlistName, isAlbum, sourceIndex + 1),
+        };
+    });
     const candidates = entries.filter(({ track }) => Boolean(track.spotify_id));
     if (candidates.length === 0) {
         return new Map();
@@ -366,6 +379,58 @@ export function queuePeakActive(jobs: ReadonlyArray<{ startedAt?: number; finish
     }
     return peak;
 }
+
+export function takeUnloggedActiveJobs<TJob extends { id: string; status: string }>(
+    jobs: readonly TJob[],
+    loggedIds: Set<string>,
+): TJob[] {
+    const newlyActive: TJob[] = [];
+    for (const job of jobs) {
+        if (job.status === "active" && !loggedIds.has(job.id)) {
+            loggedIds.add(job.id);
+            newlyActive.push(job);
+        }
+    }
+    return newlyActive;
+}
+
+export interface QueueCompatibilityLog {
+    level: "info" | "warning" | "error";
+    message: string;
+}
+
+export function queueTerminalLog(
+    job: Pick<DownloadJob<MediaJobPayload, MediaJobResult>, "status" | "payload" | "result" | "error">,
+): QueueCompatibilityLog {
+    const track = job.payload.track;
+    const identity = `${track.name || "Unknown track"} - ${track.artists || ""}`;
+    const detail = job.error || job.result?.error || "Download failed";
+    switch (job.status) {
+        case "completed":
+            return { level: "info", message: `downloaded: ${identity}` };
+        case "skipped":
+            return { level: "info", message: `skipped: ${identity}` };
+        case "suspicious":
+            return { level: "warning", message: `suspicious: ${identity} - ${detail}` };
+        case "cancelled":
+            return { level: "info", message: `cancelled: ${identity} - ${job.error || "Download cancelled"}` };
+        case "unavailable":
+            return { level: "error", message: `unavailable: ${identity} - ${detail}` };
+        default:
+            return { level: "error", message: `failed: ${identity} - ${detail}` };
+    }
+}
+
+export function batchCompletionLog(summary: BatchDownloadSummary): string {
+    return `batch complete: ${summary.downloaded} downloaded, ${summary.skipped} skipped, ${summary.metadataUpdated} metadata updated, ${summary.failed} failed, ${summary.cancelled} cancelled; elapsed ${(summary.elapsedMs / 1000).toFixed(2)}s; peak active ${summary.peakActive}`;
+}
+
+function writeCompatibilityLog(entry: QueueCompatibilityLog): void {
+    if (entry.level === "error") logger.error(entry.message);
+    else if (entry.level === "warning") logger.warning(entry.message);
+    else logger.info(entry.message);
+}
+
 export function useDownload() {
     const [downloadProgress, setDownloadProgress] = useState<number>(0);
     const [isDownloading, setIsDownloading] = useState(false);
@@ -379,18 +444,19 @@ export function useDownload() {
         artists: string;
     } | null>(null);
     const [suspiciousTracks, setSuspiciousTracks] = useState<Map<string, SuspiciousTrackInfo>>(new Map());
-    const [batchSummary, setBatchSummary] = useState<BatchDownloadSummary | null>(null);
+    const [batchSummary, setBatchSummary] = useState<QueueOwnedBatchSummary | null>(null);
     const [isBatchSummaryOpen, setIsBatchSummaryOpen] = useState(false);
     const [isBatchSummaryMinimized, setIsBatchSummaryMinimized] = useState(false);
     const [isBulkUpdatingMetadata, setIsBulkUpdatingMetadata] = useState(false);
     const [isRedownloadingSuspicious, setIsRedownloadingSuspicious] = useState(false);
     const shouldStopDownloadRef = useRef(false);
     const latestQueueIdRef = useRef<string | null>(null);
-    const loggedActiveJobRef = useRef<string | null>(null);
+    const loggedActiveJobIdsRef = useRef<Set<string>>(new Set());
+    const loggedTerminalJobIdsRef = useRef<Set<string>>(new Set());
     const suspiciousRedownloadRequestsRef = useRef<Map<string, Map<string, SuspiciousRedownloadRequest>>>(new Map());
     const failedRedownloadRequestsRef = useRef<Map<string, Map<string, SuspiciousRedownloadRequest>>>(new Map());
-    const openBatchSummary = (summary: BatchDownloadSummary) => {
-        setBatchSummary(summary);
+    const openBatchSummary = (summary: BatchDownloadSummary, queueId: string) => {
+        setBatchSummary(withBatchSummaryQueue(summary, queueId));
         setIsBatchSummaryMinimized(false);
         setIsBatchSummaryOpen(true);
     };
@@ -480,16 +546,19 @@ export function useDownload() {
         playlistName?: string,
         isAlbum?: boolean,
         existingFilePaths?: ReadonlyMap<number, string>,
+        sourceIndices?: readonly number[],
     ): CollectionDownloadArgs => {
         const firstTrack = tracks[0];
+        const firstSourceIndex = sourceIndices?.[0] ?? 0;
         const firstPath = firstTrack
-            ? buildBatchTrackPathInfo(firstTrack, settings, playlistName, isAlbum, 1)
+            ? buildBatchTrackPathInfo(firstTrack, settings, playlistName, isAlbum, firstSourceIndex + 1)
             : undefined;
         return {
             settings,
             playlistName,
             isAlbum,
             m3u8OutputDir: firstPath?.baseOutputDir || settings.downloadPath,
+            sourceIndexFor: (_track, arrayIndex) => sourceIndices?.[arrayIndex] ?? arrayIndex,
             existingFileFor: existingFilePaths
                 ? (_track, sourceIndex) => existingFilePaths.get(sourceIndex)
                 : undefined,
@@ -548,17 +617,21 @@ export function useDownload() {
     };
     const downloadQueues = useDownloadQueues({
         onQueueIdle: async (queue, snapshot, args) => {
-            const terminalJobs = queue.jobs
-                .filter((job) => isQueueTerminal(job.status))
-                .sort((left, right) => left.sourceIndex - right.sourceIndex || left.enqueuedAt - right.enqueuedAt);
+            const allTerminalJobs = queue.jobs.filter((job) => isQueueTerminal(job.status));
+            const terminalJobs = latestTerminalQueueJobs(queue.jobs);
             if (terminalJobs.length === 0) {
                 return;
             }
 
+            for (const job of allTerminalJobs) {
+                if (!loggedTerminalJobIdsRef.current.has(job.id)) {
+                    loggedTerminalJobIdsRef.current.add(job.id);
+                    writeCompatibilityLog(queueTerminalLog(job));
+                }
+            }
+
             let summary = createEmptyBatchSummary((args?.playlistName || queue.title) + " download summary");
-            const latestByTrack = new Map<string, typeof terminalJobs[number]>();
             for (const job of terminalJobs) {
-                latestByTrack.set(job.trackKey, job);
                 const track = job.payload.track;
                 const response = job.result;
                 if (job.status === "completed" || job.status === "skipped") {
@@ -583,18 +656,18 @@ export function useDownload() {
                     }));
                 }
             }
-            const earliestEnqueuedAt = Math.min(...terminalJobs.map((job) => job.enqueuedAt));
-            const latestFinishedAt = Math.max(...terminalJobs.map((job) => job.finishedAt || job.enqueuedAt));
+            const earliestEnqueuedAt = Math.min(...allTerminalJobs.map((job) => job.enqueuedAt));
+            const latestFinishedAt = Math.max(...allTerminalJobs.map((job) => job.finishedAt || job.enqueuedAt));
             const elapsedMs = Math.max(0, latestFinishedAt - earliestEnqueuedAt);
             summary = { ...summary, elapsedMs, peakActive: queuePeakActive(queue.jobs) };
-            openBatchSummary(summary);
+            openBatchSummary(summary, queue.id);
 
             const downloaded = new Set<string>();
             const skipped = new Set<string>();
             const failed = new Set<string>();
             suspiciousRedownloadRequestsRef.current.set(queue.id, new Map());
             failedRedownloadRequestsRef.current.set(queue.id, new Map());
-            for (const job of latestByTrack.values()) {
+            for (const job of terminalJobs) {
                 const track = job.payload.track;
                 const trackID = track.spotify_id || "";
                 if (!trackID) {
@@ -612,17 +685,15 @@ export function useDownload() {
                     }
                     else {
                         clearSuspiciousTrack(trackID);
-                        logger.info(`${job.status === "skipped" ? "skipped" : "downloaded"}: ${track.name || "Unknown track"} - ${track.artists || ""}`);
                     }
                 }
                 else if (job.status === "failed" || job.status === "unavailable") {
                     failed.add(trackID);
                     const pathInfo = buildBatchTrackPathInfo(track, job.payload.settings, job.payload.playlistName, job.payload.isAlbum, job.payload.position);
                     queueFailedRedownload(queue.id, track, job.payload.settings, pathInfo);
-                    logger.error(`failed: ${track.name || "Unknown track"} - ${track.artists || ""} - ${job.error || "Download failed"}`);
                 }
             }
-            logger.info(`batch complete: ${summary.downloaded} downloaded, ${summary.skipped} skipped, ${summary.metadataUpdated} metadata updated, ${summary.failed} failed, ${summary.cancelled} cancelled`);
+            logger.info(batchCompletionLog(summary));
             setDownloadedTracks((previous) => new Set([...previous, ...downloaded]));
             setSkippedTracks((previous) => {
                 const next = new Set(previous);
@@ -664,6 +735,14 @@ export function useDownload() {
     });
     useEffect(() => {
         const queues = Object.values(downloadQueues.snapshot.queues);
+        const newlyActiveJobs = takeUnloggedActiveJobs(
+            queues.flatMap((queue) => queue.jobs),
+            loggedActiveJobIdsRef.current,
+        );
+        for (const job of newlyActiveJobs) {
+            const track = job.payload.track;
+            logger.info(`starting download: ${track.name || "Unknown track"} - ${track.artists || ""}`);
+        }
         const preferredQueue = latestQueueIdRef.current
             ? downloadQueues.snapshot.queues[latestQueueIdRef.current]
             : undefined;
@@ -673,7 +752,6 @@ export function useDownload() {
         const activeJob = targetQueue?.jobs.find((job) => job.status === "active") ||
             targetQueue?.jobs.find((job) => job.status === "queued");
         if (!targetQueue || !activeJob) {
-            loggedActiveJobRef.current = null;
             return;
         }
         const track = activeJob.payload.track;
@@ -681,10 +759,6 @@ export function useDownload() {
         setDownloadProgress(Math.round(targetQueue.progress * 100));
         setDownloadingTrack(track.spotify_id || null);
         setCurrentDownloadInfo({ name: track.name || "Unknown track", artists: track.artists || "" });
-        if (loggedActiveJobRef.current !== activeJob.id) {
-            loggedActiveJobRef.current = activeJob.id;
-            logger.info(`starting download: ${track.name || "Unknown track"} - ${track.artists || ""}`);
-        }
     }, [downloadQueues.snapshot]);
     const handleDownloadTrack = async (
         track: TrackMetadata,
@@ -698,14 +772,16 @@ export function useDownload() {
         const queue = queueContext || fallbackQueue(playlistName, isAlbum);
         const [enrichedTrack] = await enrichTracksReleaseDates([track], settings);
         const resolvedTrack = enrichedTrack || track;
-        const existingFilePaths = await findExistingFilePaths([resolvedTrack], settings, playlistName, isAlbum, "track download");
+        const sourceIndex = Math.max(0, (position || 1) - 1);
+        const sourceIndices = [sourceIndex];
+        const existingFilePaths = await findExistingFilePaths([resolvedTrack], settings, playlistName, isAlbum, "track download", sourceIndices);
         latestQueueIdRef.current = queue.id;
         setIsDownloading(true);
         setBulkDownloadType(null);
         setDownloadingTrack(resolvedTrack.spotify_id || null);
         await downloadQueues.retryTrack(queue, resolvedTrack, {
-            ...collectionArgsFor(settings, [resolvedTrack], playlistName, isAlbum, existingFilePaths),
-            sourceIndex: Math.max(0, (position || 1) - 1),
+            ...collectionArgsFor(settings, [resolvedTrack], playlistName, isAlbum, existingFilePaths, sourceIndices),
+            sourceIndex,
         });
     };
     const handleDownloadSelected = async (
@@ -721,10 +797,11 @@ export function useDownload() {
         }
         const settings = await getSettingsWithDefaults();
         const queue = queueContext || fallbackQueue(playlistName, isAlbum);
-        const selected = new Set(selectedTracks);
-        const selectedTrackObjects = allTracks.filter((track) => selected.has(track.spotify_id || ""));
+        const selectedEntries = selectTracksWithSourceIndices(allTracks, selectedTracks);
+        const selectedTrackObjects = selectedEntries.map((entry) => entry.track);
+        const sourceIndices = selectedEntries.map((entry) => entry.sourceIndex);
         const enrichedTracks = await enrichTracksReleaseDates(selectedTrackObjects, settings);
-        const existingFilePaths = await findExistingFilePaths(enrichedTracks, settings, playlistName, isAlbum, "selected download");
+        const existingFilePaths = await findExistingFilePaths(enrichedTracks, settings, playlistName, isAlbum, "selected download", sourceIndices);
         latestQueueIdRef.current = queue.id;
         setIsDownloading(true);
         setBulkDownloadType("selected");
@@ -733,7 +810,7 @@ export function useDownload() {
             queue,
             enrichedTracks,
             selectedTracks,
-            collectionArgsFor(settings, enrichedTracks, playlistName, isAlbum, existingFilePaths),
+            collectionArgsFor(settings, enrichedTracks, playlistName, isAlbum, existingFilePaths, sourceIndices),
         );
         if (!decisions.some((decision) => decision.added)) {
             toast.info("Selected tracks are already represented in this queue");
@@ -839,7 +916,7 @@ export function useDownload() {
                 completed++;
                 setDownloadProgress(Math.min(100, Math.round((completed / trackPathInfo.length) * 100)));
             }
-            openBatchSummary(summary);
+            openBatchSummary(summary, "metadata");
         }
         finally {
             setDownloadingTrack(null);
@@ -848,7 +925,7 @@ export function useDownload() {
         }
     };
     const handleRedownloadSuspiciousFromYouTube = async (includeFailedTracks: boolean = false) => {
-        const queueId = latestQueueIdRef.current;
+        const queueId = batchSummary?.queueId ?? latestQueueIdRef.current;
         const suspiciousRequests = queueId ? suspiciousRedownloadRequestsRef.current.get(queueId) : undefined;
         const failedRequests = queueId ? failedRedownloadRequestsRef.current.get(queueId) : undefined;
         const queuedRequests = [
@@ -930,7 +1007,7 @@ export function useDownload() {
                     requests?.delete(queued.key);
                 }
             }
-            openBatchSummary(nextSummary);
+            openBatchSummary(nextSummary, queueId || "redownload");
         }
         catch (err) {
             toast.error(err instanceof Error ? err.message : "YouTube redownload failed");

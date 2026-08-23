@@ -1,5 +1,5 @@
 import { useEffect, useRef, useSyncExternalStore } from "react";
-import { addDownloadJob, cancelDownloadQueue, downloadTrack, markDownloadItemFailed, skipDownloadItem } from "@/lib/api";
+import { addDownloadJob, cancelDownloadItem, cancelDownloadQueue, downloadTrack, markDownloadItemFailed, skipDownloadItem } from "@/lib/api";
 import { isUnauthorizedDownloadError, runWithUnauthorizedRetry } from "@/lib/batch-download";
 import {
     buildSpotifyCandidate,
@@ -25,6 +25,7 @@ export interface CollectionDownloadArgs {
     playlistOwner?: string;
     isAlbum?: boolean;
     m3u8OutputDir?: string;
+    sourceIndexFor?: (track: TrackMetadata, arrayIndex: number) => number;
     requestFor?: (track: TrackMetadata, sourceIndex: number) => RequestSeed;
     existingFileFor?: (track: TrackMetadata, sourceIndex: number) => string | undefined;
     updateExistingFile?: (track: TrackMetadata, sourceIndex: number, filePath: string) => Promise<DownloadResponse>;
@@ -36,6 +37,7 @@ export interface TrackDownloadArgs extends CollectionDownloadArgs {
 
 export interface DownloadQueueApi {
     addDownloadJob(queueId: string, jobId: string, spotifyId: string, trackName: string, artistName: string, albumName: string): Promise<string>;
+    cancelDownloadItem(itemId: string): Promise<void>;
     cancelDownloadQueue(queueId: string): Promise<number>;
     downloadTrack(request: DownloadRequest): Promise<DownloadResponse>;
     ensureValidToken(force?: boolean): Promise<string>;
@@ -75,6 +77,7 @@ export interface DownloadQueueHarness {
 
 const defaultApi: DownloadQueueApi = {
     addDownloadJob,
+    cancelDownloadItem,
     cancelDownloadQueue,
     downloadTrack,
     ensureValidToken: async (force?: boolean) => {
@@ -227,15 +230,21 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
             });
         }
         catch (error) {
+            const cancelled = signal.aborted || isCancellation(error);
             if (backendItemId && !downloadStarted) {
                 try {
-                    await api.markDownloadItemFailed(backendItemId, error instanceof Error ? error.message : String(error));
+                    if (cancelled) {
+                        await api.cancelDownloadItem(backendItemId);
+                    }
+                    else {
+                        await api.markDownloadItemFailed(backendItemId, error instanceof Error ? error.message : String(error));
+                    }
                 }
                 catch {
                     // Backend cleanup is best effort; preserve the original scheduler result.
                 }
             }
-            if (signal.aborted || isCancellation(error)) {
+            if (cancelled) {
                 return cancelledResponse(error);
             }
             throw error;
@@ -332,21 +341,21 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
     return {
         snapshot: () => scheduler.getSnapshot(),
         enqueueAll: async (queue, tracks, args) => {
-            const decisions = tracks.map((track, sourceIndex) =>
-                enqueue(queue, track, sourceIndex, args, "unseen-only"));
+            const decisions = tracks.map((track, arrayIndex) =>
+                enqueue(queue, track, args.sourceIndexFor?.(track, arrayIndex) ?? arrayIndex, args, "unseen-only"));
             notifyQueueIdleIfSettled(queue.id);
             return decisions;
         },
         enqueueSelected: async (queue, tracks, selectedIds, args) => {
             const selected = new Set(selectedIds);
-            const decisions = tracks.flatMap((track, sourceIndex) => selected.has(track.spotify_id || "")
-                ? [enqueue(queue, track, sourceIndex, args, "unseen-only")]
+            const decisions = tracks.flatMap((track, arrayIndex) => selected.has(track.spotify_id || "")
+                ? [enqueue(queue, track, args.sourceIndexFor?.(track, arrayIndex) ?? arrayIndex, args, "unseen-only")]
                 : []);
             notifyQueueIdleIfSettled(queue.id);
             return decisions;
         },
         retryTrack: async (queue, track, args) => {
-            const decision = enqueue(queue, track, args.sourceIndex ?? 0, args, "retry-terminal");
+            const decision = enqueue(queue, track, args.sourceIndex ?? args.sourceIndexFor?.(track, 0) ?? 0, args, "retry-terminal");
             notifyQueueIdleIfSettled(queue.id);
             return decision;
         },

@@ -1,5 +1,5 @@
 import type { SpotifyMetadataResponse, DownloadRequest, DownloadResponse, HealthResponse, LyricsDownloadRequest, LyricsDownloadResponse, CoverDownloadRequest, CoverDownloadResponse, HeaderDownloadRequest, HeaderDownloadResponse, GalleryImageDownloadRequest, GalleryImageDownloadResponse, AvatarDownloadRequest, AvatarDownloadResponse, TrackMetadataUpdateRequest, TrackMetadataUpdateResult, SuspiciousRedownloadRequest, SuspiciousRedownloadResult, YtDlpStatus, } from "@/types/api";
-import { AddDownloadJob, CancelDownloadQueue, CheckYtDlpInstalled, DownloadAvatar, DownloadCover, DownloadGalleryImage, DownloadHeader, DownloadLyrics, DownloadTrack, EnsureYtDlpInstalledOrUpdated, GetSpotifyMetadata, MarkDownloadItemFailed, RedownloadSuspiciousTracksFromYouTube, SkipDownloadItem, UpdateTrackMetadata, UpdateTracksMetadata } from "../../wailsjs/go/main/App";
+import { AddDownloadJob, CancelDownloadItem, CancelDownloadQueue, CheckYtDlpInstalled, DownloadAvatar, DownloadCover, DownloadGalleryImage, DownloadHeader, DownloadLyrics, DownloadTrack, EnsureYtDlpInstalledOrUpdated, GetSpotifyMetadata, MarkDownloadItemFailed, RedownloadSuspiciousTracksFromYouTube, SkipDownloadItem, UpdateTrackMetadata, UpdateTracksMetadata } from "../../wailsjs/go/main/App";
 import { backend, main } from "../../wailsjs/go/models";
 export async function fetchSpotifyMetadata(url: string, batch: boolean = true, delay: number = 1.0, timeout: number = 300.0): Promise<SpotifyMetadataResponse> {
     const req = new main.SpotifyMetadataRequest({
@@ -23,6 +23,9 @@ export async function addDownloadJob(queueId: string, jobId: string, spotifyId: 
 }
 export async function cancelDownloadQueue(queueId: string): Promise<number> {
     return await CancelDownloadQueue(queueId);
+}
+export async function cancelDownloadItem(itemId: string): Promise<void> {
+    await CancelDownloadItem(itemId);
 }
 export async function markDownloadItemFailed(itemId: string, error: string): Promise<void> {
     await MarkDownloadItemFailed(itemId, error);

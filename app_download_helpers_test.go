@@ -163,6 +163,24 @@ func TestAddDownloadJobUsesProvidedIdentity(t *testing.T) {
 	}
 }
 
+func TestCancelDownloadItemMarksRegisteredJobCancelled(t *testing.T) {
+	backend.ClearAllDownloads()
+	t.Cleanup(backend.ClearAllDownloads)
+
+	app := &App{}
+	jobID, err := app.AddDownloadJob("playlist:a", "frontend-job-1", "spotify-1", "Track", "Artist", "Album")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	app.CancelDownloadItem(jobID)
+
+	queue := backend.GetDownloadQueue()
+	if queue.CancelledCount != 1 || len(queue.Queue) != 1 || queue.Queue[0].Status != backend.StatusCancelled {
+		t.Fatalf("cancelled job = %#v, cancelled count = %d", queue.Queue, queue.CancelledCount)
+	}
+}
+
 func TestDownloadCompletesAfterFinalization(t *testing.T) {
 	backend.ClearAllDownloads()
 	t.Cleanup(backend.ClearAllDownloads)

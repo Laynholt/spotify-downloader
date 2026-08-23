@@ -3,9 +3,11 @@ import type { TrackMetadata } from "@/types/api";
 import {
     buildBatchDownloadWorkItems,
     isUnauthorizedDownloadError,
+    latestTerminalQueueJobs,
     orderedQueueFilePaths,
     reduceBatchFilePaths,
     runWithUnauthorizedRetry,
+    selectTracksWithSourceIndices,
     type BatchDownloadWorkItem,
 } from "./batch-download";
 import type { DownloadJob } from "./download-queue-manager";
@@ -37,6 +39,27 @@ function pathInfo() {
 }
 
 describe("batch download source ordering", () => {
+    it("keeps selected tracks paired with their original playlist indices", () => {
+        expect(selectTracksWithSourceIndices(
+            [track(0), track(1), track(2), track(3)],
+            ["track-1", "track-3"],
+        ).map((entry) => [entry.track.spotify_id, entry.sourceIndex])).toEqual([
+            ["track-1", 1],
+            ["track-3", 3],
+        ]);
+    });
+
+    it("selects the latest terminal attempt by enqueue time and attempt order before source index", () => {
+        const jobs = [
+            { id: "older", trackKey: "track-a", sourceIndex: 5, enqueuedAt: 10, status: "failed" },
+            { id: "newer", trackKey: "track-a", sourceIndex: 0, enqueuedAt: 20, status: "completed" },
+            { id: "tied-older", trackKey: "track-b", sourceIndex: 9, enqueuedAt: 30, status: "failed" },
+            { id: "tied-newer", trackKey: "track-b", sourceIndex: 1, enqueuedAt: 30, status: "skipped" },
+        ] as DownloadJob<unknown, import("@/types/api").DownloadResponse>[];
+
+        expect(latestTerminalQueueJobs(jobs).map((job) => job.id)).toEqual(["newer", "tied-newer"]);
+    });
+
     it("keeps existing source indices and reduces out-of-order completions into source order", () => {
         const sourceEntries = Array.from({ length: 5 }, (_, sourceIndex) => ({
             track: track(sourceIndex),
