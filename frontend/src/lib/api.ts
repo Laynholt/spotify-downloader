@@ -1,5 +1,5 @@
 import type { SpotifyMetadataResponse, DownloadRequest, DownloadResponse, HealthResponse, LyricsDownloadRequest, LyricsDownloadResponse, CoverDownloadRequest, CoverDownloadResponse, HeaderDownloadRequest, HeaderDownloadResponse, GalleryImageDownloadRequest, GalleryImageDownloadResponse, AvatarDownloadRequest, AvatarDownloadResponse, TrackMetadataUpdateRequest, TrackMetadataUpdateResult, SuspiciousRedownloadRequest, SuspiciousRedownloadResult, YtDlpStatus, } from "@/types/api";
-import { CheckYtDlpInstalled, DownloadAvatar, DownloadCover, DownloadGalleryImage, DownloadHeader, DownloadLyrics, DownloadTrack, EnsureYtDlpInstalledOrUpdated, GetSpotifyMetadata, RedownloadSuspiciousTracksFromYouTube, UpdateTrackMetadata, UpdateTracksMetadata } from "../../wailsjs/go/main/App";
+import { AddDownloadJob, CancelDownloadQueue, CheckYtDlpInstalled, DownloadAvatar, DownloadCover, DownloadGalleryImage, DownloadHeader, DownloadLyrics, DownloadTrack, EnsureYtDlpInstalledOrUpdated, GetSpotifyMetadata, RedownloadSuspiciousTracksFromYouTube, UpdateTrackMetadata, UpdateTracksMetadata } from "../../wailsjs/go/main/App";
 import { backend, main } from "../../wailsjs/go/models";
 export async function fetchSpotifyMetadata(url: string, batch: boolean = true, delay: number = 1.0, timeout: number = 300.0): Promise<SpotifyMetadataResponse> {
     const req = new main.SpotifyMetadataRequest({
@@ -17,6 +17,12 @@ export async function downloadTrack(request: DownloadRequest): Promise<DownloadR
         req.use_single_genre = request.use_single_genre;
     }
     return await DownloadTrack(req);
+}
+export async function addDownloadJob(queueId: string, jobId: string, spotifyId: string, trackName: string, artistName: string, albumName: string): Promise<string> {
+    return await AddDownloadJob(queueId, jobId, spotifyId, trackName, artistName, albumName);
+}
+export async function cancelDownloadQueue(queueId: string): Promise<number> {
+    return await CancelDownloadQueue(queueId);
 }
 export async function downloadLyrics(request: LyricsDownloadRequest): Promise<LyricsDownloadResponse> {
     const req = new main.LyricsDownloadRequest(request);

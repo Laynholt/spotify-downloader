@@ -1,4 +1,5 @@
 import type { DownloadResponse, TrackMetadata } from "@/types/api";
+import type { DownloadJob } from "./download-queue-manager";
 import type { BatchTrackPathInfo } from "@/hooks/useDownload";
 
 export interface BatchDownloadWorkItem {
@@ -86,4 +87,20 @@ export function reduceBatchFilePaths(
         }
     }
     return filePaths;
+}
+
+/** Keep the newest playable result for each original source position. */
+export function orderedQueueFilePaths<TPayload>(
+    jobs: readonly DownloadJob<TPayload, DownloadResponse>[],
+): string[] {
+    const paths = new Map<number, string>();
+    for (const job of jobs) {
+        const file = job.result?.file;
+        if ((job.status === "completed" || job.status === "skipped") && file) {
+            paths.set(job.sourceIndex, file);
+        }
+    }
+    return [...paths.entries()]
+        .sort(([left], [right]) => left - right)
+        .map(([, file]) => file);
 }

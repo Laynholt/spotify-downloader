@@ -3,10 +3,12 @@ import type { TrackMetadata } from "@/types/api";
 import {
     buildBatchDownloadWorkItems,
     isUnauthorizedDownloadError,
+    orderedQueueFilePaths,
     reduceBatchFilePaths,
     runWithUnauthorizedRetry,
     type BatchDownloadWorkItem,
 } from "./batch-download";
+import type { DownloadJob } from "./download-queue-manager";
 
 function track(index: number): TrackMetadata {
     return {
@@ -63,6 +65,17 @@ describe("batch download source ordering", () => {
         );
 
         expect(finalFilePaths).toEqual(["file-0", "existing-1", "file-2", "file-3", "existing-4"]);
+    });
+
+    it("keeps the latest successful or skipped file for each source index in source order", () => {
+        const jobs = [
+            { sourceIndex: 2, status: "completed", result: { success: true, message: "done", file: "third-old" } },
+            { sourceIndex: 0, status: "skipped", result: { success: true, message: "exists", file: "first" } },
+            { sourceIndex: 2, status: "completed", result: { success: true, message: "done", file: "third-new" } },
+            { sourceIndex: 1, status: "failed", result: { success: false, message: "failed" } },
+        ] as DownloadJob<unknown, import("@/types/api").DownloadResponse>[];
+
+        expect(orderedQueueFilePaths(jobs)).toEqual(["first", "third-new"]);
     });
 
     it.each(["401", "403", "unauthorized", "ERR_UNAUTHORIZED"])("recognizes %s as an unauthorized response", (error) => {

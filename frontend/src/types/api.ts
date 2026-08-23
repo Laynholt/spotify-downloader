@@ -137,6 +137,8 @@ export interface DownloadRequest {
     item_id?: string;
     queue_id?: string;
     force?: boolean;
+    playlist_name?: string;
+    playlist_owner?: string;
     use_first_artist_only?: boolean;
     use_single_genre?: boolean;
     embed_genre?: boolean;
