@@ -72,6 +72,7 @@ func buildTrackPipelineRequest(req DownloadRequest, itemID string) backend.Track
 	return backend.TrackPipelineRequest{
 		ItemID:               itemID,
 		TrackID:              trackID,
+		Force:                req.Force,
 		OutputDir:            req.OutputDir,
 		AudioFormat:          req.AudioFormat,
 		FilenameFormat:       req.FilenameFormat,

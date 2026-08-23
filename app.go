@@ -129,6 +129,7 @@ type DownloadRequest struct {
 	EmbedMaxQualityCover bool   `json:"embed_max_quality_cover,omitempty"`
 	ItemID               string `json:"item_id,omitempty"`
 	QueueID              string `json:"queue_id,omitempty"`
+	Force                bool   `json:"force,omitempty"`
 	PlaylistName         string `json:"playlist_name,omitempty"`
 	PlaylistOwner        string `json:"playlist_owner,omitempty"`
 	UseFirstArtistOnly   bool   `json:"use_first_artist_only,omitempty"`

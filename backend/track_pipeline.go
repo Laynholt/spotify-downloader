@@ -23,6 +23,7 @@ const (
 type TrackPipelineRequest struct {
 	ItemID               string
 	TrackID              string
+	Force                bool
 	OutputDir            string
 	AudioFormat          string
 	FilenameFormat       string
@@ -198,12 +199,14 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 
 	// Existing-state detection is intentionally before link resolution and all
 	// optional branches. A non-empty file is the only valid existing artifact.
-	for _, ext := range PossibleAudioExtensions(req.AudioFormat) {
-		candidate := outputBasePath + ext
-		if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() && info.Size() > 0 {
-			result.File = candidate
-			result.AlreadyExists = true
-			return result, nil
+	if !req.Force {
+		for _, ext := range PossibleAudioExtensions(req.AudioFormat) {
+			candidate := outputBasePath + ext
+			if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() && info.Size() > 0 {
+				result.File = candidate
+				result.AlreadyExists = true
+				return result, nil
+			}
 		}
 	}
 

@@ -135,6 +135,8 @@ export interface DownloadRequest {
     embed_lyrics?: boolean;
     embed_max_quality_cover?: boolean;
     item_id?: string;
+    queue_id?: string;
+    force?: boolean;
     use_first_artist_only?: boolean;
     use_single_genre?: boolean;
     embed_genre?: boolean;

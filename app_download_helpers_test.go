@@ -356,6 +356,49 @@ func TestDownloadTrackReturnsPipelineDiagnosticsAndBuildsRequest(t *testing.T) {
 	}
 }
 
+func TestDownloadTrackPropagatesQueueAndForce(t *testing.T) {
+	backend.ClearAllDownloads()
+	t.Cleanup(backend.ClearAllDownloads)
+	outputDir := t.TempDir()
+	finalPath := filepath.Join(outputDir, "track.mp3")
+	if err := os.WriteFile(finalPath, []byte("audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var captured backend.TrackPipelineRequest
+	var activeQueueID string
+	app := &App{ctx: context.Background()}
+	app.runTrackPipeline = func(_ context.Context, req backend.TrackPipelineRequest) (backend.TrackPipelineResult, error) {
+		captured = req
+		app.activeMu.Lock()
+		activeQueueID = app.activeDownloads["job-1"].QueueID
+		app.activeMu.Unlock()
+		return backend.TrackPipelineResult{File: finalPath}, nil
+	}
+	_, err := app.DownloadTrack(DownloadRequest{
+		QueueID:      "playlist:p1",
+		Force:        true,
+		ItemID:       "job-1",
+		TrackID:      "track-1",
+		SessionToken: "session-token",
+		TrackName:    "Track",
+		ArtistName:   "Artist",
+		OutputDir:    outputDir,
+	})
+	if err != nil {
+		t.Fatalf("DownloadTrack returned error: %v", err)
+	}
+	if !captured.Force {
+		t.Fatalf("captured pipeline request Force = false, want true")
+	}
+	if activeQueueID != "playlist:p1" {
+		t.Fatalf("active queue ID = %q, want playlist:p1", activeQueueID)
+	}
+	if got := app.CancelDownloadQueue("playlist:p1"); got != 0 {
+		t.Fatalf("queue cancellation after completed download = %d, want 0", got)
+	}
+}
+
 func TestDownloadTrackSuspiciousMoveOwnsTerminalQueuePath(t *testing.T) {
 	backend.ClearAllDownloads()
 	t.Cleanup(backend.ClearAllDownloads)

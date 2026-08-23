@@ -577,6 +577,62 @@ func TestTrackPipelineExistingOutputSkipsOptionalBranches(t *testing.T) {
 	}
 }
 
+func TestTrackPipelineForceBypassesExistingOutput(t *testing.T) {
+	ClearAllDownloads()
+	t.Cleanup(ClearAllDownloads)
+	req, paths := testTrackPipelineRequest(t)
+	req.Force = true
+	AddToQueue(req.ItemID, req.BaseMetadata.Title, req.BaseMetadata.Artist, req.BaseMetadata.Album, req.TrackID)
+	if err := os.MkdirAll(req.OutputDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	filename := SanitizeFilename(BuildFilename(req.BaseMetadata.Title, req.BaseMetadata.Artist, req.BaseMetadata.Album, req.BaseMetadata.AlbumArtist, req.BaseMetadata.Date, req.BaseMetadata.DiscNumber, req.FilenameFormat, req.IncludeTrackNumber, req.Position, req.UseAlbumTrackNumber, req.PlaylistName, req.PlaylistOwner))
+	existing := filepath.Join(req.OutputDir, filename+".mp3")
+	if err := os.WriteFile(existing, []byte("old"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var resolverCalls atomic.Int32
+	installPipelineDepsForTest(t, trackPipelineDeps{
+		resolveTarget: func(context.Context, *SpotiDownloader, TrackPipelineRequest) (string, string, error) {
+			resolverCalls.Add(1)
+			return "source", ".mp3", nil
+		},
+		downloadAudio: func(_ context.Context, _ *SpotiDownloader, _ string, base, ext, _ string) (string, error) {
+			path := base + ext
+			return path, os.WriteFile(path, []byte("new"), 0600)
+		},
+		convertAudio:  func(_ context.Context, path, _, _ string) (string, error) { return path, nil },
+		downloadCover: func(context.Context, *SpotiDownloader, string, string, bool) (string, error) { return "", nil },
+		metadata: func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string) {
+			return taggingMetadataResult{}, nil
+		},
+		lyrics:        func(context.Context, TrackPipelineRequest, int) (string, error) { return "", nil },
+		probeDuration: func(context.Context, string) (float64, error) { return 0, nil },
+		finalizeMedia: func(context.Context, string, Metadata, string) error { return nil },
+	})
+
+	result, err := (&SpotiDownloader{}).RunTrackPipeline(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolverCalls.Load() != 1 {
+		t.Fatalf("resolver calls = %d, want 1", resolverCalls.Load())
+	}
+	if result.AlreadyExists || result.File != existing {
+		t.Fatalf("result = %#v", result)
+	}
+	contents, err := os.ReadFile(existing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "new" {
+		t.Fatalf("destination contents = %q, want new staged bytes", contents)
+	}
+	if _, err := os.Stat(filepath.Join(paths.RunTempDir, SanitizeFilename(req.ItemID))); !os.IsNotExist(err) {
+		t.Fatalf("staged track temp still exists: %v", err)
+	}
+}
+
 func TestTrackPipelineDefaultMetadataPropagatesCacheOutcomes(t *testing.T) {
 	cache, warnings := OpenMetadataCache("", CacheOptions{})
 	if len(warnings) != 0 {
