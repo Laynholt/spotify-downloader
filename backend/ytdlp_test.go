@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -41,6 +43,101 @@ func ytDlpDiagnosticFixture() string {
 	const size = 50 * 1024
 	suffix := "\r\n[ExtractAudio]\tDestination: final sentinel.mp3\r\n"
 	return strings.Repeat("x", size-len(suffix)) + suffix
+}
+
+func TestYtDlpDiagnosticsPreservesValidUTF8AtByteLimit(t *testing.T) {
+	want := strings.Repeat("y", 4091) + "終"
+	diagnostics := normalizeYtDlpDiagnostics([]byte("x界" + want))
+	if !utf8.ValidString(diagnostics) {
+		t.Fatalf("diagnostics contain invalid UTF-8: %q", diagnostics[:8])
+	}
+	if diagnostics != want || len(diagnostics) > ytDlpDiagnosticsLimit {
+		t.Fatalf("diagnostics length = %d, want %d-byte newest suffix", len(diagnostics), len(want))
+	}
+
+	wire, err := json.Marshal(YtDlpDownloadResult{Diagnostics: diagnostics, Output: diagnostics})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded YtDlpDownloadResult
+	if err := json.Unmarshal(wire, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Diagnostics != want || decoded.Output != want || len(decoded.Diagnostics) > ytDlpDiagnosticsLimit || len(decoded.Output) > ytDlpDiagnosticsLimit {
+		t.Fatalf("wire result escaped diagnostic contract: diagnostics=%d output=%d", len(decoded.Diagnostics), len(decoded.Output))
+	}
+}
+
+func TestYtDlpStageFromOutputRecognizesAnchoredProgressAndErrors(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   YtDlpStage
+	}{
+		{name: "search progress", output: "[youtube] Extracting URL: https://youtu.be/track", want: YtDlpStageSearch},
+		{name: "search error", output: "ERROR: [youtube] track: Video unavailable", want: YtDlpStageSearch},
+		{name: "download progress", output: "[download] Destination: track.webm", want: YtDlpStageDownload},
+		{name: "download error", output: "ERROR: unable to download video data: HTTP Error 403: Forbidden", want: YtDlpStageDownload},
+		{name: "conversion progress", output: "[ExtractAudio] Destination: track.mp3", want: YtDlpStageConversion},
+		{name: "conversion error", output: "ERROR: Postprocessing: ffprobe and ffmpeg not found", want: YtDlpStageConversion},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := ytDlpStageFromOutput([]byte(test.output)); got != test.want {
+				t.Fatalf("stage = %q, want %q for %q", got, test.want, test.output)
+			}
+		})
+	}
+}
+
+func TestYtDlpStageFromOutputIgnoresUnanchoredMarkers(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   YtDlpStage
+	}{
+		{
+			name:   "search URL",
+			output: "[youtube] Extracting URL: https://example.invalid/[download]/[ExtractAudio]",
+			want:   YtDlpStageSearch,
+		},
+		{
+			name:   "download filename",
+			output: "[download] Destination: C:\\music\\[ExtractAudio]\\track.webm",
+			want:   YtDlpStageDownload,
+		},
+		{
+			name:   "later error filename",
+			output: "[download] Destination: track.webm\nERROR: unable to open C:\\music\\[ExtractAudio]\\track.webm",
+			want:   YtDlpStageDownload,
+		},
+		{
+			name:   "plain marker-like text",
+			output: "failed to open /music/[download]/track.webm",
+			want:   YtDlpStageSearch,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := ytDlpStageFromOutput([]byte(test.output)); got != test.want {
+				t.Fatalf("stage = %q, want %q for %q", got, test.want, test.output)
+			}
+		})
+	}
+}
+
+func TestYtDlpStageFromOutputUsesLastAnchoredOperation(t *testing.T) {
+	output := strings.Join([]string{
+		"[youtube] Extracting URL: https://youtu.be/track",
+		"[download] Destination: track.webm",
+		"[ExtractAudio] Destination: track.mp3",
+		"ERROR: unable to download video data: connection reset",
+	}, "\r\n")
+	if got := ytDlpStageFromOutput([]byte(output)); got != YtDlpStageDownload {
+		t.Fatalf("stage = %q, want last anchored operation %q", got, YtDlpStageDownload)
+	}
 }
 
 func TestBuildYtDlpArgsIncludesPortableRuntimePaths(t *testing.T) {
@@ -223,14 +320,21 @@ func TestYtDlpDiagnosticsLogsFullOutputAndBoundsResponse(t *testing.T) {
 		func() (string, error) { return executable, nil },
 	)
 	var logged string
+	logCalls := 0
 	previousLogf := ytDlpDebugLogf
-	ytDlpDebugLogf = func(format string, args ...any) { logged = fmt.Sprintf(format, args...) }
+	ytDlpDebugLogf = func(format string, args ...any) {
+		logCalls++
+		logged = fmt.Sprintf(format, args...)
+	}
 	t.Cleanup(func() { ytDlpDebugLogf = previousLogf })
 
 	result := DownloadWithYtDlpContext(context.Background(), YtDlpDownloadRequest{
 		Query:      "https://example.invalid/track",
 		OutputBase: filepath.Join(t.TempDir(), "track"),
 	})
+	if logCalls != 1 {
+		t.Fatalf("debug logger calls = %d, want exactly 1", logCalls)
+	}
 	if logged != ytDlpDiagnosticFixture() {
 		t.Fatalf("debug logger received %d bytes, want full %d-byte output", len(logged), len(ytDlpDiagnosticFixture()))
 	}

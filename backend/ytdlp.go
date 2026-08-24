@@ -426,23 +426,30 @@ func normalizeYtDlpDiagnostics(output []byte) string {
 	if len(diagnostics) > ytDlpDiagnosticsLimit {
 		diagnostics = diagnostics[len(diagnostics)-ytDlpDiagnosticsLimit:]
 	}
-	return diagnostics
+	return strings.ToValidUTF8(diagnostics, "")
 }
 
 func ytDlpStageFromOutput(output []byte) YtDlpStage {
-	lower := strings.ToLower(string(output))
 	stage := YtDlpStageSearch
-	lastMarker := -1
-	for candidate, markers := range map[YtDlpStage][]string{
-		YtDlpStageSearch:     {"extracting url", "[youtube", "[generic"},
-		YtDlpStageDownload:   {"[download]"},
-		YtDlpStageConversion: {"[extractaudio]", "[ffmpeg]", "[merger]", "[fixup", "[videoconvertor]", "[postprocess"},
-	} {
-		for _, marker := range markers {
-			if index := strings.LastIndex(lower, marker); index > lastMarker {
-				lastMarker = index
-				stage = candidate
-			}
+	for _, rawLine := range strings.Split(string(output), "\n") {
+		line := strings.ToLower(strings.TrimSpace(rawLine))
+		switch {
+		case strings.HasPrefix(line, "error: postprocessing:"),
+			strings.HasPrefix(line, "[extractaudio]"),
+			strings.HasPrefix(line, "[ffmpeg]"),
+			strings.HasPrefix(line, "[merger]"),
+			strings.HasPrefix(line, "[fixup"),
+			strings.HasPrefix(line, "[videoconvertor]"),
+			strings.HasPrefix(line, "[postprocess"):
+			stage = YtDlpStageConversion
+		case strings.HasPrefix(line, "error: unable to download video data"),
+			strings.HasPrefix(line, "[download]"):
+			stage = YtDlpStageDownload
+		case strings.HasPrefix(line, "error: [youtube"),
+			strings.HasPrefix(line, "error: [generic"),
+			strings.HasPrefix(line, "[youtube"),
+			strings.HasPrefix(line, "[generic"):
+			stage = YtDlpStageSearch
 		}
 	}
 	return stage
