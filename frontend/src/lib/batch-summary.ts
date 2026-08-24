@@ -115,3 +115,23 @@ export function hasProblemDetails(summary: BatchDownloadSummary): boolean {
         summary.youtubeFailed > 0 ||
         summary.youtubeStillSuspicious > 0;
 }
+
+export function youtubeEligibleResultIds(summary: BatchDownloadSummary): string[] {
+    return summary.results
+        .filter((result) => result.status === "failed" || result.status === "suspicious")
+        .map((result) => result.id);
+}
+
+export function initialYoutubeSelection(summary: BatchDownloadSummary): Set<string> {
+    return new Set(youtubeEligibleResultIds(summary));
+}
+
+export function normalizeYoutubeSelection(summary: BatchDownloadSummary, selected: ReadonlySet<string>): Set<string> {
+    const eligible = new Set(youtubeEligibleResultIds(summary));
+    return new Set([...selected].filter((id) => eligible.has(id)));
+}
+
+export function selectedYoutubeRetryResultIds(summary: BatchDownloadSummary, selected: ReadonlySet<string>): string[] {
+    const normalized = normalizeYoutubeSelection(summary, selected);
+    return youtubeEligibleResultIds(summary).filter((id) => normalized.has(id));
+}

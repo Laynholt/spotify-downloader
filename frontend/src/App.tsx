@@ -552,7 +552,7 @@ function App() {
 
             <DownloadQueue isOpen={downloadQueue.isOpen} onClose={downloadQueue.closeQueue} queueInfo={downloadProgress}/>
 
-            <BatchDownloadSummaryDialog open={download.isBatchSummaryOpen} summary={download.batchSummary} isRedownloadingSuspicious={download.isRedownloadingSuspicious} redownloadProgress={download.downloadProgress} redownloadCurrentTrack={download.currentDownloadInfo} onMinimize={download.minimizeBatchSummary} onClose={download.closeBatchSummary} onRedownloadSuspicious={download.handleRedownloadSuspiciousFromYouTube}/>
+            <BatchDownloadSummaryDialog open={download.isBatchSummaryOpen} summary={download.batchSummary} isRedownloadingSuspicious={download.isRedownloadingSuspicious} redownloadProgress={download.downloadProgress} redownloadCurrentTrack={download.currentDownloadInfo} onMinimize={download.minimizeBatchSummary} onClose={download.closeBatchSummary} selectedYoutubeResultIds={download.selectedYoutubeResultIds} onToggleYoutubeResult={download.toggleYoutubeResult} onSelectAllYoutube={download.selectAllYoutube} onClearYoutube={download.clearYoutubeSelection} onRedownloadSelectedFromYouTube={download.handleRedownloadSelectedFromYouTube}/>
 
 
             {download.isBatchSummaryMinimized && download.batchSummary && (<Button onClick={download.restoreBatchSummary} className="fixed bottom-20 right-6 z-50 gap-2 shadow-lg">

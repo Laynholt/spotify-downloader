@@ -6,7 +6,17 @@ import { toastWithSound as toast } from "@/lib/toast-with-sound";
 import { joinPath, sanitizePath, getFirstArtist } from "@/lib/utils";
 import { logger } from "@/lib/logger";
 import { logDuplicateTracks } from "@/lib/duplicate-tracks";
-import { addBatchResult, createEmptyBatchSummary, type BatchDownloadSummary, type BatchTrackResult, type BatchTrackStatus } from "@/lib/batch-summary";
+import {
+    addBatchResult,
+    createEmptyBatchSummary,
+    initialYoutubeSelection,
+    normalizeYoutubeSelection,
+    selectedYoutubeRetryResultIds,
+    youtubeEligibleResultIds,
+    type BatchDownloadSummary,
+    type BatchTrackResult,
+    type BatchTrackStatus,
+} from "@/lib/batch-summary";
 import type { DownloadResponse, SuspiciousRedownloadRequest, SuspiciousRedownloadResult, TrackMetadata, TrackMetadataUpdateRequest, TrackMetadataUpdateResult } from "@/types/api";
 import { latestTerminalQueueJobs, orderedQueueFilePaths, selectTracksWithSourceIndices } from "@/lib/batch-download";
 import { useDownloadQueues, type CollectionDownloadArgs } from "@/hooks/useDownloadQueues";
@@ -445,6 +455,7 @@ export function useDownload() {
     } | null>(null);
     const [suspiciousTracks, setSuspiciousTracks] = useState<Map<string, SuspiciousTrackInfo>>(new Map());
     const [batchSummary, setBatchSummary] = useState<QueueOwnedBatchSummary | null>(null);
+    const [youtubeSelection, setYoutubeSelection] = useState<Set<string>>(new Set());
     const [isBatchSummaryOpen, setIsBatchSummaryOpen] = useState(false);
     const [isBatchSummaryMinimized, setIsBatchSummaryMinimized] = useState(false);
     const [isBulkUpdatingMetadata, setIsBulkUpdatingMetadata] = useState(false);
@@ -456,7 +467,9 @@ export function useDownload() {
     const suspiciousRedownloadRequestsRef = useRef<Map<string, Map<string, SuspiciousRedownloadRequest>>>(new Map());
     const failedRedownloadRequestsRef = useRef<Map<string, Map<string, SuspiciousRedownloadRequest>>>(new Map());
     const openBatchSummary = (summary: BatchDownloadSummary, queueId: string) => {
-        setBatchSummary(withBatchSummaryQueue(summary, queueId));
+        const summaryWithQueue = withBatchSummaryQueue(summary, queueId);
+        setBatchSummary(summaryWithQueue);
+        setYoutubeSelection(initialYoutubeSelection(summaryWithQueue));
         setIsBatchSummaryMinimized(false);
         setIsBatchSummaryOpen(true);
     };
@@ -474,6 +487,32 @@ export function useDownload() {
     const closeBatchSummary = () => {
         setIsBatchSummaryOpen(false);
         setIsBatchSummaryMinimized(false);
+    };
+    const selectedYoutubeResultIds = batchSummary
+        ? normalizeYoutubeSelection(batchSummary, youtubeSelection)
+        : new Set<string>();
+    const toggleYoutubeResult = (id: string) => {
+        if (!batchSummary || !youtubeEligibleResultIds(batchSummary).includes(id)) {
+            return;
+        }
+        setYoutubeSelection((previous) => {
+            const next = normalizeYoutubeSelection(batchSummary, previous);
+            if (next.has(id)) {
+                next.delete(id);
+            }
+            else {
+                next.add(id);
+            }
+            return next;
+        });
+    };
+    const selectAllYoutube = () => {
+        if (batchSummary) {
+            setYoutubeSelection(initialYoutubeSelection(batchSummary));
+        }
+    };
+    const clearYoutubeSelection = () => {
+        setYoutubeSelection(new Set());
     };
     const recordSuspiciousTrack = (trackID: string, info: SuspiciousTrackInfo) => {
         if (!trackID) {
@@ -495,14 +534,13 @@ export function useDownload() {
             return next;
         });
     };
-    const redownloadTrackKey = (track: TrackMetadata) => track.spotify_id || `${track.name || ""}-${track.artists || ""}`;
-    const queueSuspiciousRedownload = (queueId: string, track: TrackMetadata, settings: Settings, pathInfo: BatchTrackPathInfo, filePath?: string, replacementPath?: string) => {
+    const queueSuspiciousRedownload = (queueId: string, resultId: string, track: TrackMetadata, settings: Settings, pathInfo: BatchTrackPathInfo, filePath?: string, replacementPath?: string) => {
         if (!filePath) {
             return;
         }
         const metadataFilePath = replacementPath || filePath;
         const queueRequests = suspiciousRedownloadRequestsRef.current.get(queueId) || new Map<string, SuspiciousRedownloadRequest>();
-        queueRequests.set(redownloadTrackKey(track), {
+        queueRequests.set(resultId, {
             original_file_path: filePath,
             replacement_file_path: replacementPath,
             collection_dir: pathInfo.baseOutputDir,
@@ -511,10 +549,10 @@ export function useDownload() {
         });
         suspiciousRedownloadRequestsRef.current.set(queueId, queueRequests);
     };
-    const queueFailedRedownload = (queueId: string, track: TrackMetadata, settings: Settings, pathInfo: BatchTrackPathInfo) => {
+    const queueFailedRedownload = (queueId: string, resultId: string, track: TrackMetadata, settings: Settings, pathInfo: BatchTrackPathInfo) => {
         const replacementPath = buildExpectedReplacementFilePath(track, settings, pathInfo);
         const queueRequests = failedRedownloadRequestsRef.current.get(queueId) || new Map<string, SuspiciousRedownloadRequest>();
-        queueRequests.set(redownloadTrackKey(track), {
+        queueRequests.set(resultId, {
             original_file_path: "",
             replacement_file_path: replacementPath,
             collection_dir: pathInfo.baseOutputDir,
@@ -634,27 +672,29 @@ export function useDownload() {
             for (const job of terminalJobs) {
                 const track = job.payload.track;
                 const response = job.result;
+                let result: BatchTrackResult;
                 if (job.status === "completed" || job.status === "skipped") {
-                    summary = addBatchResult(summary, response
+                    result = response
                         ? downloadResultToBatch(track, response)
-                        : batchResult(track, job.status === "skipped" ? "skipped" : "downloaded"));
+                        : batchResult(track, job.status === "skipped" ? "skipped" : "downloaded");
                 }
                 else if (job.status === "suspicious") {
-                    summary = addBatchResult(summary, response
+                    result = response
                         ? suspiciousDownloadResult(track, response)
-                        : batchResult(track, "suspicious", { error: job.error }));
+                        : batchResult(track, "suspicious", { error: job.error });
                 }
                 else if (job.status === "cancelled") {
-                    summary = addBatchResult(summary, batchResult(track, "cancelled", {
+                    result = batchResult(track, "cancelled", {
                         error: job.error,
                         reason: "Download cancelled",
-                    }));
+                    });
                 }
                 else {
-                    summary = addBatchResult(summary, batchResult(track, "failed", {
+                    result = batchResult(track, "failed", {
                         error: job.error || response?.error || (job.status === "unavailable" ? "Spotify track ID is missing" : "Download failed"),
-                    }));
+                    });
                 }
+                summary = addBatchResult(summary, { ...result, id: job.id });
             }
             const earliestEnqueuedAt = Math.min(...allTerminalJobs.map((job) => job.enqueuedAt));
             const latestFinishedAt = Math.max(...allTerminalJobs.map((job) => job.finishedAt || job.enqueuedAt));
@@ -681,7 +721,7 @@ export function useDownload() {
                     if (job.status === "suspicious" && job.result) {
                         const pathInfo = buildBatchTrackPathInfo(track, job.payload.settings, job.payload.playlistName, job.payload.isAlbum, job.payload.position);
                         recordSuspiciousTrack(trackID, durationInfoFromDownload(job.result));
-                        queueSuspiciousRedownload(queue.id, track, job.payload.settings, pathInfo, job.result.file, job.result.replacement_path);
+                        queueSuspiciousRedownload(queue.id, job.id, track, job.payload.settings, pathInfo, job.result.file, job.result.replacement_path);
                     }
                     else {
                         clearSuspiciousTrack(trackID);
@@ -690,7 +730,7 @@ export function useDownload() {
                 else if (job.status === "failed" || job.status === "unavailable") {
                     failed.add(trackID);
                     const pathInfo = buildBatchTrackPathInfo(track, job.payload.settings, job.payload.playlistName, job.payload.isAlbum, job.payload.position);
-                    queueFailedRedownload(queue.id, track, job.payload.settings, pathInfo);
+                    queueFailedRedownload(queue.id, job.id, track, job.payload.settings, pathInfo);
                 }
             }
             logger.info(batchCompletionLog(summary));
@@ -896,7 +936,7 @@ export function useDownload() {
                             summary = addBatchResult(summary, batchResult(track, "metadata_updated", { file: filePath }));
                             if (result.suspicious) {
                                 recordSuspiciousTrack(trackID, durationInfoFromMetadata(result));
-                                queueSuspiciousRedownload("metadata", track, settings, pathInfo, filePath);
+                                queueSuspiciousRedownload("metadata", trackID, track, settings, pathInfo, filePath);
                                 summary = addBatchResult(summary, suspiciousMetadataResult(track, result));
                             }
                             else {
@@ -924,22 +964,25 @@ export function useDownload() {
             setIsBulkUpdatingMetadata(false);
         }
     };
-    const handleRedownloadSuspiciousFromYouTube = async (includeFailedTracks: boolean = false) => {
-        const queueId = batchSummary?.queueId ?? latestQueueIdRef.current;
+    const handleRedownloadSelectedFromYouTube = async (selectedResultIds: string[] = []) => {
+        if (!batchSummary) {
+            return;
+        }
+        const selectedIds = new Set(selectedYoutubeRetryResultIds(batchSummary, new Set(selectedResultIds)));
+        const queueId = batchSummary.queueId ?? latestQueueIdRef.current;
         const suspiciousRequests = queueId ? suspiciousRedownloadRequestsRef.current.get(queueId) : undefined;
         const failedRequests = queueId ? failedRedownloadRequestsRef.current.get(queueId) : undefined;
-        const queuedRequests = [
+        const availableRequests = [
             ...(suspiciousRequests
                 ? [...suspiciousRequests.entries()].map(([key, request]) => ({ request, key, source: "suspicious" as const }))
                 : []),
-            ...(includeFailedTracks
-                ? failedRequests
-                    ? [...failedRequests.entries()].map(([key, request]) => ({ request, key, source: "failed" as const }))
-                    : []
+            ...(failedRequests
+                ? [...failedRequests.entries()].map(([key, request]) => ({ request, key, source: "failed" as const }))
                 : []),
         ];
+        const queuedRequests = availableRequests.filter(({ key }) => selectedIds.has(key));
         if (queuedRequests.length === 0) {
-            toast.info(includeFailedTracks ? "No tracks available for YouTube redownload" : "No suspicious tracks available for YouTube redownload");
+            toast.info("No selected tracks available for YouTube redownload");
             return;
         }
         setIsRedownloadingSuspicious(true);
@@ -955,14 +998,14 @@ export function useDownload() {
                 toast.error(status.error);
                 return;
             }
-            let nextSummary = batchSummary || createEmptyBatchSummary("YouTube redownload summary");
+            let nextSummary: BatchDownloadSummary = batchSummary;
             const results: SuspiciousRedownloadResult[] = [];
             for (let i = 0; i < queuedRequests.length; i++) {
                 if (shouldStopDownloadRef.current) {
                     toast.info(`YouTube redownload stopped. ${i} of ${queuedRequests.length} processed.`);
                     break;
                 }
-                const { request } = queuedRequests[i];
+                const { request, key } = queuedRequests[i];
                 setCurrentDownloadInfo({
                     name: request.metadata.track_name || "Unknown track",
                     artists: request.metadata.artist_name || "YouTube redownload",
@@ -976,7 +1019,7 @@ export function useDownload() {
                     error: "YouTube redownload returned no result",
                 };
                 results.push(result);
-                nextSummary = addBatchResult(nextSummary, redownloadResultToBatch(request, result));
+                nextSummary = addBatchResult(nextSummary, { ...redownloadResultToBatch(request, result), id: key });
                 const trackID = request.metadata.track_id || result.track_id || "";
                 if (result.success && result.status === "replaced") {
                     clearSuspiciousTrack(trackID);
@@ -1048,6 +1091,7 @@ export function useDownload() {
         skippedTracks,
         suspiciousTracks,
         batchSummary,
+        selectedYoutubeResultIds,
         isBatchSummaryOpen,
         isBatchSummaryMinimized,
         isBulkUpdatingMetadata,
@@ -1057,11 +1101,14 @@ export function useDownload() {
         minimizeBatchSummary,
         restoreBatchSummary,
         closeBatchSummary,
+        toggleYoutubeResult,
+        selectAllYoutube,
+        clearYoutubeSelection,
         handleDownloadTrack,
         handleDownloadSelected,
         handleDownloadAll,
         handleUpdateAllMetadata,
-        handleRedownloadSuspiciousFromYouTube,
+        handleRedownloadSelectedFromYouTube,
         handleStopDownload,
         stopQueue: downloadQueues.stopQueue,
         resetDownloadedTracks,

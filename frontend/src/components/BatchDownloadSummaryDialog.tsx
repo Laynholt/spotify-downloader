@@ -1,13 +1,12 @@
 import { AlertTriangle, CheckCircle, Download, FileCheck, RefreshCw, XCircle } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import { type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Progress } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Spinner } from "@/components/ui/spinner";
-import type { BatchDownloadSummary, BatchTrackResult } from "@/lib/batch-summary";
-import { hasProblemDetails } from "@/lib/batch-summary";
+import { hasProblemDetails, youtubeEligibleResultIds, type BatchDownloadSummary, type BatchTrackResult } from "@/lib/batch-summary";
 import { formatCancelledSummary } from "@/lib/download-timings";
 
 interface BatchDownloadSummaryDialogProps {
@@ -21,7 +20,11 @@ interface BatchDownloadSummaryDialogProps {
     } | null;
     onMinimize: () => void;
     onClose: () => void;
-    onRedownloadSuspicious?: (includeFailedTracks?: boolean) => void;
+    selectedYoutubeResultIds: ReadonlySet<string>;
+    onToggleYoutubeResult: (id: string) => void;
+    onSelectAllYoutube: () => void;
+    onClearYoutube: () => void;
+    onRedownloadSelectedFromYouTube: (ids: string[]) => void;
 }
 
 function formatDuration(seconds?: number): string {
@@ -73,7 +76,13 @@ function formatElapsedMs(milliseconds: number): string {
     return `${(milliseconds / 1000).toFixed(2)}s`;
 }
 
-function ResultSection({ title, icon, results }: { title: string; icon: ReactNode; results: BatchTrackResult[] }) {
+function ResultSection({ title, icon, results, selectedYoutubeResultIds, onToggleYoutubeResult }: {
+    title: string;
+    icon: ReactNode;
+    results: BatchTrackResult[];
+    selectedYoutubeResultIds?: ReadonlySet<string>;
+    onToggleYoutubeResult?: (id: string) => void;
+}) {
     if (results.length === 0) {
         return null;
     }
@@ -86,10 +95,19 @@ function ResultSection({ title, icon, results }: { title: string; icon: ReactNod
             </summary>
             <div className="mt-3 max-h-48 space-y-2 overflow-y-auto pr-1">
                 {results.map((result) => (
-                    <div key={`${result.status}-${result.id}-${result.file || result.replacementPath || ""}`} className="rounded-md bg-muted/40 px-3 py-2">
-                        <div className="text-sm font-medium">{result.name}</div>
-                        <div className="text-xs text-muted-foreground">{result.artists}</div>
-                        {detailText(result) && <div className="mt-1 text-xs text-muted-foreground">{detailText(result)}</div>}
+                    <div key={`${result.status}-${result.id}-${result.file || result.replacementPath || ""}`} className="flex items-start gap-3 rounded-md bg-muted/40 px-3 py-2">
+                        {selectedYoutubeResultIds && onToggleYoutubeResult && (
+                            <Checkbox
+                                checked={selectedYoutubeResultIds.has(result.id)}
+                                onCheckedChange={() => onToggleYoutubeResult(result.id)}
+                                aria-label={`Select ${result.name} for YouTube retry`}
+                            />
+                        )}
+                        <div>
+                            <div className="text-sm font-medium">{result.name}</div>
+                            <div className="text-xs text-muted-foreground">{result.artists}</div>
+                            {detailText(result) && <div className="mt-1 text-xs text-muted-foreground">{detailText(result)}</div>}
+                        </div>
                     </div>
                 ))}
             </div>
@@ -97,8 +115,20 @@ function ResultSection({ title, icon, results }: { title: string; icon: ReactNod
     );
 }
 
-export function BatchDownloadSummaryDialog({ open, summary, isRedownloadingSuspicious = false, redownloadProgress = 0, redownloadCurrentTrack = null, onMinimize, onClose, onRedownloadSuspicious }: BatchDownloadSummaryDialogProps) {
-    const [includeFailedTracks, setIncludeFailedTracks] = useState(false);
+export function BatchDownloadSummaryDialog({
+    open,
+    summary,
+    isRedownloadingSuspicious = false,
+    redownloadProgress = 0,
+    redownloadCurrentTrack = null,
+    onMinimize,
+    onClose,
+    selectedYoutubeResultIds,
+    onToggleYoutubeResult,
+    onSelectAllYoutube,
+    onClearYoutube,
+    onRedownloadSelectedFromYouTube,
+}: BatchDownloadSummaryDialogProps) {
     const failed = summary?.results.filter((result) => result.status === "failed") || [];
     const cancelled = summary?.results.filter((result) => result.status === "cancelled") || [];
     const suspicious = summary?.results.filter((result) => result.status === "suspicious") || [];
@@ -106,7 +136,9 @@ export function BatchDownloadSummaryDialog({ open, summary, isRedownloadingSuspi
     const metadataUpdated = summary?.results.filter((result) => result.status === "metadata_updated") || [];
     const youtubeSucceeded = summary?.results.filter((result) => result.status === "youtube_replaced") || [];
     const youtubeFailed = summary?.results.filter((result) => result.status === "youtube_failed" || result.status === "youtube_still_suspicious") || [];
-    const canRedownloadFromYouTube = (suspicious.length > 0 || failed.length > 0) && !!onRedownloadSuspicious;
+    const youtubeEligibleIds = summary ? youtubeEligibleResultIds(summary) : [];
+    const selectedYoutubeIds = youtubeEligibleIds.filter((id) => selectedYoutubeResultIds.has(id));
+    const canRedownloadFromYouTube = youtubeEligibleIds.length > 0;
 
     return (
         <Dialog open={open} onOpenChange={(nextOpen) => {
@@ -141,8 +173,8 @@ export function BatchDownloadSummaryDialog({ open, summary, isRedownloadingSuspi
                         <ScrollArea className="min-h-0 flex-1 pr-3">
                             {hasProblemDetails(summary) || metadataUpdated.length > 0 || youtubeSucceeded.length > 0 ? (
                                 <div className="space-y-3">
-                                    <ResultSection title="Suspicious Tracks" icon={<AlertTriangle className="h-4 w-4 text-yellow-500" />} results={suspicious} />
-                                    <ResultSection title="Failed Tracks" icon={<XCircle className="h-4 w-4 text-red-500" />} results={failed} />
+                                    <ResultSection title="Suspicious Tracks" icon={<AlertTriangle className="h-4 w-4 text-yellow-500" />} results={suspicious} selectedYoutubeResultIds={selectedYoutubeResultIds} onToggleYoutubeResult={onToggleYoutubeResult} />
+                                    <ResultSection title="Failed Tracks" icon={<XCircle className="h-4 w-4 text-red-500" />} results={failed} selectedYoutubeResultIds={selectedYoutubeResultIds} onToggleYoutubeResult={onToggleYoutubeResult} />
                                     <ResultSection title="Cancelled Tracks" icon={<XCircle className="h-4 w-4 text-orange-500" />} results={cancelled} />
                                     {summary.cancelled > 0 && cancelled.length === 0 && <div className="rounded-md border border-border/60 px-3 py-2 text-sm text-muted-foreground">{formatCancelledSummary(summary.cancelled)}</div>}
                                     <ResultSection title="Duplicate Tracks" icon={<FileCheck className="h-4 w-4 text-yellow-500" />} results={duplicateSkipped} />
@@ -177,15 +209,15 @@ export function BatchDownloadSummaryDialog({ open, summary, isRedownloadingSuspi
                 <DialogFooter className="shrink-0 gap-2">
                     {canRedownloadFromYouTube && (
                         <div className="flex flex-1 flex-wrap items-center justify-end gap-3">
-                            {failed.length > 0 && (
-                                <label className="flex items-center gap-2 text-sm text-muted-foreground">
-                                    <Checkbox checked={includeFailedTracks} onCheckedChange={(checked) => setIncludeFailedTracks(checked === true)} />
-                                    Include failed tracks
-                                </label>
-                            )}
-                            <Button onClick={() => onRedownloadSuspicious?.(includeFailedTracks)} disabled={isRedownloadingSuspicious}>
+                            <Button variant="outline" onClick={onSelectAllYoutube} disabled={isRedownloadingSuspicious}>
+                                Select all
+                            </Button>
+                            <Button variant="outline" onClick={onClearYoutube} disabled={isRedownloadingSuspicious}>
+                                Clear
+                            </Button>
+                            <Button onClick={() => onRedownloadSelectedFromYouTube(selectedYoutubeIds)} disabled={isRedownloadingSuspicious || selectedYoutubeIds.length === 0}>
                                 {isRedownloadingSuspicious ? <Spinner /> : <Download className="h-4 w-4" />}
-                                {suspicious.length > 0 ? "Redownload suspicious from YouTube" : "Download failed from YouTube"}
+                                Redownload selected via YouTube ({selectedYoutubeIds.length})
                             </Button>
                         </div>
                     )}
