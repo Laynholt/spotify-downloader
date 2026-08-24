@@ -73,6 +73,20 @@ export function selectCollectionQueue(
     return undefined;
 }
 
+export function selectCollectionQueueSnapshot(
+    snapshot: DownloadSchedulerSnapshot<MediaJobPayload, MediaJobResult>,
+    collection: DownloadQueueContext | undefined,
+): DownloadQueueSnapshot<MediaJobPayload, MediaJobResult> | undefined {
+    if (!collection) return undefined;
+    return snapshot.queues[collection.id] ?? {
+        id: collection.id,
+        title: collection.title,
+        jobs: [],
+        counts: { total: 0, terminal: 0, active: 0, queued: 0, completed: 0, failed: 0 },
+        progress: 0,
+    };
+}
+
 function isTerminal(status: DownloadJobStatus): boolean {
     return status === "completed" || status === "skipped" || status === "failed" ||
         status === "suspicious" || status === "cancelled" || status === "unavailable";

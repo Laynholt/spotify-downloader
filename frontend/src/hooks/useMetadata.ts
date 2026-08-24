@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { fetchSpotifyMetadata } from "@/lib/api";
 import { toastWithSound as toast } from "@/lib/toast-with-sound";
 import { logger } from "@/lib/logger";
@@ -19,6 +19,7 @@ export function loadedMetadataAfterAttempt(
 export function useMetadata() {
     const [loading, setLoading] = useState(false);
     const [loadedMetadata, setLoadedMetadata] = useState<LoadedSpotifyMetadata | null>(null);
+    const generationRef = useRef(0);
     const metadata = loadedMetadata?.data ?? null;
     const [showAlbumDialog, setShowAlbumDialog] = useState(false);
     const [selectedAlbum, setSelectedAlbum] = useState<{
@@ -94,7 +95,9 @@ export function useMetadata() {
             console.error("Failed to save fetch history:", err);
         }
     };
-    const fetchMetadataDirectly = async (url: string) => {
+    const beginGeneration = () => ++generationRef.current;
+    const isCurrentGeneration = (generation: number) => generation === generationRef.current;
+    const fetchMetadataDirectly = async (url: string, generation: number) => {
         const urlType = getUrlType(url);
         logger.info(`fetching ${urlType} metadata...`);
         logger.debug(`url: ${url}`);
@@ -103,6 +106,7 @@ export function useMetadata() {
             const startTime = Date.now();
             const timeout = urlType === "artist" ? 60 : 300;
             const data = await fetchSpotifyMetadata(url, true, 1.0, timeout);
+            if (!isCurrentGeneration(generation)) return;
             if (!isKnownMetadataResponse(data)) {
                 logger.error(`unknown metadata payload for url: ${url}`);
                 toast.error("Failed to parse metadata response");
@@ -150,16 +154,20 @@ export function useMetadata() {
             toast.success("Metadata fetched successfully");
         }
         catch (err) {
-            setLoadedMetadata(current => loadedMetadataAfterAttempt(current, url));
+            if (!isCurrentGeneration(generation)) return;
             const errorMsg = err instanceof Error ? err.message : "Failed to fetch metadata";
             logger.error(`fetch failed: ${errorMsg}`);
             toast.error(errorMsg);
         }
         finally {
-            setLoading(false);
+            if (isCurrentGeneration(generation)) {
+                setLoading(false);
+            }
         }
     };
     const loadFromCache = (cachedData: string, sourceUrl: string) => {
+        beginGeneration();
+        setLoading(false);
         try {
             const data = JSON.parse(cachedData) as SpotifyMetadataResponse;
             setLoadedMetadata(current => loadedMetadataAfterAttempt(current, sourceUrl, data));
@@ -171,7 +179,9 @@ export function useMetadata() {
         }
     };
     const handleFetchMetadata = async (url: string) => {
+        const generation = beginGeneration();
         if (!url.trim()) {
+            setLoading(false);
             logger.warning("empty url provided");
             toast.error("Please enter a Spotify URL");
             return;
@@ -181,6 +191,7 @@ export function useMetadata() {
         if (isArtistUrl) {
             const artistID = extractArtistID(urlToFetch);
             if (!artistID) {
+                setLoading(false);
                 logger.error(`invalid artist url: ${urlToFetch}`);
                 toast.error("Invalid artist URL");
                 return;
@@ -190,12 +201,12 @@ export function useMetadata() {
         }
         if (isArtistUrl) {
             logger.info("artist url detected");
-            await fetchMetadataDirectly(urlToFetch);
+            await fetchMetadataDirectly(urlToFetch, generation);
         }
         else {
-            await fetchMetadataDirectly(urlToFetch);
+            await fetchMetadataDirectly(urlToFetch, generation);
         }
-        return urlToFetch;
+        return isCurrentGeneration(generation) ? urlToFetch : undefined;
     };
     const handleAlbumClick = (album: {
         id: string;
@@ -210,21 +221,21 @@ export function useMetadata() {
         if (!selectedAlbum)
             return;
         const albumUrl = selectedAlbum.external_urls;
+        const generation = beginGeneration();
         logger.info(`fetching album: ${selectedAlbum.name}...`);
         logger.debug(`url: ${albumUrl}`);
         setShowAlbumDialog(false);
         setLoading(true);
-        setLoadedMetadata(null);
         try {
             const startTime = Date.now();
             const data = await fetchSpotifyMetadata(albumUrl);
+            if (!isCurrentGeneration(generation)) return;
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
             if ("album_info" in data) {
                 const albumInfo = data.album_info;
                 if (!albumInfo.name && albumInfo.total_tracks === 0 && data.track_list.length === 0) {
                     logger.warning("album appears to be empty or not found");
                     toast.error("Album not found or may be private");
-                    setLoadedMetadata(null);
                     setSelectedAlbum(null);
                     return albumUrl;
                 }
@@ -241,13 +252,16 @@ export function useMetadata() {
             return albumUrl;
         }
         catch (err) {
+            if (!isCurrentGeneration(generation)) return;
             const errorMsg = err instanceof Error ? err.message : "Failed to fetch album metadata";
             logger.error(`fetch failed: ${errorMsg}`);
             toast.error(errorMsg);
         }
         finally {
-            setLoading(false);
-            setSelectedAlbum(null);
+            if (isCurrentGeneration(generation)) {
+                setLoading(false);
+                setSelectedAlbum(null);
+            }
         }
     };
     return {
@@ -261,6 +275,10 @@ export function useMetadata() {
         handleAlbumClick,
         handleConfirmAlbumFetch,
         loadFromCache,
-        resetMetadata: () => setLoadedMetadata(null),
+        resetMetadata: () => {
+            beginGeneration();
+            setLoadedMetadata(null);
+            setLoading(false);
+        },
     };
 }

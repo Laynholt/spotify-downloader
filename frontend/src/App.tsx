@@ -35,7 +35,11 @@ import { useCover } from "@/hooks/useCover";
 import { useDownloadQueueDialog } from "@/hooks/useDownloadQueueDialog";
 import { useDownloadProgress } from "@/hooks/useDownloadProgress";
 import { isNewerVersion } from "@/lib/version";
-import { selectCollectionQueue, selectQueueStatus } from "@/lib/download-queue-selectors";
+import {
+    selectCollectionQueue,
+    selectCollectionQueueSnapshot,
+    selectQueueStatus,
+} from "@/lib/download-queue-selectors";
 const HISTORY_KEY = "spotidownloader_fetch_history";
 const MAX_HISTORY = 5;
 interface AppUpdateStatus {
@@ -80,9 +84,10 @@ function App() {
         () => selectCollectionQueue(metadata.loadedMetadata),
         [metadata.loadedMetadata],
     );
-    const currentDownloadQueue = collectionQueue
-        ? download.downloadQueueSnapshot.queues[collectionQueue.id]
-        : undefined;
+    const currentDownloadQueue = useMemo(
+        () => selectCollectionQueueSnapshot(download.downloadQueueSnapshot, collectionQueue),
+        [download.downloadQueueSnapshot, collectionQueue],
+    );
     const currentQueueStatus = collectionQueue
         ? selectQueueStatus(download.downloadQueueSnapshot, collectionQueue.id)
         : undefined;

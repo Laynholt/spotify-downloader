@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { TrackMetadata } from "@/types/api";
 import type { MediaJobPayload, MediaJobResult } from "@/lib/download-jobs";
 import type { DownloadQueueSnapshot } from "@/lib/download-queue-manager";
+import { selectCollectionQueueSnapshot } from "@/lib/download-queue-selectors";
 import { TrackList } from "./TrackList";
 
 const track: TrackMetadata = {
@@ -103,6 +104,23 @@ describe("TrackList media status", () => {
         });
 
         expect(markup).toContain('aria-label="Downloaded"');
+    });
+
+    it("ignores global media status for a rendered collection before first enqueue", () => {
+        const collectionQueue = selectCollectionQueueSnapshot({
+            queues: {},
+            activeCount: 0,
+            peakActive: 0,
+        }, {
+            id: "playlist:a",
+            title: "Collection A",
+            kind: "playlist",
+        });
+        const markup = renderTrackList(collectionQueue, {
+            downloadedTracks: new Set(["track-1"]),
+        });
+
+        expect(markup).toContain('aria-label="Download Track"');
     });
 
     it.each([

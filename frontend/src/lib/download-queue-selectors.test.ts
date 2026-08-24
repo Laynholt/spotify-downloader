@@ -10,6 +10,7 @@ import type {
 } from "./download-queue-manager";
 import {
     selectCollectionQueue,
+    selectCollectionQueueSnapshot,
     selectLatestTrackAttempt,
     selectQueueStatus,
     type LoadedSpotifyMetadata,
@@ -82,6 +83,28 @@ function playlistMetadata(title: string): SpotifyMetadataResponse {
 }
 
 describe("download queue selectors", () => {
+    it("creates collection scope before its first scheduler queue exists", () => {
+        const scheduler: DownloadSchedulerSnapshot<MediaJobPayload, MediaJobResult> = {
+            queues: {},
+            activeCount: 0,
+            peakActive: 0,
+        };
+        const collection = {
+            id: "playlist:a",
+            title: "Collection A",
+            kind: "playlist" as const,
+        };
+
+        expect(selectCollectionQueueSnapshot(scheduler, collection)).toEqual({
+            id: "playlist:a",
+            title: "Collection A",
+            jobs: [],
+            counts: { total: 0, terminal: 0, active: 0, queued: 0, completed: 0, failed: 0 },
+            progress: 0,
+        });
+        expect(selectCollectionQueueSnapshot(scheduler, undefined)).toBeUndefined();
+    });
+
     it("keeps the rendered collection identity when the editable input changes to another type", () => {
         const loadedA: LoadedSpotifyMetadata = {
             data: playlistMetadata("Collection A"),
