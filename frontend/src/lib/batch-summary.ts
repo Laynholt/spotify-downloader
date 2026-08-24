@@ -52,6 +52,7 @@ export interface YoutubeSummaryState {
     queueId: string | null;
     selectedYoutubeResultIds: Set<string>;
     isOpen: boolean;
+    generation: number;
 }
 
 export function createEmptyBatchSummary(title: string): BatchDownloadSummary {
@@ -199,19 +200,17 @@ export function selectedYoutubeRetryResultIds(summary: BatchDownloadSummary, sel
 }
 
 export function openYoutubeSummaryState(state: YoutubeSummaryState, summary: BatchDownloadSummary, queueId: string): YoutubeSummaryState {
-    const preserveSelection = state.isOpen && state.queueId === queueId;
     return {
         summary,
         queueId,
-        selectedYoutubeResultIds: preserveSelection
-            ? normalizeYoutubeSelection(summary, state.selectedYoutubeResultIds)
-            : initialYoutubeSelection(summary),
+        selectedYoutubeResultIds: initialYoutubeSelection(summary),
         isOpen: true,
+        generation: state.generation + 1,
     };
 }
 
-export function updateYoutubeSummaryState(state: YoutubeSummaryState, summary: BatchDownloadSummary, queueId: string): YoutubeSummaryState {
-    if (state.queueId !== queueId) {
+export function updateYoutubeSummaryState(state: YoutubeSummaryState, summary: BatchDownloadSummary, queueId: string, generation: number): YoutubeSummaryState {
+    if (state.queueId !== queueId || state.generation !== generation) {
         return state;
     }
     return {

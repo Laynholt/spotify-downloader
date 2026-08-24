@@ -476,6 +476,7 @@ export function useDownload() {
         queueId: null,
         selectedYoutubeResultIds: new Set(),
         isOpen: false,
+        generation: 0,
     });
     const syncYoutubeSummaryState = (state: YoutubeSummaryState) => {
         youtubeSummaryStateRef.current = state;
@@ -1017,6 +1018,7 @@ export function useDownload() {
         }
         const selectedIds = new Set(selectedYoutubeRetryResultIds(retryState.summary, new Set(selectedResultIds)));
         const queueId = retryState.queueId;
+        const generation = retryState.generation;
         const suspiciousRequests = queueId ? suspiciousRedownloadRequestsRef.current.get(queueId) : undefined;
         const failedRequests = queueId ? failedRedownloadRequestsRef.current.get(queueId) : undefined;
         const availableRequests = [
@@ -1098,7 +1100,7 @@ export function useDownload() {
                 }
             }
             const currentState = youtubeSummaryStateRef.current;
-            const nextState = updateYoutubeSummaryState(currentState, nextSummary, queueId);
+            const nextState = updateYoutubeSummaryState(currentState, nextSummary, queueId, generation);
             if (nextState !== currentState) {
                 syncYoutubeSummaryState(nextState);
             }

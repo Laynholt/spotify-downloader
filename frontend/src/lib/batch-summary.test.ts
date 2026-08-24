@@ -177,12 +177,13 @@ describe("YouTube retry selection", () => {
             queueId: null,
             selectedYoutubeResultIds: new Set<string>(),
             isOpen: false,
+            generation: 0,
         }, summaryA, "queue-a");
         const clearedA = {
             ...openedA,
             selectedYoutubeResultIds: new Set<string>(),
         };
-        const updatedA = updateYoutubeSummaryState(clearedA, { ...summaryA, title: "Updated A" }, "queue-a");
+        const updatedA = updateYoutubeSummaryState(clearedA, { ...summaryA, title: "Updated A" }, "queue-a", openedA.generation);
 
         expect([...openedA.selectedYoutubeResultIds]).toEqual(["attempt-a"]);
         expect([...updatedA.selectedYoutubeResultIds]).toEqual([]);
@@ -196,7 +197,9 @@ describe("YouTube retry selection", () => {
             queueId: null,
             selectedYoutubeResultIds: new Set<string>(),
             isOpen: false,
+            generation: 0,
         }, summaryA, "queue-a");
+        const queueAGeneration = openedA.generation;
         let currentSummary = openedA;
         let releaseQueueA!: () => void;
         const queueAGate = new Promise<void>((resolve) => {
@@ -204,9 +207,55 @@ describe("YouTube retry selection", () => {
         });
         const delayedQueueAUpdate = (async () => {
             await queueAGate;
-            return updateYoutubeSummaryState(currentSummary, { ...summaryA, title: "Queue A retry complete" }, "queue-a");
+            return updateYoutubeSummaryState(currentSummary, { ...summaryA, title: "Queue A retry complete" }, "queue-a", queueAGeneration);
         })();
         currentSummary = openYoutubeSummaryState(openedA, summaryB, "queue-b");
+
+        releaseQueueA();
+        const lateA = await delayedQueueAUpdate;
+
+        expect([...currentSummary.selectedYoutubeResultIds]).toEqual(["attempt-b"]);
+        expect(lateA).toBe(currentSummary);
+    });
+
+    it("opens a same-queue summary as a fresh generation after Clear", () => {
+        const summaryA = summaryWithResults([["attempt-a", "failed"]]);
+        const summaryB = summaryWithResults([["attempt-b", "suspicious"]]);
+        const openedA = openYoutubeSummaryState({
+            summary: null,
+            queueId: null,
+            selectedYoutubeResultIds: new Set<string>(),
+            isOpen: false,
+            generation: 0,
+        }, summaryA, "queue-reused");
+        const clearedA = { ...openedA, selectedYoutubeResultIds: new Set<string>() };
+        const openedB = openYoutubeSummaryState(clearedA, summaryB, "queue-reused");
+
+        expect(openedB.generation).toBe(2);
+        expect([...openedB.selectedYoutubeResultIds]).toEqual(["attempt-b"]);
+    });
+
+    it("ignores a gated late retry when a newer generation reuses its queue ID", async () => {
+        const summaryA = summaryWithResults([["attempt-a", "failed"]]);
+        const summaryB = summaryWithResults([["attempt-b", "suspicious"]]);
+        const openedA = openYoutubeSummaryState({
+            summary: null,
+            queueId: null,
+            selectedYoutubeResultIds: new Set<string>(),
+            isOpen: false,
+            generation: 0,
+        }, summaryA, "queue-reused");
+        const retryGeneration = openedA.generation;
+        let currentSummary = openedA;
+        let releaseQueueA!: () => void;
+        const queueAGate = new Promise<void>((resolve) => {
+            releaseQueueA = resolve;
+        });
+        const delayedQueueAUpdate = (async () => {
+            await queueAGate;
+            return updateYoutubeSummaryState(currentSummary, { ...summaryA, title: "Queue A retry complete" }, "queue-reused", retryGeneration);
+        })();
+        currentSummary = openYoutubeSummaryState(openedA, summaryB, "queue-reused");
 
         releaseQueueA();
         const lateA = await delayedQueueAUpdate;
