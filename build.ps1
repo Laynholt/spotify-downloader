@@ -85,7 +85,7 @@ $runtimeBinDir = Join-Path $scriptRoot "build\bin\SpotiDownloader.runtime\bin"
 Push-Location $scriptRoot
 
 try {
-    if (-not $IsWindows) {
+    if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
         throw "This script is intended for Windows builds (.exe)."
     }
 
