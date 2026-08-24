@@ -83,6 +83,15 @@ files into the user profile.
 `yt-dlp.exe` is checked for a newer official release at most once every 24 hours.
 Settings, history, and downloaded music keep their existing locations.
 
+### YouTube fallback runtime
+
+The first YouTube retry lazily installs official `yt-dlp` and Deno executables
+under `SpotiDownloader.runtime/bin` beside the application. Release checks are
+cached for 24 hours. Downloads use the packaged FFmpeg path and an explicit
+`--js-runtimes deno:<path>` argument. If a retry fails, open the queue result to
+see its stage and bounded diagnostics; the complete yt-dlp output remains in the
+application debug log.
+
 ## Test
 
 Run backend tests:
