@@ -213,6 +213,8 @@ export function useMetadata() {
         name: string;
         external_urls: string;
     }) => {
+        beginGeneration();
+        setLoading(false);
         logger.debug(`album clicked: ${album.name}`);
         setSelectedAlbum(album);
         setShowAlbumDialog(true);

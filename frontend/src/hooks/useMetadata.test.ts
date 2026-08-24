@@ -101,6 +101,19 @@ function playlistMetadata(title: string): SpotifyMetadataResponse {
     };
 }
 
+function albumMetadata(name: string): SpotifyMetadataResponse {
+    return {
+        album_info: {
+            total_tracks: 0,
+            name,
+            release_date: "2026",
+            artists: "Artist",
+            images: "",
+        },
+        track_list: [],
+    };
+}
+
 function deferred<T>() {
     let resolve!: (value: T) => void;
     let reject!: (reason: unknown) => void;
@@ -268,5 +281,56 @@ describe("useMetadata async source identity", () => {
         expect(hook.loadedMetadata).toEqual({ data: metadataA, sourceUrl: urlA });
         expect(hook.loading).toBe(false);
         expect(doubles.toastError).toHaveBeenCalledWith("album B failed");
+    });
+
+    it("invalidates pending album A as soon as album B opens, then confirms B", async () => {
+        const priorMetadata = playlistMetadata("Prior Collection");
+        const metadataA = albumMetadata("Album A");
+        const metadataB = albumMetadata("Album B");
+        const albumAResult = deferred<SpotifyMetadataResponse>();
+        const albumBResult = deferred<SpotifyMetadataResponse>();
+        const albumA = {
+            id: "a",
+            name: "Album A",
+            external_urls: "https://open.spotify.com/album/a",
+        };
+        const albumB = {
+            id: "b",
+            name: "Album B",
+            external_urls: "https://open.spotify.com/album/b",
+        };
+        doubles.fetchSpotifyMetadata.mockImplementation((url: string) =>
+            url === albumA.external_urls ? albumAResult.promise : albumBResult.promise);
+
+        let hook = MetadataHookHarness();
+        hook.loadFromCache(JSON.stringify(priorMetadata), urlA);
+        hook = MetadataHookHarness();
+        hook.handleAlbumClick(albumA);
+        hook = MetadataHookHarness();
+        const requestA = hook.handleConfirmAlbumFetch();
+        hook = MetadataHookHarness();
+        hook.handleAlbumClick(albumB);
+
+        albumAResult.resolve(metadataA);
+        const returnedAUrl = await requestA;
+        hook = MetadataHookHarness();
+
+        expect(returnedAUrl).toBeUndefined();
+        expect(hook.loadedMetadata).toEqual({ data: priorMetadata, sourceUrl: urlA });
+        expect(hook.selectedAlbum).toEqual(albumB);
+        expect(hook.showAlbumDialog).toBe(true);
+        expect(hook.loading).toBe(false);
+
+        const requestB = hook.handleConfirmAlbumFetch();
+        albumBResult.resolve(metadataB);
+        const returnedBUrl = await requestB;
+        hook = MetadataHookHarness();
+
+        expect(returnedBUrl).toBe(albumB.external_urls);
+        expect(hook.loadedMetadata).toEqual({
+            data: metadataB,
+            sourceUrl: albumB.external_urls,
+        });
+        expect(hook.selectedAlbum).toBeNull();
     });
 });
