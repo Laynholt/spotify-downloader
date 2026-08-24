@@ -331,6 +331,30 @@ func TestYouTubeReplacementFailurePointsPreserveOriginal(t *testing.T) {
 	}
 }
 
+func TestYouTubeReplacementCancellationDuringDurationProbeWinsBeforeClassification(t *testing.T) {
+	f := newReplacementFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	f.deps.probeDuration = func(inner context.Context, _ string) (float64, error) {
+		f.record("probe")
+		f.assertOriginalUntouched()
+		cancel()
+		<-inner.Done()
+		return 184, nil
+	}
+
+	got := runSuspiciousRedownloadWithDeps(ctx, f.request, f.deps)
+	if got.Success || got.Status != "cancelled" || got.Stage != "validation" || got.Suspicious {
+		t.Fatalf("result = %#v", got)
+	}
+	wantCalls := replacementCallCounts{download: 1, metadata: 1, finalize: 1, probe: 1}
+	if f.calls != wantCalls {
+		t.Fatalf("calls = %#v, want %#v", f.calls, wantCalls)
+	}
+	assertFileContents(t, f.originalPath, "original")
+	assertPathAbsent(t, f.backupPath)
+	assertPathAbsent(t, f.jobTempDir)
+}
+
 func TestYouTubeReplacementPublishesAlreadyMovedAndMissingOriginals(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -490,6 +514,25 @@ func TestYouTubeReplacementRestoresSameDestinationAlreadyInSuspicious(t *testing
 	}
 	assertFileContents(t, f.originalPath, "original")
 	assertNoRollbackFiles(t, f.replacementPath)
+}
+
+func TestYouTubeReplacementPreservesSameDestinationAlreadyInSuspiciousOnSuccess(t *testing.T) {
+	f := newReplacementFixture(t)
+	f.moveOriginalToSuspicious()
+	destination := f.originalPath
+	if runtime.GOOS == "windows" {
+		destination = strings.ToUpper(destination)
+	}
+	f.replacementPath = destination
+	f.request.ReplacementFilePath = destination
+
+	got := runSuspiciousRedownloadWithDeps(context.Background(), f.request, f.deps)
+	if !got.Success || got.Status != "replaced" || got.MovedOriginalPath == "" {
+		t.Fatalf("result = %#v", got)
+	}
+	assertFileContents(t, destination, "replacement")
+	assertFileContents(t, got.MovedOriginalPath, "original")
+	assertNoRollbackFiles(t, destination)
 }
 
 func TestSameFilesystemPathRecognizesAliases(t *testing.T) {
@@ -687,7 +730,7 @@ func TestYouTubeReplacementSerializesOnlyPublicationForConcurrentSameOriginal(t 
 		result SuspiciousRedownloadResult
 	}
 	probeReached := make(chan string, 2)
-	publishReached := make(chan string, 2)
+	publishReached := make(chan string)
 	releaseFirstPublish := make(chan struct{})
 	results := make(chan labeledResult, 2)
 	run := func(label string) {
@@ -728,19 +771,14 @@ func TestYouTubeReplacementSerializesOnlyPublicationForConcurrentSameOriginal(t 
 	go run("second")
 	waitForLabel(t, probeReached, "second")
 
-	collected := make([]labeledResult, 0, 2)
-	publicationSerialized := true
-	select {
-	case label := <-publishReached:
-		publicationSerialized = false
-		t.Logf("second publication entered early: %s", label)
-	case result := <-results:
-		publicationSerialized = false
-		collected = append(collected, result)
-		t.Logf("second operation completed before first commit: %#v", result)
-	case <-time.After(200 * time.Millisecond):
+	publicationLocked := !youtubePublicationMu.TryLock()
+	if !publicationLocked {
+		youtubePublicationMu.Unlock()
 	}
 	close(releaseFirstPublish)
+	waitForLabel(t, publishReached, "second")
+
+	collected := make([]labeledResult, 0, 2)
 	for len(collected) < 2 {
 		select {
 		case result := <-results:
@@ -749,8 +787,8 @@ func TestYouTubeReplacementSerializesOnlyPublicationForConcurrentSameOriginal(t 
 			t.Fatal("timed out waiting for concurrent replacements")
 		}
 	}
-	if !publicationSerialized {
-		t.Fatal("publication critical sections overlapped or observed an intermediate missing original")
+	if !publicationLocked {
+		t.Fatal("first publication did not hold the publication lock")
 	}
 
 	byLabel := make(map[string]SuspiciousRedownloadResult, 2)

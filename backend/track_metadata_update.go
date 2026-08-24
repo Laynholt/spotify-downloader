@@ -427,6 +427,9 @@ func runSuspiciousRedownloadWithDeps(ctx context.Context, req SuspiciousRedownlo
 	}
 
 	actualSeconds, err := deps.probeDuration(workCtx, stagedMedia)
+	if ctxErr := workCtx.Err(); ctxErr != nil {
+		return fail("validation", ctxErr)
+	}
 	expectedSeconds := float64(req.Metadata.Duration) / 1000
 	result.ExpectedDurationSeconds = expectedSeconds
 	if err != nil {
@@ -442,10 +445,6 @@ func runSuspiciousRedownloadWithDeps(ctx context.Context, req SuspiciousRedownlo
 		result.Error = "redownloaded audio is still suspicious"
 		return result
 	}
-	if err := workCtx.Err(); err != nil {
-		return fail("validation", err)
-	}
-
 	youtubePublicationMu.Lock()
 	defer youtubePublicationMu.Unlock()
 	if err := workCtx.Err(); err != nil {
@@ -461,7 +460,7 @@ func runSuspiciousRedownloadWithDeps(ctx context.Context, req SuspiciousRedownlo
 	}
 	originalIsDestination := sameFilesystemPath(originalPath, replacementPath)
 	originalIsDestinationEntry := sameFilesystemEntry(originalPath, replacementPath)
-	originalNeedsBackup := originalPath != "" && !IsPathInsideDir(originalPath, suspiciousDir)
+	originalNeedsBackup := originalPath != "" && (!IsPathInsideDir(originalPath, suspiciousDir) || originalIsDestinationEntry)
 	movedOriginal := ""
 	if originalNeedsBackup {
 		movedOriginal, err = deps.moveOriginal(originalPath, suspiciousDir)
