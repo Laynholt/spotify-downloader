@@ -80,3 +80,4 @@ get_token.spec
 # Local agent planning artifacts
 docs/superpowers/
 superpowers/
+.codebase-memory/
