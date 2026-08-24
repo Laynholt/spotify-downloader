@@ -7,6 +7,10 @@ import { SearchAndSort } from "./SearchAndSort";
 import { TrackList } from "./TrackList";
 import { DownloadProgress } from "./DownloadProgress";
 import type { TrackMetadata } from "@/types/api";
+import type { backend } from "../../wailsjs/go/models";
+import type { MediaJobPayload, MediaJobResult } from "@/lib/download-jobs";
+import type { DownloadQueueSnapshot } from "@/lib/download-queue-manager";
+import type { QueueStatusView } from "@/lib/download-queue-selectors";
 interface AlbumInfoProps {
     albumInfo: {
         name: string;
@@ -29,14 +33,9 @@ interface AlbumInfoProps {
         actualDurationSeconds?: number;
         durationDeltaSeconds?: number;
     }>;
-    downloadingTrack: string | null;
-    isDownloading: boolean;
-    bulkDownloadType: "all" | "selected" | null;
-    downloadProgress: number;
-    currentDownloadInfo: {
-        name: string;
-        artists: string;
-    } | null;
+    downloadQueue?: DownloadQueueSnapshot<MediaJobPayload, MediaJobResult>;
+    downloadQueueStatus?: QueueStatusView;
+    downloadItemsByJobId: ReadonlyMap<string, backend.DownloadItem>;
     downloadingLyricsTrack?: string | null;
     downloadedLyrics?: Set<string>;
     failedLyrics?: Set<string>;
@@ -73,7 +72,7 @@ interface AlbumInfoProps {
     onTrackClick?: (track: TrackMetadata) => void;
     onBack?: () => void;
 }
-export function AlbumInfo({ albumInfo, trackList, searchQuery, sortBy, selectedTracks, downloadedTracks, failedTracks, skippedTracks, suspiciousTracks, downloadingTrack, isDownloading, bulkDownloadType, downloadProgress, currentDownloadInfo, downloadingLyricsTrack, downloadedLyrics, failedLyrics, skippedLyrics, downloadedCovers, failedCovers, skippedCovers, downloadingCoverTrack, isBulkDownloadingCovers, isBulkDownloadingLyrics, isBulkUpdatingMetadata, currentPage, itemsPerPage, onSearchChange, onSortChange, onToggleTrack, onToggleSelectAll, onDownloadTrack, onDownloadLyrics, onDownloadCover, onDownloadAllLyrics, onDownloadAllCovers, onUpdateAllMetadata, onDownloadAll, onDownloadSelected, onStopDownload, onOpenFolder, onPageChange, onArtistClick, onTrackClick, onBack, }: AlbumInfoProps) {
+export function AlbumInfo({ albumInfo, trackList, searchQuery, sortBy, selectedTracks, downloadedTracks, failedTracks, skippedTracks, suspiciousTracks, downloadQueue, downloadQueueStatus, downloadItemsByJobId, downloadingLyricsTrack, downloadedLyrics, failedLyrics, skippedLyrics, downloadedCovers, failedCovers, skippedCovers, downloadingCoverTrack, isBulkDownloadingCovers, isBulkDownloadingLyrics, isBulkUpdatingMetadata, currentPage, itemsPerPage, onSearchChange, onSortChange, onToggleTrack, onToggleSelectAll, onDownloadTrack, onDownloadLyrics, onDownloadCover, onDownloadAllLyrics, onDownloadAllCovers, onUpdateAllMetadata, onDownloadAll, onDownloadSelected, onStopDownload, onOpenFolder, onPageChange, onArtistClick, onTrackClick, onBack, }: AlbumInfoProps) {
     const resolvedAlbumArtist = (() => {
         if (albumInfo.artist_id && albumInfo.artist_url) {
             return {
@@ -137,12 +136,12 @@ export function AlbumInfo({ albumInfo, trackList, searchQuery, sortBy, selectedT
                 </div>
               </div>
               <div className="flex gap-2">
-                <Button onClick={onDownloadAll} disabled={isDownloading}>
-                  {isDownloading && bulkDownloadType === "all" ? (<Spinner />) : (<Download className="h-4 w-4"/>)}
+                <Button onClick={onDownloadAll}>
+                  <Download className="h-4 w-4"/>
                   Download All
                 </Button>
-                {selectedTracks.length > 0 && (<Button onClick={onDownloadSelected} variant="secondary" disabled={isDownloading}>
-                    {isDownloading && bulkDownloadType === "selected" ? (<Spinner />) : (<Download className="h-4 w-4"/>)}
+                {selectedTracks.length > 0 && (<Button onClick={onDownloadSelected} variant="secondary">
+                    <Download className="h-4 w-4"/>
                     Download Selected ({selectedTracks.length.toLocaleString()})
                   </Button>)}
                 {onDownloadAllLyrics && (<Tooltip>
@@ -167,7 +166,7 @@ export function AlbumInfo({ albumInfo, trackList, searchQuery, sortBy, selectedT
                   </Tooltip>)}
                 {onUpdateAllMetadata && (<Tooltip>
                     <TooltipTrigger asChild>
-                      <Button onClick={onUpdateAllMetadata} variant="outline" disabled={isBulkUpdatingMetadata || isDownloading}>
+                      <Button onClick={onUpdateAllMetadata} variant="outline" disabled={isBulkUpdatingMetadata || downloadQueueStatus?.busy}>
                         {isBulkUpdatingMetadata ? <Spinner /> : <RefreshCw className="h-4 w-4"/>}
                       </Button>
                     </TooltipTrigger>
@@ -180,14 +179,14 @@ export function AlbumInfo({ albumInfo, trackList, searchQuery, sortBy, selectedT
                     Open Folder
                   </Button>)}
               </div>
-              {isDownloading && (<DownloadProgress progress={downloadProgress} currentTrack={currentDownloadInfo} onStop={onStopDownload}/>)}
+              {downloadQueueStatus && (<DownloadProgress status={downloadQueueStatus} onStop={onStopDownload}/>)}
             </div>
           </div>
         </CardContent>
       </Card>
       <div className="space-y-4">
         <SearchAndSort searchQuery={searchQuery} sortBy={sortBy} onSearchChange={onSearchChange} onSortChange={onSortChange}/>
-        <TrackList tracks={trackList} searchQuery={searchQuery} sortBy={sortBy} selectedTracks={selectedTracks} downloadedTracks={downloadedTracks} failedTracks={failedTracks} skippedTracks={skippedTracks} suspiciousTracks={suspiciousTracks} downloadingTrack={downloadingTrack} isDownloading={isDownloading} downloadingLyricsTrack={downloadingLyricsTrack} downloadedLyrics={downloadedLyrics} failedLyrics={failedLyrics} skippedLyrics={skippedLyrics} currentPage={currentPage} itemsPerPage={itemsPerPage} showCheckboxes={true} hideAlbumColumn={true} folderName={albumInfo.name} isAlbum={true} onToggleTrack={onToggleTrack} onDownloadLyrics={onDownloadLyrics} onDownloadCover={onDownloadCover} downloadedCovers={downloadedCovers} failedCovers={failedCovers} skippedCovers={skippedCovers} downloadingCoverTrack={downloadingCoverTrack} onToggleSelectAll={onToggleSelectAll} onDownloadTrack={onDownloadTrack} onPageChange={onPageChange} onArtistClick={onArtistClick} onTrackClick={onTrackClick}/>
+        <TrackList tracks={trackList} searchQuery={searchQuery} sortBy={sortBy} selectedTracks={selectedTracks} downloadedTracks={downloadedTracks} failedTracks={failedTracks} skippedTracks={skippedTracks} suspiciousTracks={suspiciousTracks} downloadQueue={downloadQueue} downloadItemsByJobId={downloadItemsByJobId} downloadingLyricsTrack={downloadingLyricsTrack} downloadedLyrics={downloadedLyrics} failedLyrics={failedLyrics} skippedLyrics={skippedLyrics} currentPage={currentPage} itemsPerPage={itemsPerPage} showCheckboxes={true} hideAlbumColumn={true} folderName={albumInfo.name} isAlbum={true} onToggleTrack={onToggleTrack} onDownloadLyrics={onDownloadLyrics} onDownloadCover={onDownloadCover} downloadedCovers={downloadedCovers} failedCovers={failedCovers} skippedCovers={skippedCovers} downloadingCoverTrack={downloadingCoverTrack} onToggleSelectAll={onToggleSelectAll} onDownloadTrack={onDownloadTrack} onPageChange={onPageChange} onArtistClick={onArtistClick} onTrackClick={onTrackClick}/>
       </div>
     </div>);
 }

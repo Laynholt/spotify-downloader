@@ -3,56 +3,28 @@ import { X, Download, CheckCircle2, XCircle, Clock, FileCheck, Trash2, HardDrive
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
-import { GetDownloadQueue, ClearCompletedDownloads, ClearAllDownloads, ExportFailedDownloads, } from "../../wailsjs/go/main/App";
+import { ClearCompletedDownloads, ClearAllDownloads, ExportFailedDownloads, } from "../../wailsjs/go/main/App";
 import { toastWithSound as toast } from "@/lib/toast-with-sound";
 import { formatAggregateProgress, formatPipelineTimings, formatTransferProgress, phaseLabel } from "@/lib/download-timings";
-import { backend } from "../../wailsjs/go/models";
+import type { backend } from "../../wailsjs/go/models";
 interface DownloadQueueProps {
     isOpen: boolean;
     onClose: () => void;
+    queueInfo: Omit<backend.DownloadQueueInfo, "convertValues">;
 }
-export function DownloadQueue({ isOpen, onClose }: DownloadQueueProps) {
+export function DownloadQueue({ isOpen, onClose, queueInfo }: DownloadQueueProps) {
     const [nowSeconds, setNowSeconds] = useState(() => Math.floor(Date.now() / 1000));
-    const [queueInfo, setQueueInfo] = useState<backend.DownloadQueueInfo>(new backend.DownloadQueueInfo({
-        is_downloading: false,
-        queue: [],
-        current_speed: 0,
-        total_downloaded: 0,
-        session_start_time: 0,
-        queued_count: 0,
-        completed_count: 0,
-        failed_count: 0,
-        skipped_count: 0,
-        active_count: 0,
-        cancelled_count: 0,
-    }));
     useEffect(() => {
         if (!isOpen)
             return;
-        const fetchQueue = async () => {
-            try {
-                const info = await GetDownloadQueue();
-                setQueueInfo(info);
-            }
-            catch (error) {
-                console.error("Failed to get download queue:", error);
-            }
-        };
-        fetchQueue();
-        const interval = setInterval(fetchQueue, 500);
         const clockInterval = setInterval(() => {
             setNowSeconds(Math.floor(Date.now() / 1000));
         }, 1000);
-        return () => {
-            clearInterval(interval);
-            clearInterval(clockInterval);
-        };
+        return () => clearInterval(clockInterval);
     }, [isOpen]);
     const handleClearHistory = async () => {
         try {
             await ClearCompletedDownloads();
-            const info = await GetDownloadQueue();
-            setQueueInfo(info);
         }
         catch (error) {
             console.error("Failed to clear history:", error);
@@ -61,8 +33,6 @@ export function DownloadQueue({ isOpen, onClose }: DownloadQueueProps) {
     const handleReset = async () => {
         try {
             await ClearAllDownloads();
-            const info = await GetDownloadQueue();
-            setQueueInfo(info);
             toast.success("Download queue reset");
         }
         catch (error) {

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { GetDownloadQueue } from "../../wailsjs/go/main/App";
 import { backend } from "../../wailsjs/go/models";
 export function useDownloadQueueData() {
@@ -30,8 +30,13 @@ export function useDownloadQueueData() {
         return () => clearInterval(interval);
     }, []);
     const settledCount = queueInfo.completed_count + queueInfo.failed_count + queueInfo.skipped_count + (queueInfo.cancelled_count ?? 0);
+    const itemsByJobId = useMemo(
+        () => new Map(queueInfo.queue.map(item => [item.id, item])),
+        [queueInfo.queue],
+    );
     return {
         ...queueInfo,
+        itemsByJobId,
         settled_count: settledCount,
         total_count: queueInfo.queue.length,
     };

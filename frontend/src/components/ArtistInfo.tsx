@@ -14,6 +14,10 @@ import { useState, useMemo } from "react";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import type { backend } from "../../wailsjs/go/models";
+import type { MediaJobPayload, MediaJobResult } from "@/lib/download-jobs";
+import type { DownloadQueueSnapshot } from "@/lib/download-queue-manager";
+import type { QueueStatusView } from "@/lib/download-queue-selectors";
 interface ArtistInfoProps {
     artistInfo: {
         name: string;
@@ -48,14 +52,9 @@ interface ArtistInfoProps {
         actualDurationSeconds?: number;
         durationDeltaSeconds?: number;
     }>;
-    downloadingTrack: string | null;
-    isDownloading: boolean;
-    bulkDownloadType: "all" | "selected" | null;
-    downloadProgress: number;
-    currentDownloadInfo: {
-        name: string;
-        artists: string;
-    } | null;
+    downloadQueue?: DownloadQueueSnapshot<MediaJobPayload, MediaJobResult>;
+    downloadQueueStatus?: QueueStatusView;
+    downloadItemsByJobId: ReadonlyMap<string, backend.DownloadItem>;
     downloadingLyricsTrack?: string | null;
     downloadedLyrics?: Set<string>;
     failedLyrics?: Set<string>;
@@ -97,7 +96,7 @@ interface ArtistInfoProps {
     onTrackClick?: (track: TrackMetadata) => void;
     onBack?: () => void;
 }
-export function ArtistInfo({ artistInfo, albumList, trackList, searchQuery, sortBy, selectedTracks, downloadedTracks, failedTracks, skippedTracks, suspiciousTracks, downloadingTrack, isDownloading, bulkDownloadType, downloadProgress, currentDownloadInfo, downloadingLyricsTrack, downloadedLyrics, failedLyrics, skippedLyrics, downloadedCovers, failedCovers, skippedCovers, downloadingCoverTrack, isBulkDownloadingCovers, isBulkDownloadingLyrics, isBulkUpdatingMetadata, currentPage, itemsPerPage, onSearchChange, onSortChange, onToggleTrack, onToggleSelectAll, onDownloadTrack, onDownloadLyrics, onDownloadCover, onDownloadAllLyrics, onDownloadAllCovers, onUpdateAllMetadata, onDownloadAll, onDownloadSelected, onStopDownload, onOpenFolder, onAlbumClick, onArtistClick, onPageChange, onTrackClick, onBack, }: ArtistInfoProps) {
+export function ArtistInfo({ artistInfo, albumList, trackList, searchQuery, sortBy, selectedTracks, downloadedTracks, failedTracks, skippedTracks, suspiciousTracks, downloadQueue, downloadQueueStatus, downloadItemsByJobId, downloadingLyricsTrack, downloadedLyrics, failedLyrics, skippedLyrics, downloadedCovers, failedCovers, skippedCovers, downloadingCoverTrack, isBulkDownloadingCovers, isBulkDownloadingLyrics, isBulkUpdatingMetadata, currentPage, itemsPerPage, onSearchChange, onSortChange, onToggleTrack, onToggleSelectAll, onDownloadTrack, onDownloadLyrics, onDownloadCover, onDownloadAllLyrics, onDownloadAllCovers, onUpdateAllMetadata, onDownloadAll, onDownloadSelected, onStopDownload, onOpenFolder, onAlbumClick, onArtistClick, onPageChange, onTrackClick, onBack, }: ArtistInfoProps) {
     const [downloadingHeader, setDownloadingHeader] = useState(false);
     const [downloadingAvatar, setDownloadingAvatar] = useState(false);
     const [downloadingGalleryIndex, setDownloadingGalleryIndex] = useState<number | null>(null);
@@ -401,6 +400,8 @@ export function ArtistInfo({ artistInfo, albumList, trackList, searchQuery, sort
         </CardContent>)}
       </Card>
 
+      {downloadQueueStatus && (<DownloadProgress status={downloadQueueStatus} onStop={onStopDownload}/>)}
+
       <div className="border-b">
         <div className="flex gap-6">
             <button onClick={() => setActiveTab("albums")} className={`pb-3 text-sm font-medium transition-colors border-b-2 -mb-px hover:text-foreground ${activeTab === "albums" ? "border-primary text-foreground" : "border-transparent text-muted-foreground"}`}>
@@ -454,17 +455,17 @@ export function ArtistInfo({ artistInfo, albumList, trackList, searchQuery, sort
           <div className="flex items-center justify-between flex-wrap gap-2">
             <h3 className="text-2xl font-bold">Discography</h3>
             <div className="flex gap-2">
-                <Button onClick={onDownloadAll} size="sm" disabled={isDownloading}>
-                    {isDownloading && bulkDownloadType === "all" ? (<Spinner />) : (<Download className="h-4 w-4"/>)}
+                <Button onClick={onDownloadAll} size="sm">
+                    <Download className="h-4 w-4"/>
                     Download Discography
                 </Button>
-                {selectedTracks.length > 0 && (<Button onClick={onDownloadSelected} size="sm" variant="secondary" disabled={isDownloading}>
-                        {isDownloading && bulkDownloadType === "selected" ? (<Spinner />) : (<Download className="h-4 w-4"/>)}
+                {selectedTracks.length > 0 && (<Button onClick={onDownloadSelected} size="sm" variant="secondary">
+                        <Download className="h-4 w-4"/>
                         Download Selected ({selectedTracks.length})
                     </Button>)}
                 {onUpdateAllMetadata && (<Tooltip>
                     <TooltipTrigger asChild>
-                        <Button onClick={onUpdateAllMetadata} size="sm" variant="outline" disabled={isBulkUpdatingMetadata || isDownloading}>
+                        <Button onClick={onUpdateAllMetadata} size="sm" variant="outline" disabled={isBulkUpdatingMetadata || downloadQueueStatus?.busy}>
                             {isBulkUpdatingMetadata ? <Spinner /> : <RefreshCw className="h-4 w-4"/>}
                         </Button>
                     </TooltipTrigger>
@@ -552,12 +553,12 @@ export function ArtistInfo({ artistInfo, albumList, trackList, searchQuery, sort
                       </ScrollArea>
                   </DialogContent>
               </Dialog>
-              <Button onClick={onDownloadAll} size="sm" disabled={isDownloading}>
-                {isDownloading && bulkDownloadType === "all" ? (<Spinner />) : (<Download className="h-4 w-4"/>)}
+              <Button onClick={onDownloadAll} size="sm">
+                <Download className="h-4 w-4"/>
                 Download All
               </Button>
-              {selectedTracks.length > 0 && (<Button onClick={onDownloadSelected} size="sm" variant="secondary" disabled={isDownloading}>
-                  {isDownloading && bulkDownloadType === "selected" ? (<Spinner />) : (<Download className="h-4 w-4"/>)}
+              {selectedTracks.length > 0 && (<Button onClick={onDownloadSelected} size="sm" variant="secondary">
+                  <Download className="h-4 w-4"/>
                   Download Selected ({selectedTracks.length.toLocaleString()})
                 </Button>)}
               {onDownloadAllLyrics && (<Tooltip>
@@ -582,7 +583,7 @@ export function ArtistInfo({ artistInfo, albumList, trackList, searchQuery, sort
                 </Tooltip>)}
               {onUpdateAllMetadata && (<Tooltip>
                   <TooltipTrigger asChild>
-                    <Button onClick={onUpdateAllMetadata} size="sm" variant="outline" disabled={isBulkUpdatingMetadata || isDownloading}>
+                    <Button onClick={onUpdateAllMetadata} size="sm" variant="outline" disabled={isBulkUpdatingMetadata || downloadQueueStatus?.busy}>
                       {isBulkUpdatingMetadata ? <Spinner /> : <RefreshCw className="h-4 w-4"/>}
                     </Button>
                   </TooltipTrigger>
@@ -596,9 +597,8 @@ export function ArtistInfo({ artistInfo, albumList, trackList, searchQuery, sort
                 </Button>)}
             </div>
           </div>
-          {isDownloading && (<DownloadProgress progress={downloadProgress} currentTrack={currentDownloadInfo} onStop={onStopDownload}/>)}
           <SearchAndSort searchQuery={searchQuery} sortBy={sortBy} onSearchChange={onSearchChange} onSortChange={onSortChange}/>
-          <TrackList tracks={trackList} searchQuery={searchQuery} sortBy={sortBy} selectedTracks={selectedTracks} downloadedTracks={downloadedTracks} failedTracks={failedTracks} skippedTracks={skippedTracks} suspiciousTracks={suspiciousTracks} downloadingTrack={downloadingTrack} isDownloading={isDownloading} downloadingLyricsTrack={downloadingLyricsTrack} downloadedLyrics={downloadedLyrics} failedLyrics={failedLyrics} skippedLyrics={skippedLyrics} currentPage={currentPage} itemsPerPage={itemsPerPage} showCheckboxes={true} hideAlbumColumn={false} folderName={artistInfo.name} isArtistDiscography={true} onToggleTrack={onToggleTrack} onToggleSelectAll={onToggleSelectAll} onDownloadTrack={onDownloadTrack} onDownloadLyrics={onDownloadLyrics} onDownloadCover={onDownloadCover} downloadedCovers={downloadedCovers} failedCovers={failedCovers} skippedCovers={skippedCovers} downloadingCoverTrack={downloadingCoverTrack} onPageChange={onPageChange} onAlbumClick={onAlbumClick} onArtistClick={onArtistClick} onTrackClick={onTrackClick}/>
+          <TrackList tracks={trackList} searchQuery={searchQuery} sortBy={sortBy} selectedTracks={selectedTracks} downloadedTracks={downloadedTracks} failedTracks={failedTracks} skippedTracks={skippedTracks} suspiciousTracks={suspiciousTracks} downloadQueue={downloadQueue} downloadItemsByJobId={downloadItemsByJobId} downloadingLyricsTrack={downloadingLyricsTrack} downloadedLyrics={downloadedLyrics} failedLyrics={failedLyrics} skippedLyrics={skippedLyrics} currentPage={currentPage} itemsPerPage={itemsPerPage} showCheckboxes={true} hideAlbumColumn={false} folderName={artistInfo.name} isArtistDiscography={true} onToggleTrack={onToggleTrack} onToggleSelectAll={onToggleSelectAll} onDownloadTrack={onDownloadTrack} onDownloadLyrics={onDownloadLyrics} onDownloadCover={onDownloadCover} downloadedCovers={downloadedCovers} failedCovers={failedCovers} skippedCovers={skippedCovers} downloadingCoverTrack={downloadingCoverTrack} onPageChange={onPageChange} onAlbumClick={onAlbumClick} onArtistClick={onArtistClick} onTrackClick={onTrackClick}/>
         </div>)}
     </div>);
 }

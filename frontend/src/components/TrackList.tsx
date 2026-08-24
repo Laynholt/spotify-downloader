@@ -1,11 +1,17 @@
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Download, CheckCircle, XCircle, FileCheck, FileText, ImageDown, Play, Pause, AlertTriangle } from "lucide-react";
+import { Download, CheckCircle, XCircle, FileCheck, FileText, ImageDown, Play, Pause, AlertTriangle, Clock } from "lucide-react";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Pagination, PaginationContent, PaginationEllipsis, PaginationItem, PaginationLink, PaginationNext, PaginationPrevious, } from "@/components/ui/pagination";
 import type { TrackMetadata } from "@/types/api";
 import { usePreview } from "@/hooks/usePreview";
+import type { backend } from "../../wailsjs/go/models";
+import type { MediaJobPayload, MediaJobResult } from "@/lib/download-jobs";
+import { makeTrackKey } from "@/lib/download-jobs";
+import type { DownloadQueueSnapshot } from "@/lib/download-queue-manager";
+import { selectLatestTrackAttempt, type TrackAttemptView } from "@/lib/download-queue-selectors";
+import { formatTransferProgress, phaseLabel } from "@/lib/download-timings";
 interface SuspiciousTrackInfo {
     expectedDurationSeconds?: number;
     actualDurationSeconds?: number;
@@ -20,8 +26,8 @@ interface TrackListProps {
     failedTracks: Set<string>;
     skippedTracks: Set<string>;
     suspiciousTracks?: Map<string, SuspiciousTrackInfo>;
-    downloadingTrack: string | null;
-    isDownloading: boolean;
+    downloadQueue?: DownloadQueueSnapshot<MediaJobPayload, MediaJobResult>;
+    downloadItemsByJobId?: ReadonlyMap<string, backend.DownloadItem>;
     currentPage: number;
     itemsPerPage: number;
     showCheckboxes?: boolean;
@@ -55,8 +61,28 @@ interface TrackListProps {
     }) => void;
     onTrackClick?: (track: TrackMetadata) => void;
 }
-export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloadedTracks, failedTracks, skippedTracks, suspiciousTracks, downloadingTrack, isDownloading, currentPage, itemsPerPage, showCheckboxes = false, hideAlbumColumn = false, folderName, isArtistDiscography = false, isAlbum = false, downloadedLyrics, failedLyrics, skippedLyrics, downloadingLyricsTrack, downloadedCovers, failedCovers, skippedCovers, downloadingCoverTrack, onToggleTrack, onToggleSelectAll, onDownloadTrack, onDownloadLyrics, onDownloadCover, onPageChange, onAlbumClick, onArtistClick, onTrackClick, }: TrackListProps) {
+export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloadedTracks, failedTracks, skippedTracks, suspiciousTracks, downloadQueue, downloadItemsByJobId, currentPage, itemsPerPage, showCheckboxes = false, hideAlbumColumn = false, folderName, isArtistDiscography = false, isAlbum = false, downloadedLyrics, failedLyrics, skippedLyrics, downloadingLyricsTrack, downloadedCovers, failedCovers, skippedCovers, downloadingCoverTrack, onToggleTrack, onToggleSelectAll, onDownloadTrack, onDownloadLyrics, onDownloadCover, onPageChange, onAlbumClick, onArtistClick, onTrackClick, }: TrackListProps) {
     const { playPreview, loadingPreview, playingTrack } = usePreview();
+    const sourceIndexByTrack = new Map(tracks.map((track, index) => [track, index]));
+    const attemptFor = (track: TrackMetadata): TrackAttemptView | undefined => {
+        if (!downloadQueue) {
+            return undefined;
+        }
+        const sourceIndex = sourceIndexByTrack.get(track) ?? 0;
+        return selectLatestTrackAttempt(downloadQueue, makeTrackKey(track, sourceIndex), downloadItemsByJobId);
+    };
+    const isDownloaded = (track: TrackMetadata): boolean => {
+        const attempt = attemptFor(track);
+        return attempt
+            ? attempt.status === "completed" || attempt.status === "skipped" || attempt.status === "suspicious"
+            : Boolean(track.spotify_id && downloadedTracks.has(track.spotify_id));
+    };
+    const isFailed = (track: TrackMetadata): boolean => {
+        const attempt = attemptFor(track);
+        return attempt
+            ? attempt.status === "failed" || attempt.status === "unavailable"
+            : Boolean(track.spotify_id && failedTracks.has(track.spotify_id));
+    };
     let filteredTracks = tracks.filter((track) => {
         if (!searchQuery)
             return true;
@@ -107,22 +133,22 @@ export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloa
     }
     else if (sortBy === "downloaded") {
         filteredTracks = [...filteredTracks].sort((a, b) => {
-            const aDownloaded = a.spotify_id ? downloadedTracks.has(a.spotify_id) : false;
-            const bDownloaded = b.spotify_id ? downloadedTracks.has(b.spotify_id) : false;
+            const aDownloaded = isDownloaded(a);
+            const bDownloaded = isDownloaded(b);
             return (bDownloaded ? 1 : 0) - (aDownloaded ? 1 : 0);
         });
     }
     else if (sortBy === "not-downloaded") {
         filteredTracks = [...filteredTracks].sort((a, b) => {
-            const aDownloaded = a.spotify_id ? downloadedTracks.has(a.spotify_id) : false;
-            const bDownloaded = b.spotify_id ? downloadedTracks.has(b.spotify_id) : false;
+            const aDownloaded = isDownloaded(a);
+            const bDownloaded = isDownloaded(b);
             return (aDownloaded ? 1 : 0) - (bDownloaded ? 1 : 0);
         });
     }
     else if (sortBy === "failed") {
         filteredTracks = [...filteredTracks].sort((a, b) => {
-            const aFailed = a.spotify_id ? failedTracks.has(a.spotify_id) : false;
-            const bFailed = b.spotify_id ? failedTracks.has(b.spotify_id) : false;
+            const aFailed = isFailed(a);
+            const bFailed = isFailed(b);
             return (bFailed ? 1 : 0) - (aFailed ? 1 : 0);
         });
     }
@@ -191,6 +217,46 @@ export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloa
         }
         return parts.length > 0 ? parts.join(", ") : "Suspicious duration";
     };
+    const attemptIcon = (attempt: TrackAttemptView) => {
+        switch (attempt.status) {
+            case "queued":
+                return <Clock className="h-4 w-4 text-muted-foreground"/>;
+            case "active":
+                return <Spinner />;
+            case "completed":
+                return <CheckCircle className="h-4 w-4 text-green-500"/>;
+            case "skipped":
+                return <FileCheck className="h-4 w-4 text-yellow-500"/>;
+            case "suspicious":
+                return <AlertTriangle className="h-4 w-4 text-yellow-500"/>;
+            case "failed":
+                return <XCircle className="h-4 w-4 text-red-500"/>;
+            case "cancelled":
+                return <XCircle className="h-4 w-4 text-orange-500"/>;
+            case "unavailable":
+                return <XCircle className="h-4 w-4 text-muted-foreground"/>;
+        }
+    };
+    const attemptTooltip = (attempt: TrackAttemptView): string => {
+        switch (attempt.status) {
+            case "queued":
+                return "Queued";
+            case "active":
+                return `${phaseLabel(attempt.phase || "downloading")}${attempt.detail ? ` · ${attempt.detail}` : ""}`;
+            case "completed":
+                return "Downloaded";
+            case "skipped":
+                return "Already exists";
+            case "suspicious":
+                return attempt.warning || "Suspicious download";
+            case "failed":
+                return attempt.error || "Failed";
+            case "cancelled":
+                return attempt.error || "Cancelled";
+            case "unavailable":
+                return attempt.error || "Unavailable";
+        }
+    };
     return (<div className="space-y-4">
     <div className="rounded-md border">
       <div className="overflow-x-auto">
@@ -222,8 +288,15 @@ export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloa
           </thead>
           <tbody>
             {paginatedTracks.map((track, index) => {
+            const sourceIndex = sourceIndexByTrack.get(track) ?? startIndex + index;
+            const attempt = attemptFor(track);
+            const attemptBusy = attempt?.status === "queued" || attempt?.status === "active";
+            const speedMbps = attempt?.speedMbps ?? 0;
+            const transfer = attempt?.totalBytes
+                ? formatTransferProgress(attempt.downloadedBytes ?? 0, attempt.totalBytes)
+                : "";
             const suspiciousInfo = track.spotify_id ? suspiciousTracks?.get(track.spotify_id) : undefined;
-            const isSuspicious = !!suspiciousInfo;
+            const isSuspicious = attempt ? attempt.status === "suspicious" : !!suspiciousInfo;
             return (<tr key={index} className="border-b transition-colors hover:bg-muted/50">
               {showCheckboxes && (<td className="p-4 align-middle">
                 {track.spotify_id && (<Checkbox checked={selectedTracks.includes(track.spotify_id)} onCheckedChange={() => onToggleTrack(track.spotify_id!)}/>)}
@@ -251,7 +324,7 @@ export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloa
                         {track.name}
                       </span>) : (<span className="font-medium">{track.name}</span>)}
                       {track.is_explicit && (<span className="inline-flex items-center justify-center bg-red-600 text-white text-[10px] h-4 w-4 rounded shrink-0" title="Explicit">E</span>)}
-                      {isSuspicious ? (<Tooltip>
+                      {attempt ? attemptIcon(attempt) : isSuspicious ? (<Tooltip>
                         <TooltipTrigger asChild>
                           <AlertTriangle className="h-4 w-4 text-yellow-500 shrink-0"/>
                         </TooltipTrigger>
@@ -285,6 +358,15 @@ export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloa
                         {track.artists}
                       </span>) : (track.artists)}
                     </span>
+                    {attempt?.status === "active" && (<span className="max-w-[420px] truncate text-xs text-muted-foreground">
+                      {phaseLabel(attempt.phase || "downloading")}{attempt.detail ? ` · ${attempt.detail}` : ""}
+                    </span>)}
+                    {(transfer || speedMbps > 0) && (<span className="text-xs font-mono text-muted-foreground">
+                      {transfer}{transfer && speedMbps > 0 ? " · " : ""}
+                      {speedMbps > 0 ? `${speedMbps.toFixed(2)} MB/s` : ""}
+                    </span>)}
+                    {attempt?.warning && (<span className="max-w-[420px] truncate text-xs text-yellow-600 dark:text-yellow-400">{attempt.warning}</span>)}
+                    {attempt?.error && (attempt.status === "failed" || attempt.status === "cancelled" || attempt.status === "unavailable") && (<span className="max-w-[420px] truncate text-xs text-red-500">{attempt.error}</span>)}
                   </div>
                 </div>
               </td>
@@ -305,16 +387,16 @@ export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloa
               </td>
               <td className="p-4 align-middle text-center">
                 <div className="flex items-center justify-center gap-1">
-                  {(track.spotify_id) && (<Tooltip>
+                  <Tooltip>
                     <TooltipTrigger asChild>
-                      <Button onClick={() => onDownloadTrack(track, folderName, isArtistDiscography, isAlbum, startIndex + index + 1)} size="icon" disabled={isDownloading || (track.spotify_id ? downloadingTrack === track.spotify_id : false)}>
-                        {track.spotify_id && downloadingTrack === track.spotify_id ? (<Spinner />) : isSuspicious ? (<AlertTriangle className="h-4 w-4"/>) : track.spotify_id && skippedTracks.has(track.spotify_id) ? (<FileCheck className="h-4 w-4"/>) : track.spotify_id && downloadedTracks.has(track.spotify_id) ? (<CheckCircle className="h-4 w-4"/>) : track.spotify_id && failedTracks.has(track.spotify_id) ? (<XCircle className="h-4 w-4"/>) : (<Download className="h-4 w-4"/>)}
+                      <Button onClick={() => onDownloadTrack(track, folderName, isArtistDiscography, isAlbum, sourceIndex + 1)} size="icon" disabled={attemptBusy}>
+                        {attempt ? attemptIcon(attempt) : isSuspicious ? (<AlertTriangle className="h-4 w-4"/>) : track.spotify_id && skippedTracks.has(track.spotify_id) ? (<FileCheck className="h-4 w-4"/>) : track.spotify_id && downloadedTracks.has(track.spotify_id) ? (<CheckCircle className="h-4 w-4"/>) : track.spotify_id && failedTracks.has(track.spotify_id) ? (<XCircle className="h-4 w-4"/>) : (<Download className="h-4 w-4"/>)}
                       </Button>
                     </TooltipTrigger>
                     <TooltipContent>
-                      {track.spotify_id && downloadingTrack === track.spotify_id ? (<p>Downloading...</p>) : isSuspicious ? (<p>{formatSuspiciousTooltip(suspiciousInfo)}</p>) : track.spotify_id && skippedTracks.has(track.spotify_id) ? (<p>Already exists</p>) : track.spotify_id && downloadedTracks.has(track.spotify_id) ? (<p>Downloaded</p>) : track.spotify_id && failedTracks.has(track.spotify_id) ? (<p>Failed</p>) : (<p>Download Track</p>)}
+                      <p>{attempt ? attemptTooltip(attempt) : isSuspicious ? formatSuspiciousTooltip(suspiciousInfo) : track.spotify_id && skippedTracks.has(track.spotify_id) ? "Already exists" : track.spotify_id && downloadedTracks.has(track.spotify_id) ? "Downloaded" : track.spotify_id && failedTracks.has(track.spotify_id) ? "Failed" : "Download Track"}</p>
                     </TooltipContent>
-                  </Tooltip>)}
+                  </Tooltip>
                   {track.spotify_id && (<Tooltip>
                     <TooltipTrigger asChild>
                       <Button onClick={() => playPreview(track.spotify_id!, track.name)} size="icon" variant="outline" disabled={loadingPreview === track.spotify_id}>
@@ -327,7 +409,7 @@ export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloa
                   </Tooltip>)}
                   {track.spotify_id && onDownloadLyrics && (<Tooltip>
                     <TooltipTrigger asChild>
-                      <Button onClick={() => onDownloadLyrics(track.spotify_id!, track.name, track.artists, track.album_name, folderName, isArtistDiscography, startIndex + index + 1, track.album_artist, track.release_date, track.disc_number)} size="icon" variant="outline" disabled={downloadingLyricsTrack === track.spotify_id}>
+                      <Button onClick={() => onDownloadLyrics(track.spotify_id!, track.name, track.artists, track.album_name, folderName, isArtistDiscography, sourceIndex + 1, track.album_artist, track.release_date, track.disc_number)} size="icon" variant="outline" disabled={downloadingLyricsTrack === track.spotify_id}>
                         {downloadingLyricsTrack === track.spotify_id ? (<Spinner />) : skippedLyrics?.has(track.spotify_id) ? (<FileCheck className="h-4 w-4 text-yellow-500"/>) : downloadedLyrics?.has(track.spotify_id) ? (<CheckCircle className="h-4 w-4 text-green-500"/>) : failedLyrics?.has(track.spotify_id) ? (<XCircle className="h-4 w-4 text-red-500"/>) : (<FileText className="h-4 w-4"/>)}
                       </Button>
                     </TooltipTrigger>
@@ -339,7 +421,7 @@ export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloa
                     <TooltipTrigger asChild>
                       <Button onClick={() => {
                     const trackId = track.spotify_id || `${track.name}-${track.artists}`;
-                    onDownloadCover(track.images, track.name, track.artists, track.album_name, folderName, isArtistDiscography, startIndex + index + 1, trackId, track.album_artist, track.release_date, track.disc_number);
+                    onDownloadCover(track.images, track.name, track.artists, track.album_name, folderName, isArtistDiscography, sourceIndex + 1, trackId, track.album_artist, track.release_date, track.disc_number);
                 }} size="icon" variant="outline" disabled={downloadingCoverTrack === (track.spotify_id || `${track.name}-${track.artists}`)}>
                         {downloadingCoverTrack === (track.spotify_id || `${track.name}-${track.artists}`) ? (<Spinner />) : skippedCovers?.has(track.spotify_id || `${track.name}-${track.artists}`) ? (<FileCheck className="h-4 w-4 text-yellow-500"/>) : downloadedCovers?.has(track.spotify_id || `${track.name}-${track.artists}`) ? (<CheckCircle className="h-4 w-4 text-green-500"/>) : failedCovers?.has(track.spotify_id || `${track.name}-${track.artists}`) ? (<XCircle className="h-4 w-4 text-red-500"/>) : (<ImageDown className="h-4 w-4"/>)}
                       </Button>
