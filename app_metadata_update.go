@@ -15,7 +15,7 @@ func (a *App) CheckYtDlpInstalled() (backend.YtDlpStatus, error) {
 }
 
 func (a *App) EnsureYtDlpInstalledOrUpdated() (backend.YtDlpStatus, error) {
-	return backend.EnsureYtDlpInstalledOrUpdated()
+	return backend.EnsureYtDlpInstalledOrUpdatedContext(a.ctx)
 }
 
 func (a *App) RedownloadSuspiciousTracksFromYouTube(reqs []backend.SuspiciousRedownloadRequest) ([]backend.SuspiciousRedownloadResult, error) {

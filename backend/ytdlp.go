@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,9 +22,16 @@ const (
 	ytDlpLatestReleaseURL    = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
 	ytDlpUpdateCheckFilename = "yt-dlp.update-check"
 	ytDlpUpdateCheckTTL      = 24 * time.Hour
+	ytDlpDiagnosticsLimit    = 4096
 )
 
-var ytDlpHTTPClientFactory = newHTTPClient
+var (
+	ytDlpHTTPClientFactory                   = newHTTPClient
+	ytDlpEnsureInstalledOrUpdatedContext     = EnsureYtDlpInstalledOrUpdatedContext
+	ytDlpEnsureDenoInstalledOrUpdatedContext = EnsureDenoInstalledOrUpdatedContext
+	ytDlpGetFFmpegPath                       = GetFFmpegPath
+	ytDlpDebugLogf                           = log.Printf
+)
 
 type GitHubReleaseAsset struct {
 	Name               string `json:"name"`
@@ -50,11 +59,23 @@ type YtDlpDownloadRequest struct {
 	AudioFormat string `json:"audio_format"`
 }
 
+type YtDlpStage string
+
+const (
+	YtDlpStageReleaseCheck YtDlpStage = "release_check"
+	YtDlpStageRuntime      YtDlpStage = "runtime"
+	YtDlpStageSearch       YtDlpStage = "search"
+	YtDlpStageDownload     YtDlpStage = "media_download"
+	YtDlpStageConversion   YtDlpStage = "conversion"
+)
+
 type YtDlpDownloadResult struct {
-	Success bool   `json:"success"`
-	File    string `json:"file,omitempty"`
-	Error   string `json:"error,omitempty"`
-	Output  string `json:"output,omitempty"`
+	Success     bool       `json:"success"`
+	File        string     `json:"file,omitempty"`
+	Stage       YtDlpStage `json:"stage,omitempty"`
+	Error       string     `json:"error,omitempty"`
+	Diagnostics string     `json:"diagnostics,omitempty"`
+	Output      string     `json:"output,omitempty"`
 }
 
 func SelectYtDlpAsset(goos, goarch string, assets []GitHubReleaseAsset) (GitHubReleaseAsset, bool) {
@@ -287,52 +308,144 @@ func DownloadWithYtDlpContext(ctx context.Context, req YtDlpDownloadRequest) YtD
 		return YtDlpDownloadResult{Error: "output base is required"}
 	}
 
-	status, err := EnsureYtDlpInstalledOrUpdatedContext(ctx)
+	stage := YtDlpStageReleaseCheck
+	status, err := ytDlpEnsureInstalledOrUpdatedContext(ctx)
 	if err != nil {
-		return YtDlpDownloadResult{Error: err.Error()}
+		return ytDlpFailure(ctx, stage, err, nil)
+	}
+	if !status.Installed {
+		return ytDlpFailure(ctx, stage, errors.New("yt-dlp is not installed"), nil)
+	}
+	ytDlpPath, err := requireYtDlpExecutablePath(status.Path, "yt-dlp")
+	if err != nil {
+		return ytDlpFailure(ctx, stage, err, nil)
 	}
 	if err := ctx.Err(); err != nil {
-		return YtDlpDownloadResult{Error: err.Error()}
+		return ytDlpFailure(ctx, stage, err, nil)
+	}
+
+	stage = YtDlpStageRuntime
+	denoStatus, err := ytDlpEnsureDenoInstalledOrUpdatedContext(ctx)
+	if err != nil {
+		return ytDlpFailure(ctx, stage, err, nil)
+	}
+	if !denoStatus.Installed {
+		return ytDlpFailure(ctx, stage, errors.New("Deno is not installed"), nil)
+	}
+	denoPath, err := requireYtDlpExecutablePath(denoStatus.Path, "Deno")
+	if err != nil {
+		return ytDlpFailure(ctx, stage, err, nil)
+	}
+	ffmpegPath, err := ytDlpGetFFmpegPath()
+	if err != nil {
+		return ytDlpFailure(ctx, stage, err, nil)
+	}
+	ffmpegPath, err = requireYtDlpExecutablePath(ffmpegPath, "FFmpeg")
+	if err != nil {
+		return ytDlpFailure(ctx, stage, err, nil)
 	}
 
 	dir := filepath.Dir(req.OutputBase)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return YtDlpDownloadResult{Error: err.Error()}
+		return ytDlpFailure(ctx, stage, err, nil)
 	}
 
 	audioFormat := normalizeYtDlpAudioFormat(req.AudioFormat)
-	outputTemplate := req.OutputBase + ".%(ext)s"
-	args := []string{
-		"--no-playlist",
-		"--newline",
-		"--extract-audio",
-		"--audio-format", audioFormat,
-		"--audio-quality", "0",
-		"-o", outputTemplate,
-	}
-	if ffmpegPath, err := GetFFmpegPath(); err == nil && ffmpegPath != "" {
-		args = append(args, "--ffmpeg-location", filepath.Dir(ffmpegPath))
-	}
-	args = append(args, req.Query)
-
-	cmd := newManagedCommand(ctx, status.Path, args...)
+	stage = YtDlpStageSearch
+	cmd := newManagedCommand(ctx, ytDlpPath, BuildYtDlpArgs(req, denoPath, ffmpegPath)...)
 	output, err := cmd.CombinedOutput()
+	if len(output) > 0 {
+		ytDlpDebugLogf("%s", output)
+	}
+	stage = ytDlpStageFromOutput(output)
 	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return YtDlpDownloadResult{Error: ctxErr.Error(), Output: strings.TrimSpace(string(output))}
-		}
-		return YtDlpDownloadResult{Error: fmt.Sprintf("yt-dlp failed: %v", err), Output: strings.TrimSpace(string(output))}
+		return ytDlpFailure(ctx, stage, fmt.Errorf("yt-dlp failed: %w", err), output)
 	}
 	if err := ctx.Err(); err != nil {
-		return YtDlpDownloadResult{Error: err.Error(), Output: strings.TrimSpace(string(output))}
+		return ytDlpFailure(ctx, stage, err, output)
 	}
 
 	file := findYtDlpOutputFile(req.OutputBase, audioFormat)
 	if file == "" {
-		return YtDlpDownloadResult{Error: "yt-dlp completed but output file was not found", Output: strings.TrimSpace(string(output))}
+		return ytDlpFailure(ctx, stage, errors.New("yt-dlp completed but output file was not found"), output)
 	}
 
-	return YtDlpDownloadResult{Success: true, File: file, Output: strings.TrimSpace(string(output))}
+	diagnostics := normalizeYtDlpDiagnostics(output)
+	return YtDlpDownloadResult{Success: true, File: file, Stage: stage, Diagnostics: diagnostics, Output: diagnostics}
+}
+
+func BuildYtDlpArgs(req YtDlpDownloadRequest, denoPath, ffmpegPath string) []string {
+	args := []string{
+		"--no-playlist",
+		"--newline",
+		"--extract-audio",
+		"--audio-format", normalizeYtDlpAudioFormat(req.AudioFormat),
+		"--audio-quality", "0",
+		"-o", req.OutputBase + ".%(ext)s",
+		"--js-runtimes", "deno:" + denoPath,
+		"--ffmpeg-location", filepath.Dir(ffmpegPath),
+	}
+	return append(args, req.Query)
+}
+
+func requireYtDlpExecutablePath(path, name string) (string, error) {
+	cleaned := filepath.Clean(path)
+	if strings.TrimSpace(path) == "" || !filepath.IsAbs(cleaned) {
+		return "", fmt.Errorf("%s path must be absolute: %s", name, path)
+	}
+	info, err := os.Stat(cleaned)
+	if err != nil {
+		return "", fmt.Errorf("stat %s executable: %w", name, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("%s executable is not a regular file: %s", name, cleaned)
+	}
+	if info.Size() == 0 {
+		return "", fmt.Errorf("%s executable is empty: %s", name, cleaned)
+	}
+	if runtime.GOOS != "windows" && info.Mode()&0111 == 0 {
+		return "", fmt.Errorf("%s file is not executable: %s", name, cleaned)
+	}
+	return cleaned, nil
+}
+
+func ytDlpFailure(ctx context.Context, stage YtDlpStage, err error, output []byte) YtDlpDownloadResult {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		err = ctxErr
+	} else if errors.Is(err, context.Canceled) {
+		err = context.Canceled
+	} else if errors.Is(err, context.DeadlineExceeded) {
+		err = context.DeadlineExceeded
+	}
+	diagnostics := normalizeYtDlpDiagnostics(output)
+	return YtDlpDownloadResult{Stage: stage, Error: err.Error(), Diagnostics: diagnostics, Output: diagnostics}
+}
+
+func normalizeYtDlpDiagnostics(output []byte) string {
+	diagnostics := strings.Join(strings.Fields(string(output)), " ")
+	if len(diagnostics) > ytDlpDiagnosticsLimit {
+		diagnostics = diagnostics[len(diagnostics)-ytDlpDiagnosticsLimit:]
+	}
+	return diagnostics
+}
+
+func ytDlpStageFromOutput(output []byte) YtDlpStage {
+	lower := strings.ToLower(string(output))
+	stage := YtDlpStageSearch
+	lastMarker := -1
+	for candidate, markers := range map[YtDlpStage][]string{
+		YtDlpStageSearch:     {"extracting url", "[youtube", "[generic"},
+		YtDlpStageDownload:   {"[download]"},
+		YtDlpStageConversion: {"[extractaudio]", "[ffmpeg]", "[merger]", "[fixup", "[videoconvertor]", "[postprocess"},
+	} {
+		for _, marker := range markers {
+			if index := strings.LastIndex(lower, marker); index > lastMarker {
+				lastMarker = index
+				stage = candidate
+			}
+		}
+	}
+	return stage
 }
 
 func fetchLatestYtDlpRelease() (ytDlpRelease, error) {
