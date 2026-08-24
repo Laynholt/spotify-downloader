@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -46,6 +47,8 @@ type TrackMetadataUpdateResult struct {
 }
 
 type SuspiciousRedownloadRequest struct {
+	QueueID             string                     `json:"queue_id,omitempty"`
+	JobID               string                     `json:"job_id,omitempty"`
 	OriginalFilePath    string                     `json:"original_file_path"`
 	ReplacementFilePath string                     `json:"replacement_file_path,omitempty"`
 	CollectionDir       string                     `json:"collection_dir,omitempty"`
@@ -66,6 +69,8 @@ type SuspiciousRedownloadResult struct {
 	DurationDeltaSeconds    float64 `json:"duration_delta_seconds,omitempty"`
 	Suspicious              bool    `json:"suspicious,omitempty"`
 	ValidationWarning       string  `json:"validation_warning,omitempty"`
+	Stage                   string  `json:"stage,omitempty"`
+	Diagnostics             string  `json:"diagnostics,omitempty"`
 }
 
 func BuildTrackMetadataPayload(req TrackMetadataUpdateRequest) Metadata {
@@ -96,9 +101,6 @@ func BuildTrackMetadataPayload(req TrackMetadataUpdateRequest) Metadata {
 func BuildYtDlpSearchQuery(artistName, trackName string) string {
 	return fmt.Sprintf("ytsearch1:%s - %s audio", strings.TrimSpace(artistName), strings.TrimSpace(trackName))
 }
-
-var downloadWithYtDlp = DownloadWithYtDlp
-var updateTrackMetadata = UpdateTrackMetadata
 
 func normalizeYouTubeFallbackMetadata(req TrackMetadataUpdateRequest) TrackMetadataUpdateRequest {
 	if req.TrackNumber <= 0 || req.TrackNumber > 99 {
@@ -196,87 +198,253 @@ func UpdateTracksMetadata(reqs []TrackMetadataUpdateRequest) []TrackMetadataUpda
 	return results
 }
 
+type suspiciousRedownloadDeps struct {
+	download        func(context.Context, YtDlpDownloadRequest) YtDlpDownloadResult
+	prepareMetadata func(context.Context, TrackMetadataUpdateRequest, string) (Metadata, string, error)
+	finalize        func(context.Context, string, Metadata, string) error
+	probeDuration   func(context.Context, string) (float64, error)
+	moveOriginal    func(string, string) (string, error)
+	publish         func(context.Context, string, string) error
+	restoreOriginal func(string, string) error
+}
+
+var defaultSuspiciousRedownloadDeps = suspiciousRedownloadDeps{
+	download:        DownloadWithYtDlpContext,
+	prepareMetadata: prepareYouTubeRedownloadMetadata,
+	finalize:        FinalizeMedia,
+	probeDuration:   GetAudioDurationContext,
+	moveOriginal:    MoveSuspiciousOriginal,
+	publish:         publishTrackPipelineFile,
+	restoreOriginal: MoveFileWithFallback,
+}
+
+func prepareYouTubeRedownloadMetadata(ctx context.Context, req TrackMetadataUpdateRequest, tempDir string) (Metadata, string, error) {
+	metadata := BuildTrackMetadataPayload(req)
+	if req.EmbedGenre || metadata.Date == "" {
+		tagging, warnings := fetchTaggingMetadata(ctx, CurrentMetadataCache(), TaggingMetadataRequest{
+			TrackID: req.TrackID, TrackName: req.TrackName, ArtistName: req.ArtistName, AlbumName: req.AlbumName,
+			ReleaseDate: req.ReleaseDate, UseSingleGenre: req.UseSingleGenre, EmbedGenre: req.EmbedGenre,
+		})
+		if err := ctx.Err(); err != nil {
+			return Metadata{}, "", err
+		}
+		for _, warning := range warnings {
+			fmt.Printf("Warning: %s\n", warning)
+		}
+		if metadata.Date == "" {
+			metadata.Date = strings.TrimSpace(tagging.ReleaseDate)
+		}
+		if metadata.ISRC == "" {
+			metadata.ISRC = strings.TrimSpace(tagging.ISRC)
+		}
+		if metadata.Genre == "" {
+			metadata.Genre = strings.TrimSpace(tagging.Genre)
+		}
+	}
+
+	if req.EmbedLyrics && strings.TrimSpace(req.TrackID) != "" {
+		client := NewLyricsClient()
+		resp, _, err := client.FetchLyricsAllSourcesContext(ctx, req.TrackID, req.TrackName, req.ArtistName, req.Duration/1000)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return Metadata{}, "", ctxErr
+		}
+		if err == nil && resp != nil && len(resp.Lines) > 0 {
+			metadata.Lyrics = client.ConvertToLRC(resp, req.TrackName, req.ArtistName)
+		}
+	}
+
+	coverPath := ""
+	if strings.TrimSpace(req.CoverURL) != "" {
+		downloader := NewSpotiDownloader("")
+		var err error
+		coverPath, err = downloader.downloadCoverImageContextToDir(ctx, req.CoverURL, tempDir, req.EmbedMaxQualityCover, "")
+		downloader.CloseIdleConnections()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return Metadata{}, "", ctxErr
+		}
+		if err != nil {
+			fmt.Printf("Warning: Failed to download cover image for metadata update: %v\n", err)
+			coverPath = ""
+		}
+	}
+	return metadata, coverPath, nil
+}
+
+func RedownloadSuspiciousTrackFromYouTubeContext(ctx context.Context, req SuspiciousRedownloadRequest) SuspiciousRedownloadResult {
+	return runSuspiciousRedownloadWithDeps(ctx, req, defaultSuspiciousRedownloadDeps)
+}
+
 func RedownloadSuspiciousTrackFromYouTube(req SuspiciousRedownloadRequest) SuspiciousRedownloadResult {
-	result := SuspiciousRedownloadResult{
-		TrackID:          req.Metadata.TrackID,
-		OriginalFilePath: req.OriginalFilePath,
+	return RedownloadSuspiciousTrackFromYouTubeContext(context.Background(), req)
+}
+
+func runSuspiciousRedownloadWithDeps(ctx context.Context, req SuspiciousRedownloadRequest, deps suspiciousRedownloadDeps) SuspiciousRedownloadResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result := SuspiciousRedownloadResult{TrackID: req.Metadata.TrackID, OriginalFilePath: req.OriginalFilePath}
+	fail := func(stage string, err error) SuspiciousRedownloadResult {
+		if err == nil {
+			err = errors.New("YouTube redownload failed")
+		}
+		result.Success = false
+		result.Stage = stage
+		result.Error = err.Error()
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			result.Status = "cancelled"
+		} else {
+			result.Status = "failed"
+		}
+		return result
+	}
+	if err := ctx.Err(); err != nil {
+		return fail("preparation", err)
 	}
 
 	originalPath := strings.TrimSpace(req.OriginalFilePath)
 	replacementPath := strings.TrimSpace(req.ReplacementFilePath)
 	if originalPath == "" && replacementPath == "" {
-		result.Status = "failed"
-		result.Error = "original or replacement file path is required"
-		return result
+		return fail("preparation", errors.New("original or replacement file path is required"))
 	}
+	if replacementPath == "" {
+		replacementPath = originalPath
+	}
+	result.ReplacementPath = replacementPath
 
 	collectionDir := strings.TrimSpace(req.CollectionDir)
-	if collectionDir == "" && originalPath != "" {
-		collectionDir = filepath.Dir(originalPath)
-	} else if collectionDir == "" {
+	if collectionDir == "" && replacementPath != "" {
 		collectionDir = filepath.Dir(replacementPath)
+	} else if collectionDir == "" {
+		collectionDir = filepath.Dir(originalPath)
 	}
 	suspiciousDir := filepath.Join(collectionDir, SuspiciousTracksDirName)
-
-	movedPath := ""
-	if originalPath != "" && replacementPath == "" {
-		var err error
-		replacementPath = originalPath
-		movedPath, err = MoveSuspiciousOriginal(originalPath, suspiciousDir)
-		if err != nil {
-			result.Status = "failed"
-			result.Error = fmt.Sprintf("failed to move suspicious original: %v", err)
-			return result
-		}
-	} else if originalPath != "" && !IsPathInsideDir(originalPath, suspiciousDir) {
-		var err error
-		movedPath, err = MoveSuspiciousOriginal(originalPath, suspiciousDir)
-		if err != nil {
-			result.Status = "failed"
-			result.Error = fmt.Sprintf("failed to move suspicious original: %v", err)
-			return result
-		}
-	} else if originalPath != "" {
-		movedPath = originalPath
+	if originalPath != "" && filepath.Clean(originalPath) == filepath.Clean(replacementPath) && IsPathInsideDir(originalPath, suspiciousDir) {
+		return fail("preparation", errors.New("replacement file path is required when the original is already in the suspicious directory"))
 	}
-	result.MovedOriginalPath = movedPath
 
-	outputBase := strings.TrimSuffix(replacementPath, filepath.Ext(replacementPath))
-	query := BuildYtDlpSearchQuery(req.Metadata.ArtistName, req.Metadata.TrackName)
-	downloadResult := downloadWithYtDlp(YtDlpDownloadRequest{
-		Query:       query,
+	paths, err := CurrentRuntimePaths()
+	if err != nil {
+		return fail("preparation", err)
+	}
+	if strings.TrimSpace(paths.RunTempDir) == "" {
+		return fail("preparation", errors.New("runtime run temp directory is not configured"))
+	}
+	jobID := strings.TrimSpace(req.JobID)
+	if jobID == "" {
+		jobID = req.Metadata.TrackID
+	}
+	jobTempDir := filepath.Join(paths.RunTempDir, sanitizeTrackPipelineID(jobID))
+	youtubeDir := filepath.Join(jobTempDir, "youtube")
+	if err := os.MkdirAll(youtubeDir, 0o755); err != nil {
+		return fail("preparation", fmt.Errorf("create YouTube job temp directory: %w", err))
+	}
+	workCtx, cancelWork := context.WithCancel(ctx)
+	defer func() {
+		cancelWork()
+		_ = os.RemoveAll(jobTempDir)
+	}()
+
+	outputBase := filepath.Join(youtubeDir, "replacement")
+	downloadResult := deps.download(workCtx, YtDlpDownloadRequest{
+		Query:       BuildYtDlpSearchQuery(req.Metadata.ArtistName, req.Metadata.TrackName),
 		OutputBase:  outputBase,
 		AudioFormat: req.AudioFormat,
 	})
+	result.Stage = string(downloadResult.Stage)
+	result.Diagnostics = downloadResult.Diagnostics
 	if !downloadResult.Success {
-		result.Status = "failed"
-		result.Error = downloadResult.Error
-		return result
+		if ctxErr := workCtx.Err(); ctxErr != nil {
+			return fail(result.Stage, ctxErr)
+		}
+		downloadErr := errors.New(downloadResult.Error)
+		if downloadResult.Error == "" {
+			downloadErr = errors.New("yt-dlp failed")
+		}
+		return fail(result.Stage, downloadErr)
+	}
+	stagedMedia, err := resolveYouTubeStagedMedia(outputBase, downloadResult.File)
+	if err != nil {
+		return fail(result.Stage, err)
 	}
 
 	metadataReq := normalizeYouTubeFallbackMetadata(req.Metadata)
-	metadataReq.FilePath = downloadResult.File
-	updateResult := updateTrackMetadata(metadataReq)
-	result.ReplacementPath = downloadResult.File
-	result.ExpectedDurationSeconds = updateResult.ExpectedDurationSeconds
-	result.ActualDurationSeconds = updateResult.ActualDurationSeconds
-	result.DurationDeltaSeconds = updateResult.DurationDeltaSeconds
-	result.ValidationWarning = updateResult.ValidationWarning
-	result.Suspicious = updateResult.Suspicious
+	metadataReq.FilePath = stagedMedia
+	metadata, coverPath, err := deps.prepareMetadata(workCtx, metadataReq, youtubeDir)
+	if err != nil {
+		return fail("metadata", err)
+	}
+	if err := workCtx.Err(); err != nil {
+		return fail("metadata", err)
+	}
+	if err := deps.finalize(workCtx, stagedMedia, metadata, coverPath); err != nil {
+		return fail("finalization", err)
+	}
+	if err := workCtx.Err(); err != nil {
+		return fail("finalization", err)
+	}
 
-	if !updateResult.Success {
-		result.Status = "failed"
-		result.Error = updateResult.Error
+	actualSeconds, err := deps.probeDuration(workCtx, stagedMedia)
+	expectedSeconds := float64(req.Metadata.Duration) / 1000
+	result.ExpectedDurationSeconds = expectedSeconds
+	if err != nil {
+		result.ValidationWarning = fmt.Sprintf("failed to probe audio duration: %v", err)
+		return fail("validation", err)
+	}
+	result.ActualDurationSeconds = actualSeconds
+	result.DurationDeltaSeconds = actualSeconds - expectedSeconds
+	result.Suspicious = IsSuspiciousDuration(expectedSeconds, actualSeconds)
+	if result.Suspicious {
+		result.Status = "still_suspicious"
+		result.Stage = "validation"
+		result.Error = "redownloaded audio is still suspicious"
 		return result
+	}
+	if err := workCtx.Err(); err != nil {
+		return fail("validation", err)
+	}
+
+	movedOriginal := ""
+	originalNeedsBackup := originalPath != "" && !IsPathInsideDir(originalPath, suspiciousDir)
+	if originalNeedsBackup {
+		movedOriginal, err = deps.moveOriginal(originalPath, suspiciousDir)
+		if err != nil {
+			return fail("publication", fmt.Errorf("move suspicious original: %w", err))
+		}
+	} else if originalPath != "" {
+		movedOriginal = originalPath
+	}
+	if err = deps.publish(workCtx, stagedMedia, replacementPath); err != nil {
+		if originalNeedsBackup && movedOriginal != "" {
+			if restoreErr := deps.restoreOriginal(movedOriginal, originalPath); restoreErr != nil {
+				result.MovedOriginalPath = movedOriginal
+				return fail("rollback", errors.Join(err, restoreErr))
+			}
+		}
+		return fail("publication", err)
 	}
 
 	result.Success = true
-	if updateResult.Suspicious {
-		result.Status = "still_suspicious"
-	} else {
-		result.Status = "replaced"
-	}
+	result.Status = "replaced"
+	result.MovedOriginalPath = movedOriginal
 	return result
+}
+
+func resolveYouTubeStagedMedia(outputBase, reportedPath string) (string, error) {
+	reportedPath = filepath.Clean(strings.TrimSpace(reportedPath))
+	if strings.TrimSpace(reportedPath) == "" {
+		return "", errors.New("yt-dlp returned an empty media path")
+	}
+	if strings.TrimSuffix(reportedPath, filepath.Ext(reportedPath)) != filepath.Clean(outputBase) {
+		return "", fmt.Errorf("yt-dlp media is outside the expected job output: %s", reportedPath)
+	}
+	info, err := os.Stat(reportedPath)
+	if err != nil {
+		return "", fmt.Errorf("stat yt-dlp media: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Size() == 0 {
+		return "", fmt.Errorf("yt-dlp media is not a non-empty regular file: %s", reportedPath)
+	}
+	return reportedPath, nil
 }
 
 func RedownloadSuspiciousTracksFromYouTube(reqs []SuspiciousRedownloadRequest) []SuspiciousRedownloadResult {

@@ -25,14 +25,15 @@ type activeDownload struct {
 }
 
 type App struct {
-	ctx                    context.Context
-	runtimePaths           backend.RuntimePaths
-	runtimeInitErr         error
-	metadataCache          *backend.MetadataCache
-	activeMu               sync.Mutex
-	activeDownloads        map[string]activeDownload
-	runTrackPipeline       func(context.Context, backend.TrackPipelineRequest) (backend.TrackPipelineResult, error)
-	moveSuspiciousDownload func(string, string) (string, error)
+	ctx                        context.Context
+	runtimePaths               backend.RuntimePaths
+	runtimeInitErr             error
+	metadataCache              *backend.MetadataCache
+	activeMu                   sync.Mutex
+	activeDownloads            map[string]activeDownload
+	runTrackPipeline           func(context.Context, backend.TrackPipelineRequest) (backend.TrackPipelineResult, error)
+	moveSuspiciousDownload     func(string, string) (string, error)
+	redownloadTrackFromYouTube func(context.Context, backend.SuspiciousRedownloadRequest) backend.SuspiciousRedownloadResult
 }
 
 func NewApp() *App {

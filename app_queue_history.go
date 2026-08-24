@@ -58,8 +58,8 @@ func (a *App) beginTrack(itemID, queueID string) (context.Context, func()) {
 }
 
 // CancelDownloadQueue cancels every active track context owned by queueID.
-// Each DownloadTrack call maps its resulting cancellation to the queue exactly
-// once after the pipeline returns.
+// Each registered media operation maps its resulting cancellation to the queue
+// exactly once after its backend worker returns.
 func (a *App) CancelDownloadQueue(queueID string) int {
 	queueID = normalizeAppQueueID(queueID)
 
@@ -85,8 +85,8 @@ func (a *App) CancelDownloadQueue(queueID string) int {
 }
 
 // CancelActiveDownloads cancels every track context currently owned by the
-// application. Each DownloadTrack call maps its resulting cancellation to the
-// queue exactly once after the pipeline returns.
+// application. Each registered media operation maps its resulting cancellation
+// to the queue exactly once after its backend worker returns.
 func (a *App) CancelActiveDownloads() int {
 	a.activeMu.Lock()
 	cancels := make([]context.CancelFunc, 0, len(a.activeDownloads))
