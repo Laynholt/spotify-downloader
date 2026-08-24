@@ -50,6 +50,22 @@ export function withBatchSummaryQueue(summary: BatchDownloadSummary, queueId: st
     return { ...summary, queueId };
 }
 
+export function mergeQueueSummary(fresh: BatchDownloadSummary, current: BatchDownloadSummary): BatchDownloadSummary {
+    const currentById = new Map(current.results.map((result) => [result.id, result]));
+    const merged = fresh.results.reduce(
+        (summary, result) => addBatchResult(summary, currentById.get(result.id) || result),
+        createEmptyBatchSummary(fresh.title),
+    );
+    return { ...merged, elapsedMs: fresh.elapsedMs, peakActive: fresh.peakActive };
+}
+
+export function youtubeSchedulerQueueForSummary(queueId: string, title: string): DownloadQueueContext {
+    if (queueId === "metadata") return { id: "adhoc:single", title, kind: "adhoc" };
+    const prefix = queueId.split(":", 1)[0];
+    const kind = prefix === "playlist" || prefix === "album" || prefix === "artist" ? prefix : "adhoc";
+    return { id: queueId, title, kind };
+}
+
 function extensionForAudioFormat(audioFormat: string): string {
     switch (audioFormat.toLowerCase()) {
         case "flac":
@@ -459,7 +475,7 @@ export function useDownload() {
     const loggedTerminalJobIdsRef = useRef<Set<string>>(new Set());
     const suspiciousRedownloadRequestsRef = useRef<Map<string, Map<string, SuspiciousRedownloadRequest>>>(new Map());
     const failedRedownloadRequestsRef = useRef<Map<string, Map<string, SuspiciousRedownloadRequest>>>(new Map());
-    const youtubeSummaryGenerationsRef = useRef<WeakMap<BatchDownloadSummary, number>>(new WeakMap());
+    const youtubeSummaryGenerationsRef = useRef<WeakMap<BatchDownloadSummary, { queueId: string; generation: number }>>(new WeakMap());
     const summarizedSpotifyJobsByQueueRef = useRef<Map<string, number>>(new Map());
     const youtubeSummaryStateRef = useRef<YoutubeSummaryState>({
         summary: null,
@@ -667,22 +683,24 @@ export function useDownload() {
         };
     };
     const downloadQueues = useDownloadQueues({
-        youtubeRequestFor: (queueId, sourceResultId) =>
-            suspiciousRedownloadRequestsRef.current.get(queueId)?.get(sourceResultId) ||
-            failedRedownloadRequestsRef.current.get(queueId)?.get(sourceResultId),
-        onYouTubeResult: (queueId, sourceResultId, request, result, sourceSummary) => {
-            const generation = youtubeSummaryGenerationsRef.current.get(sourceSummary);
+        youtubeRequestFor: (queueId, sourceResultId, sourceSummary) => {
+            const ownerQueueId = youtubeSummaryGenerationsRef.current.get(sourceSummary)?.queueId || queueId;
+            return suspiciousRedownloadRequestsRef.current.get(ownerQueueId)?.get(sourceResultId) ||
+                failedRedownloadRequestsRef.current.get(ownerQueueId)?.get(sourceResultId);
+        },
+        onYouTubeResult: (_queueId, sourceResultId, request, result, sourceSummary) => {
+            const owner = youtubeSummaryGenerationsRef.current.get(sourceSummary);
             const state = youtubeSummaryStateRef.current;
-            if (generation === undefined || !state.summary) return;
+            if (!owner || !state.summary) return;
             const summary = applyYouTubeResultToSummary(state.summary, sourceResultId, request, result);
-            const nextState = updateYoutubeSummaryState(state, summary, queueId, generation);
+            const nextState = updateYoutubeSummaryState(state, summary, owner.queueId, owner.generation);
             if (nextState === state) return;
             syncYoutubeSummaryState(nextState);
 
             const trackID = request.metadata.track_id || result.track_id || "";
             if (result.success && result.status === "replaced") {
-                suspiciousRedownloadRequestsRef.current.get(queueId)?.delete(sourceResultId);
-                failedRedownloadRequestsRef.current.get(queueId)?.delete(sourceResultId);
+                suspiciousRedownloadRequestsRef.current.get(owner.queueId)?.delete(sourceResultId);
+                failedRedownloadRequestsRef.current.get(owner.queueId)?.delete(sourceResultId);
                 clearSuspiciousTrack(trackID);
                 setDownloadedTracks((previous) => new Set(previous).add(trackID));
                 setFailedTracks((previous) => {
@@ -754,18 +772,33 @@ export function useDownload() {
             const latestFinishedAt = Math.max(...allTerminalJobs.map((job) => job.finishedAt || job.enqueuedAt));
             const elapsedMs = Math.max(0, latestFinishedAt - earliestEnqueuedAt);
             summary = { ...summary, elapsedMs, peakActive: queuePeakActive(queue.jobs) };
-            openBatchSummary(summary, queue.id);
+            const summaryState = youtubeSummaryStateRef.current;
+            if (summaryState.queueId === queue.id && summaryState.summary) {
+                summary = mergeQueueSummary(summary, summaryState.summary);
+                syncYoutubeSummaryState(updateYoutubeSummaryState(
+                    summaryState,
+                    summary,
+                    queue.id,
+                    summaryState.generation,
+                ));
+            }
+            else {
+                openBatchSummary(summary, queue.id);
+            }
 
             const downloaded = new Set<string>();
             const skipped = new Set<string>();
             const failed = new Set<string>();
-            suspiciousRedownloadRequestsRef.current.set(queue.id, new Map());
-            failedRedownloadRequestsRef.current.set(queue.id, new Map());
+            const summaryResultsById = new Map(summary.results.map((result) => [result.id, result]));
             for (const job of terminalJobs) {
                 const track = job.payload.track;
                 const trackID = track.spotify_id || "";
                 const resultId = resultIdForAttempt(job.id, "terminal");
                 if (!trackID) {
+                    continue;
+                }
+                if (summaryResultsById.get(resultId)?.status === "youtube_replaced") {
+                    downloaded.add(trackID);
                     continue;
                 }
                 if (job.status === "completed" || job.status === "skipped" || job.status === "suspicious") {
@@ -786,6 +819,16 @@ export function useDownload() {
                     failed.add(trackID);
                     const pathInfo = buildBatchTrackPathInfo(track, job.payload.settings, job.payload.playlistName, job.payload.isAlbum, job.payload.position);
                     queueFailedRedownload(queue.id, resultId, track, job.payload.settings, pathInfo);
+                }
+            }
+            const eligibleResultIds = new Set(youtubeEligibleResultIds(summary));
+            for (const requests of [
+                suspiciousRedownloadRequestsRef.current.get(queue.id),
+                failedRedownloadRequestsRef.current.get(queue.id),
+            ]) {
+                if (!requests) continue;
+                for (const resultId of requests.keys()) {
+                    if (!eligibleResultIds.has(resultId)) requests.delete(resultId);
                 }
             }
             logger.info(batchCompletionLog(summary));
@@ -1057,10 +1100,9 @@ export function useDownload() {
             toast.info("No selected tracks available for YouTube redownload");
             return;
         }
-        const prefix = queueId.split(":", 1)[0];
-        const kind = prefix === "playlist" || prefix === "album" || prefix === "artist" ? prefix : "adhoc";
-        const queue: DownloadQueueContext = { id: queueId, title: retryState.summary.title, kind };
-        youtubeSummaryGenerationsRef.current.set(retryState.summary, retryState.generation);
+        const queue = youtubeSchedulerQueueForSummary(queueId, retryState.summary.title);
+        youtubeSummaryGenerationsRef.current.set(retryState.summary, { queueId, generation: retryState.generation });
+        latestQueueIdRef.current = queue.id;
         setIsRedownloadingSuspicious(true);
         setIsDownloading(true);
         setBulkDownloadType(null);

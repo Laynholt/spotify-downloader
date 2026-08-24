@@ -169,6 +169,55 @@ it("carries the owning queue on an opened batch summary", async () => {
     }
 });
 
+it("keeps a successful YouTube replacement when later Spotify idle results are merged", async () => {
+    vi.stubGlobal("window", { navigator: { platform: "Win32" } });
+    const { mergeQueueSummary } = await import("./useDownload");
+    try {
+        const freshSpotify = youtubeSummary();
+        const afterYouTube = applyYouTubeResultToSummary(freshSpotify, "failed-1", youtubeRequest("one"), {
+            success: true,
+            status: "replaced",
+            replacement_path: "fixed.mp3",
+        });
+        const laterSpotify = addBatchResult(freshSpotify, {
+            id: "later-failure",
+            name: "Later track",
+            artists: "Artist",
+            status: "failed",
+            youtubeRetryable: true,
+        });
+
+        const merged = mergeQueueSummary(laterSpotify, afterYouTube);
+
+        expect(merged.results.map(({ id, status }) => [id, status])).toEqual([
+            ["failed-1", "youtube_replaced"],
+            ["failed-2", "failed"],
+            ["downloaded", "downloaded"],
+            ["later-failure", "failed"],
+        ]);
+        expect(merged).toMatchObject({ failed: 2, youtubeReplaced: 1 });
+    }
+    finally {
+        vi.unstubAllGlobals();
+    }
+});
+
+it("maps metadata summary retries onto the established ad-hoc scheduler queue", async () => {
+    vi.stubGlobal("window", { navigator: { platform: "Win32" } });
+    const { youtubeSchedulerQueueForSummary } = await import("./useDownload");
+    try {
+        expect(youtubeSchedulerQueueForSummary("metadata", "Metadata summary")).toEqual({
+            id: "adhoc:single",
+            title: "Metadata summary",
+            kind: "adhoc",
+        });
+        expect(youtubeSchedulerQueueForSummary("playlist:p1", "Playlist").id).toBe("playlist:p1");
+    }
+    finally {
+        vi.unstubAllGlobals();
+    }
+});
+
 function backendApi(overrides: Partial<DownloadQueueApi> = {}): DownloadQueueApi {
     return {
         addDownloadJob: async (_queueId, jobId) => `backend:${jobId}`,
@@ -308,6 +357,7 @@ describe("createDownloadQueueHarness", () => {
             stage: "media_download",
             diagnostics: "network details",
         });
+        expect(harness.pendingYouTubeSummaryCount()).toBe(0);
         await harness.dispose();
     });
 
@@ -329,6 +379,7 @@ describe("createDownloadQueueHarness", () => {
 
         expect(cancelDownloadQueue).toHaveBeenCalledWith(playlistB.id);
         expect(harness.snapshot().queues[playlistB.id].jobs[0].status).toBe("cancelled");
+        expect(harness.pendingYouTubeSummaryCount()).toBe(0);
         await harness.dispose();
     });
 
@@ -346,6 +397,45 @@ describe("createDownloadQueueHarness", () => {
         await waitFor(() => harness.snapshot().queues[playlistB.id].jobs[0]?.status === "failed");
 
         expect(markDownloadItemFailed).toHaveBeenCalledWith(expect.any(String), "Wails unavailable");
+        expect(harness.pendingYouTubeSummaryCount()).toBe(0);
+        await harness.dispose();
+    });
+
+    it("cleans pending YouTube summary state when backend registration rejects and permits retry", async () => {
+        const addDownloadJob = vi.fn()
+            .mockRejectedValueOnce(new Error("registration failed"))
+            .mockImplementation(async (_queueId: string, jobId: string) => jobId);
+        const harness = createDownloadQueueHarness({
+            api: backendApi({ addDownloadJob }),
+            youtubeRequestFor: () => youtubeRequest("one"),
+        });
+
+        await harness.enqueueYouTubeRetries(playlistB, ["failed-1"], youtubeSummary());
+        await waitFor(() => harness.snapshot().queues[playlistB.id].jobs[0]?.status === "failed");
+        expect(harness.pendingYouTubeSummaryCount()).toBe(0);
+
+        const retry = await harness.enqueueYouTubeRetries(playlistB, ["failed-1"], youtubeSummary());
+        await waitFor(() => harness.snapshot().queues[playlistB.id].jobs[1]?.status === "completed");
+        expect(retry).toEqual([expect.objectContaining({ added: true })]);
+        expect(harness.pendingYouTubeSummaryCount()).toBe(0);
+        await harness.dispose();
+    });
+
+    it("passes the ad-hoc metadata scheduler identity to registration and YouTube execution", async () => {
+        const addDownloadJob = vi.fn(async (_queueId: string, jobId: string) => jobId);
+        const redownloadTrackFromYouTube = vi.fn(async () => ({ success: true, status: "replaced" }));
+        const metadataQueue = { id: "adhoc:single", title: "Metadata", kind: "adhoc" as const };
+        const harness = createDownloadQueueHarness({
+            api: backendApi({ addDownloadJob, redownloadTrackFromYouTube }),
+            youtubeRequestFor: (_queueId, resultId) => resultId === "failed-1" ? youtubeRequest("one") : undefined,
+        });
+
+        await harness.enqueueYouTubeRetries(metadataQueue, ["failed-1"], youtubeSummary());
+        await waitFor(() => harness.snapshot().queues[metadataQueue.id].jobs[0]?.status === "completed");
+
+        expect(addDownloadJob).toHaveBeenCalledWith("adhoc:single", expect.any(String), "one", "Track one", "Artist", "Album");
+        expect(redownloadTrackFromYouTube).toHaveBeenCalledWith(expect.objectContaining({ queue_id: "adhoc:single" }));
+        expect(harness.snapshot().queues).not.toHaveProperty("metadata");
         await harness.dispose();
     });
     it("does not append a playlist name to an already resolved output directory", async () => {

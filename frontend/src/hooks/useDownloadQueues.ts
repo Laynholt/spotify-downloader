@@ -64,7 +64,7 @@ type ExecuteSpotify = (job: DownloadJob<SpotifyDownloadPayload, MediaJobResult>,
 export interface DownloadQueueHarnessOptions {
     api?: Partial<DownloadQueueApi>;
     executeSpotify?: ExecuteSpotify;
-    youtubeRequestFor?: (queueId: string, sourceResultId: string) => SuspiciousRedownloadRequest | undefined;
+    youtubeRequestFor?: (queueId: string, sourceResultId: string, sourceSummary: BatchDownloadSummary) => SuspiciousRedownloadRequest | undefined;
     onYouTubeResult?: (
         queueId: string,
         sourceResultId: string,
@@ -86,6 +86,7 @@ export interface DownloadQueueHarness {
     enqueueYouTubeRetries: UseDownloadQueuesResult["enqueueYouTubeRetries"];
     retryTrack: UseDownloadQueuesResult["retryTrack"];
     stopQueue: UseDownloadQueuesResult["stopQueue"];
+    pendingYouTubeSummaryCount(): number;
     subscribe(listener: () => void): () => void;
     dispose(): Promise<void>;
 }
@@ -360,48 +361,52 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
         job: DownloadJob<YouTubeRedownloadPayload, MediaJobResult>,
         signal: AbortSignal,
     ): Promise<SuspiciousRedownloadResult> => {
-        const request = job.payload.request;
-        if (signal.aborted) return { success: false, status: "cancelled", error: "Download cancelled" };
-        const backendItemId = await api.addDownloadJob(
-            job.queueId,
-            job.id,
-            request.metadata.track_id || "",
-            request.metadata.track_name || "",
-            request.metadata.artist_name || "",
-            request.metadata.album_name || "",
-        );
-        scheduler.setBackendItemId(job.id, backendItemId);
-        if (signal.aborted) {
-            await api.cancelDownloadItem(backendItemId);
-            return { success: false, status: "cancelled", error: "Download cancelled" };
-        }
-        let result: SuspiciousRedownloadResult;
         try {
-            result = await api.redownloadTrackFromYouTube({
-                ...request,
-                queue_id: job.queueId,
-                job_id: backendItemId,
-            });
-        }
-        catch (error) {
-            if (signal.aborted || isCancellation(error)) {
+            const request = job.payload.request;
+            if (signal.aborted) return { success: false, status: "cancelled", error: "Download cancelled" };
+            const backendItemId = await api.addDownloadJob(
+                job.queueId,
+                job.id,
+                request.metadata.track_id || "",
+                request.metadata.track_name || "",
+                request.metadata.artist_name || "",
+                request.metadata.album_name || "",
+            );
+            scheduler.setBackendItemId(job.id, backendItemId);
+            if (signal.aborted) {
                 await api.cancelDownloadItem(backendItemId);
                 return { success: false, status: "cancelled", error: "Download cancelled" };
             }
+            let result: SuspiciousRedownloadResult;
             try {
-                await api.markDownloadItemFailed(backendItemId, error instanceof Error ? error.message : String(error));
+                result = await api.redownloadTrackFromYouTube({
+                    ...request,
+                    queue_id: job.queueId,
+                    job_id: backendItemId,
+                });
             }
-            catch {
-                // Preserve the Wails error as the scheduler result.
+            catch (error) {
+                if (signal.aborted || isCancellation(error)) {
+                    await api.cancelDownloadItem(backendItemId);
+                    return { success: false, status: "cancelled", error: "Download cancelled" };
+                }
+                try {
+                    await api.markDownloadItemFailed(backendItemId, error instanceof Error ? error.message : String(error));
+                }
+                catch {
+                    // Preserve the Wails error as the scheduler result.
+                }
+                throw error;
             }
-            throw error;
+            const sourceSummary = youtubeSummaryByJobId.get(job.id);
+            if (sourceSummary) {
+                options.onYouTubeResult?.(job.queueId, job.payload.sourceResultId, request, result, sourceSummary);
+            }
+            return result;
         }
-        const sourceSummary = youtubeSummaryByJobId.get(job.id);
-        youtubeSummaryByJobId.delete(job.id);
-        if (sourceSummary) {
-            options.onYouTubeResult?.(job.queueId, job.payload.sourceResultId, request, result, sourceSummary);
+        finally {
+            youtubeSummaryByJobId.delete(job.id);
         }
-        return result;
     };
 
     const execute = (job: DownloadJob<MediaJobPayload, MediaJobResult>, signal: AbortSignal): Promise<MediaJobResult> => {
@@ -523,7 +528,7 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
                 if (!selected.has(result.id) || !result.youtubeRetryable || (result.status !== "failed" && result.status !== "suspicious")) {
                     continue;
                 }
-                const request = options.youtubeRequestFor?.(queue.id, result.id);
+                const request = options.youtubeRequestFor?.(queue.id, result.id, summary);
                 if (!request) continue;
                 const candidate = buildYouTubeCandidate(queue, result.id, request, sourceIndex);
                 youtubeSummaryByJobId.set(candidate.id, summary);
@@ -544,6 +549,7 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
             return decision;
         },
         stopQueue: async (queueId) => await scheduler.cancelQueue(queueId),
+        pendingYouTubeSummaryCount: () => youtubeSummaryByJobId.size,
         subscribe: (listener) => scheduler.subscribe(listener),
         dispose: async () => {
             unsubscribeIdleWatcher();
