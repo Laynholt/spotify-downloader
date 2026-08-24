@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
     buildSpotifyCandidate,
+    buildYouTubeCandidate,
     makeQueueId,
     makeTrackKey,
     parseSpotifyCollectionURL,
 } from "./download-jobs";
-import type { TrackMetadata } from "@/types/api";
+import type { SuspiciousRedownloadRequest, TrackMetadata } from "@/types/api";
 import type { Settings } from "./settings";
 
 const settings = {} as Settings;
@@ -66,6 +67,30 @@ describe("download job builders", () => {
             playlistOwner: "Owner",
             isAlbum: false,
             position: 3,
+        });
+    });
+
+    it("builds a YouTube retry candidate from the stable summary result ID", () => {
+        const queue = { id: "playlist:p1", title: "Mix", kind: "playlist" as const };
+        const request = {
+            original_file_path: "bad.mp3",
+            metadata: {
+                file_path: "bad.mp3",
+                track_id: "track-1",
+                track_name: "Song",
+                artist_name: "Artist",
+                album_name: "Album",
+            },
+        } as SuspiciousRedownloadRequest;
+
+        const candidate = buildYouTubeCandidate(queue, "attempt-1:terminal", request, 2);
+
+        expect(candidate).toMatchObject({
+            queueId: queue.id,
+            trackKey: "youtube:attempt-1:terminal",
+            sourceIndex: 2,
+            kind: "youtube-redownload",
+            payload: { request, sourceResultId: "attempt-1:terminal" },
         });
     });
 });

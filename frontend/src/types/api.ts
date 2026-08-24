@@ -340,6 +340,8 @@ export interface TrackMetadataUpdateResult {
 }
 
 export interface SuspiciousRedownloadRequest {
+    queue_id?: string;
+    job_id?: string;
     original_file_path: string;
     replacement_file_path?: string;
     collection_dir?: string;
@@ -360,6 +362,9 @@ export interface SuspiciousRedownloadResult {
     duration_delta_seconds?: number;
     suspicious?: boolean;
     validation_warning?: string;
+    stage?: string;
+    diagnostics?: string;
+    warnings?: string[];
 }
 
 export interface YtDlpStatus {

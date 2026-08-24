@@ -1,5 +1,5 @@
 import type { SpotifyMetadataResponse, DownloadRequest, DownloadResponse, HealthResponse, LyricsDownloadRequest, LyricsDownloadResponse, CoverDownloadRequest, CoverDownloadResponse, HeaderDownloadRequest, HeaderDownloadResponse, GalleryImageDownloadRequest, GalleryImageDownloadResponse, AvatarDownloadRequest, AvatarDownloadResponse, TrackMetadataUpdateRequest, TrackMetadataUpdateResult, SuspiciousRedownloadRequest, SuspiciousRedownloadResult, YtDlpStatus, } from "@/types/api";
-import { AddDownloadJob, CancelDownloadItem, CancelDownloadQueue, CheckYtDlpInstalled, DownloadAvatar, DownloadCover, DownloadGalleryImage, DownloadHeader, DownloadLyrics, DownloadTrack, EnsureYtDlpInstalledOrUpdated, GetSpotifyMetadata, MarkDownloadItemFailed, RedownloadSuspiciousTracksFromYouTube, SkipDownloadItem, UpdateTrackMetadata, UpdateTracksMetadata } from "../../wailsjs/go/main/App";
+import { AddDownloadJob, CancelDownloadItem, CancelDownloadQueue, CheckYtDlpInstalled, DownloadAvatar, DownloadCover, DownloadGalleryImage, DownloadHeader, DownloadLyrics, DownloadTrack, EnsureYtDlpInstalledOrUpdated, GetSpotifyMetadata, MarkDownloadItemFailed, RedownloadSuspiciousTracksFromYouTube, RedownloadTrackFromYouTube, SkipDownloadItem, UpdateTrackMetadata, UpdateTracksMetadata } from "../../wailsjs/go/main/App";
 import { backend, main } from "../../wailsjs/go/models";
 export async function fetchSpotifyMetadata(url: string, batch: boolean = true, delay: number = 1.0, timeout: number = 300.0): Promise<SpotifyMetadataResponse> {
     const req = new main.SpotifyMetadataRequest({
@@ -61,6 +61,9 @@ export async function updateTracksMetadata(requests: TrackMetadataUpdateRequest[
 }
 export async function redownloadSuspiciousTracksFromYouTube(requests: SuspiciousRedownloadRequest[]): Promise<SuspiciousRedownloadResult[]> {
     return await RedownloadSuspiciousTracksFromYouTube(requests.map((request) => backend.SuspiciousRedownloadRequest.createFrom(request)));
+}
+export async function redownloadTrackFromYouTube(request: SuspiciousRedownloadRequest): Promise<SuspiciousRedownloadResult> {
+    return await RedownloadTrackFromYouTube(backend.SuspiciousRedownloadRequest.createFrom(request));
 }
 export async function checkYtDlpInstalled(): Promise<YtDlpStatus> {
     return await CheckYtDlpInstalled();

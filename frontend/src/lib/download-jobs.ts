@@ -1,4 +1,4 @@
-import type { DownloadResponse, TrackMetadata } from "@/types/api";
+import type { DownloadResponse, SuspiciousRedownloadRequest, SuspiciousRedownloadResult, TrackMetadata } from "@/types/api";
 import type { DownloadJobCandidate } from "./download-queue-manager";
 import type { Settings } from "./settings";
 
@@ -20,8 +20,13 @@ export interface SpotifyDownloadPayload {
     position: number;
 }
 
-export type MediaJobPayload = SpotifyDownloadPayload;
-export type MediaJobResult = DownloadResponse;
+export interface YouTubeRedownloadPayload extends SpotifyDownloadPayload {
+    request: SuspiciousRedownloadRequest;
+    sourceResultId: string;
+}
+
+export type MediaJobPayload = SpotifyDownloadPayload | YouTubeRedownloadPayload;
+export type MediaJobResult = DownloadResponse | SuspiciousRedownloadResult;
 
 export interface BuildSpotifyCandidateArgs {
     queue: DownloadQueueContext;
@@ -113,5 +118,36 @@ export function buildSpotifyCandidate(
             position: args.position ?? sourceIndex + 1,
         },
         ...(!track.spotify_id?.trim() ? { unavailableReason: "Spotify track ID is missing" } : {}),
+    };
+}
+
+export function buildYouTubeCandidate(
+    queue: DownloadQueueContext,
+    sourceResultId: string,
+    request: SuspiciousRedownloadRequest,
+    sourceIndex: number,
+): DownloadJobCandidate<YouTubeRedownloadPayload> {
+    const metadata = request.metadata;
+    return {
+        id: crypto.randomUUID(),
+        queueId: queue.id,
+        queueTitle: queue.title,
+        trackKey: `youtube:${sourceResultId}`,
+        sourceIndex,
+        kind: "youtube-redownload",
+        payload: {
+            request,
+            sourceResultId,
+            track: {
+                spotify_id: metadata.track_id,
+                name: metadata.track_name || "Unknown track",
+                artists: metadata.artist_name || "",
+                album_name: metadata.album_name || "",
+            } as TrackMetadata,
+            settings: {} as Settings,
+            queue,
+            isAlbum: queue.kind === "album",
+            position: sourceIndex + 1,
+        },
     };
 }

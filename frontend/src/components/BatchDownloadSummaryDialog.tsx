@@ -38,10 +38,12 @@ function formatDuration(seconds?: number): string {
     return `${sign}${minutes}:${rest}`;
 }
 
-function detailText(result: BatchTrackResult): string {
+// eslint-disable-next-line react-refresh/only-export-components -- focused unit coverage keeps diagnostics visible.
+export function batchResultDetailText(result: BatchTrackResult): string {
     const parts = [
         result.reason,
         result.error,
+        ...(result.warnings || []),
         result.validationWarning,
         result.file ? `File: ${result.file}` : "",
         result.movedOriginalPath ? `Moved: ${result.movedOriginalPath}` : "",
@@ -107,7 +109,7 @@ function ResultSection({ title, icon, results, youtubeEligibleIds, selectedYoutu
                         <div>
                             <div className="text-sm font-medium">{result.name}</div>
                             <div className="text-xs text-muted-foreground">{result.artists}</div>
-                            {detailText(result) && <div className="mt-1 text-xs text-muted-foreground">{detailText(result)}</div>}
+                            {batchResultDetailText(result) && <div className="mt-1 text-xs text-muted-foreground">{batchResultDetailText(result)}</div>}
                         </div>
                     </div>
                 ))}

@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import type { DownloadResponse, DownloadRequest, TrackMetadata } from "@/types/api";
+import type { DownloadResponse, DownloadRequest, SuspiciousRedownloadRequest, SuspiciousRedownloadResult, TrackMetadata } from "@/types/api";
 import type { Settings } from "@/lib/settings";
-import { createEmptyBatchSummary } from "@/lib/batch-summary";
+import { addBatchResult, createEmptyBatchSummary, youtubeEligibleResultIds, type BatchDownloadSummary } from "@/lib/batch-summary";
+import { batchResultDetailText } from "@/components/BatchDownloadSummaryDialog";
 import {
+    applyYouTubeResultToSummary,
     createDownloadQueueHarness,
     type CollectionDownloadArgs,
     type DownloadQueueApi,
@@ -49,6 +51,27 @@ function track(id?: string, index = 0): TrackMetadata {
 const playlistA = { id: "playlist:a", title: "Playlist A", kind: "playlist" as const };
 const playlistB = { id: "playlist:b", title: "Playlist B", kind: "playlist" as const };
 const args: CollectionDownloadArgs = { settings: {} as Settings };
+
+function youtubeRequest(id: string): SuspiciousRedownloadRequest {
+    return {
+        original_file_path: `${id}.mp3`,
+        metadata: {
+            file_path: `${id}.mp3`,
+            track_id: id,
+            track_name: `Track ${id}`,
+            artist_name: "Artist",
+            album_name: "Album",
+        },
+    };
+}
+
+function youtubeSummary(): BatchDownloadSummary {
+    return [
+        { id: "failed-1", name: "Track one", artists: "Artist", status: "failed" as const, youtubeRetryable: true },
+        { id: "failed-2", name: "Track two", artists: "Artist", status: "failed" as const, youtubeRetryable: true },
+        { id: "downloaded", name: "Finished", artists: "Artist", status: "downloaded" as const },
+    ].reduce(addBatchResult, createEmptyBatchSummary("YouTube retries"));
+}
 
 it("calculates queue peak from actual overlaps", async () => {
     vi.stubGlobal("window", { navigator: { platform: "Win32" } });
@@ -152,6 +175,7 @@ function backendApi(overrides: Partial<DownloadQueueApi> = {}): DownloadQueueApi
         cancelDownloadItem: async () => undefined,
         cancelDownloadQueue: async () => 0,
         downloadTrack: async () => ({ success: true, message: "Downloaded" }),
+        redownloadTrackFromYouTube: async () => ({ success: true, status: "replaced" }),
         ensureValidToken: async () => "token",
         markDownloadItemFailed: async () => undefined,
         skipDownloadItem: async () => undefined,
@@ -160,6 +184,170 @@ function backendApi(overrides: Partial<DownloadQueueApi> = {}): DownloadQueueApi
 }
 
 describe("createDownloadQueueHarness", () => {
+    it("shows preserved YouTube stage and diagnostics in the summary details", () => {
+        expect(batchResultDetailText({
+            id: "failed-1",
+            name: "Track one",
+            artists: "Artist",
+            status: "failed",
+            reason: "media_download",
+            warnings: ["HTTP 403 from YouTube"],
+        })).toContain("media_download • HTTP 403 from YouTube");
+    });
+
+    it("removes only successful source problems and keeps retry failures eligible", () => {
+        const original = youtubeSummary();
+        const afterSuccess = applyYouTubeResultToSummary(original, "failed-1", youtubeRequest("one"), {
+            success: true,
+            status: "replaced",
+            replacement_path: "fixed.mp3",
+            stage: "publication",
+        });
+        const afterFailure = applyYouTubeResultToSummary(afterSuccess, "failed-2", youtubeRequest("two"), {
+            success: false,
+            status: "still_suspicious",
+            error: "duration mismatch",
+            stage: "validation",
+            diagnostics: "expected 3:00, actual 0:30",
+        });
+
+        expect(afterFailure.results.map(({ id, status }) => [id, status])).toEqual([
+            ["failed-1", "youtube_replaced"],
+            ["failed-2", "failed"],
+            ["downloaded", "downloaded"],
+        ]);
+        expect(youtubeEligibleResultIds(afterFailure)).toEqual(["failed-2"]);
+        expect(afterFailure.results[1]).toMatchObject({
+            error: "duration mismatch",
+            reason: "validation",
+            warnings: ["expected 3:00, actual 0:30"],
+            youtubeRetryable: true,
+        });
+        expect(original.results.map((result) => result.id)).toEqual(["failed-1", "failed-2", "downloaded"]);
+    });
+
+    it("shares the three-worker cap between Spotify and selected YouTube attempts", async () => {
+        const spotifyGates = [deferred<DownloadResponse>(), deferred<DownloadResponse>()];
+        const youtubeGates = [deferred<SuspiciousRedownloadResult>(), deferred<SuspiciousRedownloadResult>()];
+        const youtubeRequests = new Map<string, SuspiciousRedownloadRequest>([
+            ["failed-1", youtubeRequest("one")],
+            ["failed-2", youtubeRequest("two")],
+        ]);
+        let spotifyStarted = 0;
+        let youtubeStarted = 0;
+        let peakActive = 0;
+        const observeActive = () => {
+            peakActive = Math.max(peakActive, spotifyStarted + youtubeStarted);
+        };
+        const harness = createDownloadQueueHarness({
+            executeSpotify: async () => {
+                const gate = spotifyGates[spotifyStarted++];
+                observeActive();
+                const result = await gate.promise;
+                spotifyStarted--;
+                return result;
+            },
+            api: backendApi({
+                redownloadTrackFromYouTube: async () => {
+                    const gate = youtubeGates[youtubeStarted++];
+                    observeActive();
+                    const result = await gate.promise;
+                    youtubeStarted--;
+                    return result;
+                },
+            }),
+            youtubeRequestFor: (_queueId, resultId) => youtubeRequests.get(resultId),
+        });
+
+        await harness.enqueueAll(playlistA, [track("spotify-1"), track("spotify-2")], args);
+        await harness.enqueueYouTubeRetries(playlistB, ["failed-1", "failed-2"], youtubeSummary());
+
+        expect(harness.snapshot().activeCount).toBe(3);
+        expect(harness.snapshot().queues[playlistB.id].counts).toMatchObject({ active: 1, queued: 1 });
+        expect(peakActive).toBe(3);
+
+        spotifyGates[0].resolve({ success: true, message: "Downloaded" });
+        await waitFor(() => harness.snapshot().queues[playlistB.id].counts.active === 2);
+        expect(harness.snapshot().peakActive).toBe(3);
+
+        spotifyGates[1].resolve({ success: true, message: "Downloaded" });
+        youtubeGates[0].resolve({ success: true, status: "replaced" });
+        youtubeGates[1].resolve({ success: true, status: "replaced" });
+        await flushPromises();
+        await harness.dispose();
+    });
+
+    it("enqueues only selected eligible YouTube rows and registers identity before execution", async () => {
+        const calls: string[] = [];
+        const requests: SuspiciousRedownloadRequest[] = [];
+        const summary = youtubeSummary();
+        const request = youtubeRequest("two");
+        const addDownloadJob = vi.fn(async (_queueId: string, jobId: string) => {
+            calls.push("register");
+            return jobId;
+        });
+        const redownloadTrackFromYouTube = vi.fn(async (value: SuspiciousRedownloadRequest) => {
+            calls.push("execute");
+            requests.push(value);
+            return { success: false, status: "failed", stage: "media_download", diagnostics: "network details" };
+        });
+        const harness = createDownloadQueueHarness({
+            api: backendApi({ addDownloadJob, redownloadTrackFromYouTube }),
+            youtubeRequestFor: (_queueId, resultId) => resultId === "failed-2" ? request : undefined,
+        });
+
+        const decisions = await harness.enqueueYouTubeRetries(playlistB, ["failed-2", "downloaded", "not-selected"], summary);
+        await waitFor(() => harness.snapshot().queues[playlistB.id].jobs[0]?.status === "failed");
+
+        expect(decisions).toHaveLength(1);
+        expect(calls).toEqual(["register", "execute"]);
+        expect(addDownloadJob).toHaveBeenCalledWith(playlistB.id, expect.any(String), "two", "Track two", "Artist", "Album");
+        expect(requests[0]).toMatchObject({ queue_id: playlistB.id, job_id: expect.any(String) });
+        expect(harness.snapshot().queues[playlistB.id].jobs).toHaveLength(1);
+        expect(harness.snapshot().queues[playlistB.id].jobs[0].result).toMatchObject({
+            stage: "media_download",
+            diagnostics: "network details",
+        });
+        await harness.dispose();
+    });
+
+    it("maps a cancelled YouTube result and Stop this queue through the shared scheduler", async () => {
+        const gate = deferred<SuspiciousRedownloadResult>();
+        const cancelDownloadQueue = vi.fn(async () => 1);
+        const harness = createDownloadQueueHarness({
+            api: backendApi({
+                cancelDownloadQueue,
+                redownloadTrackFromYouTube: async () => gate.promise,
+            }),
+            youtubeRequestFor: () => youtubeRequest("one"),
+        });
+
+        await harness.enqueueYouTubeRetries(playlistB, ["failed-1"], youtubeSummary());
+        const stopped = harness.stopQueue(playlistB.id);
+        gate.resolve({ success: false, status: "cancelled", stage: "media_download", diagnostics: "cancelled" });
+        await stopped;
+
+        expect(cancelDownloadQueue).toHaveBeenCalledWith(playlistB.id);
+        expect(harness.snapshot().queues[playlistB.id].jobs[0].status).toBe("cancelled");
+        await harness.dispose();
+    });
+
+    it("terminalizes a registered backend item when the YouTube Wails call rejects", async () => {
+        const markDownloadItemFailed = vi.fn(async () => undefined);
+        const harness = createDownloadQueueHarness({
+            api: backendApi({
+                markDownloadItemFailed,
+                redownloadTrackFromYouTube: async () => { throw new Error("Wails unavailable"); },
+            }),
+            youtubeRequestFor: () => youtubeRequest("one"),
+        });
+
+        await harness.enqueueYouTubeRetries(playlistB, ["failed-1"], youtubeSummary());
+        await waitFor(() => harness.snapshot().queues[playlistB.id].jobs[0]?.status === "failed");
+
+        expect(markDownloadItemFailed).toHaveBeenCalledWith(expect.any(String), "Wails unavailable");
+        await harness.dispose();
+    });
     it("does not append a playlist name to an already resolved output directory", async () => {
         const requests: DownloadRequest[] = [];
         const harness = createDownloadQueueHarness({
