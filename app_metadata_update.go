@@ -1,6 +1,15 @@
 package main
 
-import "github.com/afkarxyz/SpotiDownloader/backend"
+import (
+	"fmt"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/afkarxyz/SpotiDownloader/backend"
+)
+
+var youtubeJobSequence uint64
 
 func (a *App) UpdateTrackMetadata(req backend.TrackMetadataUpdateRequest) (backend.TrackMetadataUpdateResult, error) {
 	return backend.UpdateTrackMetadata(req), nil
@@ -23,6 +32,7 @@ func (a *App) RedownloadSuspiciousTracksFromYouTube(reqs []backend.SuspiciousRed
 }
 
 func (a *App) RedownloadTrackFromYouTube(req backend.SuspiciousRedownloadRequest) (backend.SuspiciousRedownloadResult, error) {
+	req.JobID = normalizeYouTubeJobID(req.JobID, req.Metadata.TrackID)
 	trackCtx, cleanup := a.beginTrack(req.JobID, req.QueueID)
 	defer cleanup()
 	backend.StartDownloadItem(req.JobID)
@@ -32,13 +42,6 @@ func (a *App) RedownloadTrackFromYouTube(req backend.SuspiciousRedownloadRequest
 		run = backend.RedownloadSuspiciousTrackFromYouTubeContext
 	}
 	result := run(trackCtx, req)
-	if err := trackCtx.Err(); err != nil {
-		result.Success = false
-		result.Status = "cancelled"
-		if result.Error == "" {
-			result.Error = err.Error()
-		}
-	}
 
 	switch {
 	case result.Status == "cancelled":
@@ -49,4 +52,16 @@ func (a *App) RedownloadTrackFromYouTube(req backend.SuspiciousRedownloadRequest
 		backend.FailDownloadItem(req.JobID, result.Error)
 	}
 	return result, nil
+}
+
+func normalizeYouTubeJobID(jobID, trackID string) string {
+	if jobID = strings.TrimSpace(jobID); jobID != "" {
+		return jobID
+	}
+	prefix := backend.SanitizeFilename(strings.TrimSpace(trackID))
+	if prefix == "" || prefix == "Unknown" {
+		prefix = "youtube"
+	}
+	sequence := atomic.AddUint64(&youtubeJobSequence, 1)
+	return fmt.Sprintf("%s-youtube-%d-%d", prefix, time.Now().UnixNano(), sequence)
 }

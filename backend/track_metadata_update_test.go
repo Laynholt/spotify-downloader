@@ -3,10 +3,14 @@ package backend
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestBuildTrackMetadataPayloadMapsRequestFields(t *testing.T) {
@@ -93,6 +97,7 @@ func newReplacementFixture(t *testing.T) *replacementFixture {
 	f.deps = suspiciousRedownloadDeps{
 		download: func(ctx context.Context, req YtDlpDownloadRequest) YtDlpDownloadResult {
 			f.record("download")
+			f.captureOperationDir(req.OutputBase)
 			f.assertOriginalUntouched()
 			if err := ctx.Err(); err != nil {
 				return YtDlpDownloadResult{Stage: YtDlpStageDownload, Error: err.Error()}
@@ -154,6 +159,11 @@ func newReplacementFixture(t *testing.T) *replacementFixture {
 		},
 	}
 	return f
+}
+
+func (f *replacementFixture) captureOperationDir(outputBase string) {
+	f.youtubeDir = filepath.Dir(outputBase)
+	f.jobTempDir = filepath.Dir(f.youtubeDir)
 }
 
 func (f *replacementFixture) record(name string) {
@@ -222,14 +232,16 @@ func TestYouTubeReplacementFailurePointsPreserveOriginal(t *testing.T) {
 			ctx := context.Background()
 			switch tt.failAt {
 			case "download":
-				f.deps.download = func(context.Context, YtDlpDownloadRequest) YtDlpDownloadResult {
+				f.deps.download = func(_ context.Context, req YtDlpDownloadRequest) YtDlpDownloadResult {
 					f.record("download")
+					f.captureOperationDir(req.OutputBase)
 					f.assertOriginalUntouched()
 					return YtDlpDownloadResult{Stage: YtDlpStageDownload, Error: "network lost", Diagnostics: "download details"}
 				}
 			case "outside-path":
 				f.deps.download = func(_ context.Context, req YtDlpDownloadRequest) YtDlpDownloadResult {
 					f.record("download")
+					f.captureOperationDir(req.OutputBase)
 					f.assertOriginalUntouched()
 					f.stagedPath = req.OutputBase + ".mp3"
 					if err := os.WriteFile(f.stagedPath, []byte("replacement"), 0o644); err != nil {
@@ -275,8 +287,9 @@ func TestYouTubeReplacementFailurePointsPreserveOriginal(t *testing.T) {
 			case "cancel":
 				var cancel context.CancelFunc
 				ctx, cancel = context.WithCancel(ctx)
-				f.deps.download = func(inner context.Context, _ YtDlpDownloadRequest) YtDlpDownloadResult {
+				f.deps.download = func(inner context.Context, req YtDlpDownloadRequest) YtDlpDownloadResult {
 					f.record("download")
+					f.captureOperationDir(req.OutputBase)
 					f.assertOriginalUntouched()
 					cancel()
 					<-inner.Done()
@@ -396,6 +409,387 @@ func TestYouTubeReplacementReportsRollbackFailure(t *testing.T) {
 	}
 	assertPathAbsent(t, f.originalPath)
 	assertFileContents(t, f.backupPath, "original")
+}
+
+func TestYouTubeReplacementRestoresExistingDistinctDestinationAfterPartialPublishFailure(t *testing.T) {
+	f := newReplacementFixture(t)
+	destination := filepath.Join(filepath.Dir(f.originalPath), "Published.mp3")
+	if err := os.WriteFile(destination, []byte("existing destination"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.replacementPath = destination
+	f.request.ReplacementFilePath = destination
+	f.deps.publish = func(context.Context, string, string) error {
+		f.record("publish")
+		if err := os.WriteFile(destination, []byte("partial replacement"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return errors.New("disk full")
+	}
+
+	got := runSuspiciousRedownloadWithDeps(context.Background(), f.request, f.deps)
+	if got.Success || got.Stage != "publication" {
+		t.Fatalf("result = %#v", got)
+	}
+	assertFileContents(t, f.originalPath, "original")
+	assertFileContents(t, destination, "existing destination")
+	assertPathAbsent(t, f.backupPath)
+	assertNoRollbackFiles(t, destination)
+}
+
+func TestYouTubeReplacementJoinsBothDestinationAndOriginalRestoreFailures(t *testing.T) {
+	f := newReplacementFixture(t)
+	destination := filepath.Join(filepath.Dir(f.originalPath), "Published.mp3")
+	if err := os.WriteFile(destination, []byte("existing destination"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.replacementPath = destination
+	f.request.ReplacementFilePath = destination
+	f.deps.publish = func(context.Context, string, string) error {
+		f.record("publish")
+		return errors.New("publish failed")
+	}
+	f.deps.restoreOriginal = func(_, dst string) error {
+		f.record("restore")
+		switch filepath.Clean(dst) {
+		case filepath.Clean(destination):
+			return errors.New("destination restore denied")
+		case filepath.Clean(f.originalPath):
+			return errors.New("original restore denied")
+		default:
+			return errors.New("unexpected restore destination")
+		}
+	}
+
+	got := runSuspiciousRedownloadWithDeps(context.Background(), f.request, f.deps)
+	if got.Success || got.Stage != "rollback" || !strings.Contains(got.Error, "publish failed") ||
+		!strings.Contains(got.Error, "destination restore denied") || !strings.Contains(got.Error, "original restore denied") {
+		t.Fatalf("result = %#v", got)
+	}
+	if f.calls.restore != 2 {
+		t.Fatalf("restore calls = %d, want 2", f.calls.restore)
+	}
+}
+
+func TestYouTubeReplacementRestoresSameDestinationAlreadyInSuspicious(t *testing.T) {
+	f := newReplacementFixture(t)
+	f.moveOriginalToSuspicious()
+	f.replacementPath = f.originalPath
+	f.request.ReplacementFilePath = f.originalPath
+	f.deps.publish = func(context.Context, string, string) error {
+		f.record("publish")
+		if err := os.WriteFile(f.replacementPath, []byte("partial replacement"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return errors.New("disk full")
+	}
+
+	got := runSuspiciousRedownloadWithDeps(context.Background(), f.request, f.deps)
+	if got.Success || got.Stage != "publication" {
+		t.Fatalf("result = %#v", got)
+	}
+	assertFileContents(t, f.originalPath, "original")
+	assertNoRollbackFiles(t, f.replacementPath)
+}
+
+func TestSameFilesystemPathRecognizesAliases(t *testing.T) {
+	dir := t.TempDir()
+	original := filepath.Join(dir, "Song.mp3")
+	if err := os.WriteFile(original, []byte("audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	hardLink := filepath.Join(dir, "Song-link.mp3")
+	if err := os.Link(original, hardLink); err != nil {
+		t.Fatal(err)
+	}
+	if !sameFilesystemPath(original, hardLink) {
+		t.Fatal("hard links to the same file were treated as distinct")
+	}
+	if !sameFilesystemPath(original, filepath.Join(dir, ".", "Song.mp3")) {
+		t.Fatal("clean aliases to the same path were treated as distinct")
+	}
+	if runtime.GOOS == "windows" && !sameFilesystemPath(original, strings.ToUpper(original)) {
+		t.Fatal("Windows case alias was treated as distinct")
+	}
+}
+
+func TestYouTubeReplacementPreservesOriginalWhenDestinationIsHardLinkAlias(t *testing.T) {
+	f := newReplacementFixture(t)
+	destination := filepath.Join(filepath.Dir(f.originalPath), "Song-alias.mp3")
+	if err := os.Link(f.originalPath, destination); err != nil {
+		t.Fatal(err)
+	}
+	f.replacementPath = destination
+	f.request.ReplacementFilePath = destination
+	f.deps.publish = func(_ context.Context, src, dst string) error {
+		f.record("publish")
+		if err := os.WriteFile(dst, []byte("replacement"), 0o644); err != nil {
+			return err
+		}
+		return os.Remove(src)
+	}
+
+	got := runSuspiciousRedownloadWithDeps(context.Background(), f.request, f.deps)
+	if !got.Success || got.Status != "replaced" {
+		t.Fatalf("result = %#v", got)
+	}
+	assertFileContents(t, destination, "replacement")
+	assertFileContents(t, got.MovedOriginalPath, "original")
+	assertNoRollbackFiles(t, destination)
+}
+
+func TestYouTubeReplacementUsesUniqueOperationDirectoriesForDuplicateEmptyAndCollidingIDs(t *testing.T) {
+	root := t.TempDir()
+	runTempDir := filepath.Join(root, "run")
+	if err := os.MkdirAll(runTempDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	keepPath := filepath.Join(runTempDir, "keep.txt")
+	if err := os.WriteFile(keepPath, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	installRuntimePathsForTest(t, RuntimePaths{RunTempDir: runTempDir})
+
+	jobIDs := []string{"duplicate", "duplicate", "", "", "a:b", "a?b"}
+	started := make(chan string, len(jobIDs))
+	release := make(chan struct{})
+	var wg sync.WaitGroup
+	for i, jobID := range jobIDs {
+		deps := defaultSuspiciousRedownloadDeps
+		deps.download = func(_ context.Context, req YtDlpDownloadRequest) YtDlpDownloadResult {
+			started <- req.OutputBase
+			<-release
+			return YtDlpDownloadResult{Stage: YtDlpStageDownload, Error: "stop after path capture"}
+		}
+		req := SuspiciousRedownloadRequest{
+			JobID: jobID, ReplacementFilePath: filepath.Join(root, "destinations", fmt.Sprintf("%d.mp3", i)),
+			Metadata: TrackMetadataUpdateRequest{TrackID: "same-track", ArtistName: "Artist", TrackName: "Song"},
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runSuspiciousRedownloadWithDeps(context.Background(), req, deps)
+		}()
+	}
+
+	operationDirs := make(map[string]struct{}, len(jobIDs))
+	for range jobIDs {
+		select {
+		case outputBase := <-started:
+			operationDir := filepath.Dir(filepath.Dir(outputBase))
+			if filepath.Dir(operationDir) != filepath.Clean(runTempDir) {
+				t.Fatalf("operation directory %q is outside run temp %q", operationDir, runTempDir)
+			}
+			operationDirs[operationDir] = struct{}{}
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for operation directories")
+		}
+	}
+	if len(operationDirs) != len(jobIDs) {
+		t.Fatalf("unique operation directories = %d, want %d: %v", len(operationDirs), len(jobIDs), operationDirs)
+	}
+	close(release)
+	wg.Wait()
+	for operationDir := range operationDirs {
+		assertPathAbsent(t, operationDir)
+	}
+	assertFileContents(t, keepPath, "keep")
+}
+
+func TestYouTubeReplacementRejectsDestinationInsideOperationDirectoryBeforeDownload(t *testing.T) {
+	root := t.TempDir()
+	runTempDir := filepath.Join(root, "run")
+	operationDir := filepath.Join(runTempDir, "controlled-operation")
+	if err := os.MkdirAll(runTempDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	keepPath := filepath.Join(runTempDir, "keep.txt")
+	if err := os.WriteFile(keepPath, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	installRuntimePathsForTest(t, RuntimePaths{RunTempDir: runTempDir})
+
+	downloadCalled := false
+	deps := defaultSuspiciousRedownloadDeps
+	deps.makeOperationDir = func(_, _ string) (string, error) {
+		if err := os.Mkdir(operationDir, 0o755); err != nil {
+			return "", err
+		}
+		return operationDir, nil
+	}
+	deps.download = func(context.Context, YtDlpDownloadRequest) YtDlpDownloadResult {
+		downloadCalled = true
+		return YtDlpDownloadResult{Success: true}
+	}
+	req := SuspiciousRedownloadRequest{
+		JobID: "job", ReplacementFilePath: filepath.Join(operationDir, "must-not-publish.mp3"),
+		Metadata: TrackMetadataUpdateRequest{TrackID: "track", ArtistName: "Artist", TrackName: "Song"},
+	}
+
+	got := runSuspiciousRedownloadWithDeps(context.Background(), req, deps)
+	if got.Success || got.Stage != "preparation" || !strings.Contains(got.Error, "operation directory") {
+		t.Fatalf("result = %#v", got)
+	}
+	if downloadCalled {
+		t.Fatal("download started for a destination inside the operation directory")
+	}
+	assertPathAbsent(t, operationDir)
+	assertFileContents(t, keepPath, "keep")
+}
+
+func TestYouTubeReplacementRejectsExternalStagedMediaSymlinkBeforeMetadata(t *testing.T) {
+	f := newReplacementFixture(t)
+	externalPath := filepath.Join(filepath.Dir(filepath.Dir(f.originalPath)), "external.mp3")
+	if err := os.WriteFile(externalPath, []byte("external audio"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.deps.download = func(_ context.Context, req YtDlpDownloadRequest) YtDlpDownloadResult {
+		f.record("download")
+		f.captureOperationDir(req.OutputBase)
+		f.assertOriginalUntouched()
+		f.stagedPath = req.OutputBase + ".mp3"
+		if err := os.Symlink(externalPath, f.stagedPath); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		return YtDlpDownloadResult{Success: true, File: f.stagedPath, Stage: YtDlpStageConversion}
+	}
+
+	got := runSuspiciousRedownloadWithDeps(context.Background(), f.request, f.deps)
+	if got.Success || got.Stage != string(YtDlpStageConversion) || !strings.Contains(strings.ToLower(got.Error), "symlink") {
+		t.Fatalf("result = %#v", got)
+	}
+	if f.calls != (replacementCallCounts{download: 1}) {
+		t.Fatalf("calls = %#v, want download only", f.calls)
+	}
+	assertFileContents(t, f.originalPath, "original")
+	assertFileContents(t, externalPath, "external audio")
+	assertPathAbsent(t, f.jobTempDir)
+}
+
+func TestYouTubeReplacementSerializesOnlyPublicationForConcurrentSameOriginal(t *testing.T) {
+	root := t.TempDir()
+	runTempDir := filepath.Join(root, "run")
+	collectionDir := filepath.Join(root, "Playlist")
+	originalPath := filepath.Join(collectionDir, "Song.mp3")
+	if err := os.MkdirAll(runTempDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(collectionDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(originalPath, []byte("original"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	installRuntimePathsForTest(t, RuntimePaths{RunTempDir: runTempDir})
+
+	type labeledResult struct {
+		label  string
+		result SuspiciousRedownloadResult
+	}
+	probeReached := make(chan string, 2)
+	publishReached := make(chan string, 2)
+	releaseFirstPublish := make(chan struct{})
+	results := make(chan labeledResult, 2)
+	run := func(label string) {
+		deps := defaultSuspiciousRedownloadDeps
+		deps.download = func(_ context.Context, req YtDlpDownloadRequest) YtDlpDownloadResult {
+			path := req.OutputBase + ".mp3"
+			if err := os.WriteFile(path, []byte(label), 0o644); err != nil {
+				t.Errorf("write %s staged media: %v", label, err)
+				return YtDlpDownloadResult{Stage: YtDlpStageDownload, Error: err.Error()}
+			}
+			return YtDlpDownloadResult{Success: true, File: path, Stage: YtDlpStageConversion}
+		}
+		deps.prepareMetadata = func(context.Context, TrackMetadataUpdateRequest, string) (Metadata, string, error) {
+			return Metadata{Title: "Song"}, "", nil
+		}
+		deps.finalize = func(context.Context, string, Metadata, string) error { return nil }
+		deps.probeDuration = func(context.Context, string) (float64, error) {
+			probeReached <- label
+			return 180, nil
+		}
+		deps.publish = func(ctx context.Context, src, dst string) error {
+			publishReached <- label
+			if label == "first" {
+				<-releaseFirstPublish
+			}
+			return publishTrackPipelineFile(ctx, src, dst)
+		}
+		req := SuspiciousRedownloadRequest{
+			JobID: label, OriginalFilePath: originalPath, ReplacementFilePath: originalPath, CollectionDir: collectionDir,
+			Metadata: TrackMetadataUpdateRequest{TrackID: label, ArtistName: "Artist", TrackName: "Song", Duration: 180000},
+		}
+		results <- labeledResult{label: label, result: runSuspiciousRedownloadWithDeps(context.Background(), req, deps)}
+	}
+
+	go run("first")
+	waitForLabel(t, probeReached, "first")
+	waitForLabel(t, publishReached, "first")
+	go run("second")
+	waitForLabel(t, probeReached, "second")
+
+	collected := make([]labeledResult, 0, 2)
+	publicationSerialized := true
+	select {
+	case label := <-publishReached:
+		publicationSerialized = false
+		t.Logf("second publication entered early: %s", label)
+	case result := <-results:
+		publicationSerialized = false
+		collected = append(collected, result)
+		t.Logf("second operation completed before first commit: %#v", result)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(releaseFirstPublish)
+	for len(collected) < 2 {
+		select {
+		case result := <-results:
+			collected = append(collected, result)
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for concurrent replacements")
+		}
+	}
+	if !publicationSerialized {
+		t.Fatal("publication critical sections overlapped or observed an intermediate missing original")
+	}
+
+	byLabel := make(map[string]SuspiciousRedownloadResult, 2)
+	for _, item := range collected {
+		byLabel[item.label] = item.result
+	}
+	if !byLabel["first"].Success || !byLabel["second"].Success {
+		t.Fatalf("results = %#v", byLabel)
+	}
+	if sameFilesystemPath(byLabel["first"].MovedOriginalPath, byLabel["second"].MovedOriginalPath) {
+		t.Fatalf("original backups collided: %#v", byLabel)
+	}
+	assertFileContents(t, originalPath, "second")
+	assertFileContents(t, byLabel["first"].MovedOriginalPath, "original")
+	assertFileContents(t, byLabel["second"].MovedOriginalPath, "first")
+	assertNoRollbackFiles(t, originalPath)
+}
+
+func waitForLabel(t *testing.T, labels <-chan string, want string) {
+	t.Helper()
+	select {
+	case got := <-labels:
+		if got != want {
+			t.Fatalf("label = %q, want %q", got, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %q", want)
+	}
+}
+
+func assertNoRollbackFiles(t *testing.T, destination string) {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(destination), "."+filepath.Base(destination)+".youtube-rollback-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("rollback files remain: %v", matches)
+	}
 }
 
 func assertFileContents(t *testing.T, path, want string) {

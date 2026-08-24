@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 )
 
 type TrackMetadataUpdateRequest struct {
@@ -112,6 +114,37 @@ func normalizeYouTubeFallbackMetadata(req TrackMetadataUpdateRequest) TrackMetad
 	return req
 }
 
+func sameFilesystemPath(left, right string) bool {
+	if sameFilesystemEntry(left, right) {
+		return true
+	}
+	if left == "" || right == "" {
+		return false
+	}
+	leftAbs, leftErr := filepath.Abs(left)
+	rightAbs, rightErr := filepath.Abs(right)
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	leftInfo, leftErr := os.Stat(leftAbs)
+	rightInfo, rightErr := os.Stat(rightAbs)
+	return leftErr == nil && rightErr == nil && os.SameFile(leftInfo, rightInfo)
+}
+
+func sameFilesystemEntry(left, right string) bool {
+	if left == "" || right == "" {
+		return false
+	}
+	leftAbs, leftErr := filepath.Abs(left)
+	rightAbs, rightErr := filepath.Abs(right)
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	leftAbs = filepath.Clean(leftAbs)
+	rightAbs = filepath.Clean(rightAbs)
+	return leftAbs == rightAbs || (runtime.GOOS == "windows" && strings.EqualFold(leftAbs, rightAbs))
+}
+
 func UpdateTrackMetadata(req TrackMetadataUpdateRequest) TrackMetadataUpdateResult {
 	result := TrackMetadataUpdateResult{
 		FilePath: req.FilePath,
@@ -199,24 +232,28 @@ func UpdateTracksMetadata(reqs []TrackMetadataUpdateRequest) []TrackMetadataUpda
 }
 
 type suspiciousRedownloadDeps struct {
-	download        func(context.Context, YtDlpDownloadRequest) YtDlpDownloadResult
-	prepareMetadata func(context.Context, TrackMetadataUpdateRequest, string) (Metadata, string, error)
-	finalize        func(context.Context, string, Metadata, string) error
-	probeDuration   func(context.Context, string) (float64, error)
-	moveOriginal    func(string, string) (string, error)
-	publish         func(context.Context, string, string) error
-	restoreOriginal func(string, string) error
+	makeOperationDir func(string, string) (string, error)
+	download         func(context.Context, YtDlpDownloadRequest) YtDlpDownloadResult
+	prepareMetadata  func(context.Context, TrackMetadataUpdateRequest, string) (Metadata, string, error)
+	finalize         func(context.Context, string, Metadata, string) error
+	probeDuration    func(context.Context, string) (float64, error)
+	moveOriginal     func(string, string) (string, error)
+	publish          func(context.Context, string, string) error
+	restoreOriginal  func(string, string) error
 }
 
 var defaultSuspiciousRedownloadDeps = suspiciousRedownloadDeps{
-	download:        DownloadWithYtDlpContext,
-	prepareMetadata: prepareYouTubeRedownloadMetadata,
-	finalize:        FinalizeMedia,
-	probeDuration:   GetAudioDurationContext,
-	moveOriginal:    MoveSuspiciousOriginal,
-	publish:         publishTrackPipelineFile,
-	restoreOriginal: MoveFileWithFallback,
+	makeOperationDir: os.MkdirTemp,
+	download:         DownloadWithYtDlpContext,
+	prepareMetadata:  prepareYouTubeRedownloadMetadata,
+	finalize:         FinalizeMedia,
+	probeDuration:    GetAudioDurationContext,
+	moveOriginal:     MoveSuspiciousOriginal,
+	publish:          publishTrackPipelineFile,
+	restoreOriginal:  MoveFileWithFallback,
 }
+
+var youtubePublicationMu sync.Mutex
 
 func prepareYouTubeRedownloadMetadata(ctx context.Context, req TrackMetadataUpdateRequest, tempDir string) (Metadata, string, error) {
 	metadata := BuildTrackMetadataPayload(req)
@@ -318,9 +355,6 @@ func runSuspiciousRedownloadWithDeps(ctx context.Context, req SuspiciousRedownlo
 		collectionDir = filepath.Dir(originalPath)
 	}
 	suspiciousDir := filepath.Join(collectionDir, SuspiciousTracksDirName)
-	if originalPath != "" && filepath.Clean(originalPath) == filepath.Clean(replacementPath) && IsPathInsideDir(originalPath, suspiciousDir) {
-		return fail("preparation", errors.New("replacement file path is required when the original is already in the suspicious directory"))
-	}
 
 	paths, err := CurrentRuntimePaths()
 	if err != nil {
@@ -329,20 +363,29 @@ func runSuspiciousRedownloadWithDeps(ctx context.Context, req SuspiciousRedownlo
 	if strings.TrimSpace(paths.RunTempDir) == "" {
 		return fail("preparation", errors.New("runtime run temp directory is not configured"))
 	}
-	jobID := strings.TrimSpace(req.JobID)
-	if jobID == "" {
-		jobID = req.Metadata.TrackID
+	if err := os.MkdirAll(paths.RunTempDir, 0o755); err != nil {
+		return fail("preparation", fmt.Errorf("create runtime temp directory: %w", err))
 	}
-	jobTempDir := filepath.Join(paths.RunTempDir, sanitizeTrackPipelineID(jobID))
-	youtubeDir := filepath.Join(jobTempDir, "youtube")
-	if err := os.MkdirAll(youtubeDir, 0o755); err != nil {
-		return fail("preparation", fmt.Errorf("create YouTube job temp directory: %w", err))
+	makeOperationDir := deps.makeOperationDir
+	if makeOperationDir == nil {
+		makeOperationDir = os.MkdirTemp
+	}
+	operationDir, err := makeOperationDir(paths.RunTempDir, sanitizeTrackPipelineID(req.JobID)+"-")
+	if err != nil {
+		return fail("preparation", fmt.Errorf("create YouTube operation directory: %w", err))
 	}
 	workCtx, cancelWork := context.WithCancel(ctx)
 	defer func() {
 		cancelWork()
-		_ = os.RemoveAll(jobTempDir)
+		_ = os.RemoveAll(operationDir)
 	}()
+	if pathResolvesInsideDirectory(replacementPath, operationDir) {
+		return fail("preparation", errors.New("replacement destination is inside the YouTube operation directory"))
+	}
+	youtubeDir := filepath.Join(operationDir, "youtube")
+	if err := os.MkdirAll(youtubeDir, 0o755); err != nil {
+		return fail("preparation", fmt.Errorf("create YouTube job temp directory: %w", err))
+	}
 
 	outputBase := filepath.Join(youtubeDir, "replacement")
 	downloadResult := deps.download(workCtx, YtDlpDownloadRequest{
@@ -362,7 +405,7 @@ func runSuspiciousRedownloadWithDeps(ctx context.Context, req SuspiciousRedownlo
 		}
 		return fail(result.Stage, downloadErr)
 	}
-	stagedMedia, err := resolveYouTubeStagedMedia(outputBase, downloadResult.File)
+	stagedMedia, err := resolveYouTubeStagedMedia(operationDir, outputBase, downloadResult.File)
 	if err != nil {
 		return fail(result.Stage, err)
 	}
@@ -403,8 +446,23 @@ func runSuspiciousRedownloadWithDeps(ctx context.Context, req SuspiciousRedownlo
 		return fail("validation", err)
 	}
 
-	movedOriginal := ""
+	youtubePublicationMu.Lock()
+	defer youtubePublicationMu.Unlock()
+	if err := workCtx.Err(); err != nil {
+		return fail("publication", err)
+	}
+	destinationInfo, destinationStatErr := os.Stat(replacementPath)
+	destinationExisted := destinationStatErr == nil
+	if destinationStatErr != nil && !os.IsNotExist(destinationStatErr) {
+		return fail("publication", fmt.Errorf("stat replacement destination: %w", destinationStatErr))
+	}
+	if destinationExisted && destinationInfo.IsDir() {
+		return fail("publication", errors.New("replacement destination is a directory"))
+	}
+	originalIsDestination := sameFilesystemPath(originalPath, replacementPath)
+	originalIsDestinationEntry := sameFilesystemEntry(originalPath, replacementPath)
 	originalNeedsBackup := originalPath != "" && !IsPathInsideDir(originalPath, suspiciousDir)
+	movedOriginal := ""
 	if originalNeedsBackup {
 		movedOriginal, err = deps.moveOriginal(originalPath, suspiciousDir)
 		if err != nil {
@@ -413,14 +471,65 @@ func runSuspiciousRedownloadWithDeps(ctx context.Context, req SuspiciousRedownlo
 	} else if originalPath != "" {
 		movedOriginal = originalPath
 	}
-	if err = deps.publish(workCtx, stagedMedia, replacementPath); err != nil {
-		if originalNeedsBackup && movedOriginal != "" {
-			if restoreErr := deps.restoreOriginal(movedOriginal, originalPath); restoreErr != nil {
-				result.MovedOriginalPath = movedOriginal
-				return fail("rollback", errors.Join(err, restoreErr))
+
+	destinationRollbackPath := ""
+	destinationNeedsRollbackFile := destinationExisted && (!originalIsDestination || !originalNeedsBackup || !originalIsDestinationEntry)
+	if destinationNeedsRollbackFile {
+		destinationRollbackPath, err = moveToUniqueYouTubeRollback(replacementPath)
+		if err != nil {
+			if originalNeedsBackup && movedOriginal != "" {
+				if restoreErr := deps.restoreOriginal(movedOriginal, originalPath); restoreErr != nil {
+					result.MovedOriginalPath = movedOriginal
+					return fail("rollback", errors.Join(err, fmt.Errorf("restore original: %w", restoreErr)))
+				}
+			}
+			return fail("publication", err)
+		}
+	}
+
+	rollback := func(cause error, publishAttempted bool) SuspiciousRedownloadResult {
+		errs := []error{cause}
+		rollbackFailed := false
+		if destinationRollbackPath != "" {
+			if restoreErr := deps.restoreOriginal(destinationRollbackPath, replacementPath); restoreErr != nil {
+				errs = append(errs, fmt.Errorf("restore replacement destination from %s: %w", destinationRollbackPath, restoreErr))
+				rollbackFailed = true
+			}
+		} else if publishAttempted && !destinationExisted {
+			if removeErr := os.Remove(replacementPath); removeErr != nil && !os.IsNotExist(removeErr) {
+				errs = append(errs, fmt.Errorf("remove unpublished replacement: %w", removeErr))
+				rollbackFailed = true
 			}
 		}
-		return fail("publication", err)
+		if originalNeedsBackup && movedOriginal != "" {
+			if restoreErr := deps.restoreOriginal(movedOriginal, originalPath); restoreErr != nil {
+				errs = append(errs, fmt.Errorf("restore original from %s: %w", movedOriginal, restoreErr))
+				result.MovedOriginalPath = movedOriginal
+				rollbackFailed = true
+			}
+		}
+		if rollbackFailed {
+			return fail("rollback", errors.Join(errs...))
+		}
+		return fail("publication", cause)
+	}
+
+	if err := workCtx.Err(); err != nil {
+		return rollback(err, false)
+	}
+	if err = deps.publish(workCtx, stagedMedia, replacementPath); err != nil {
+		if ctxErr := workCtx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
+			err = errors.Join(err, ctxErr)
+		}
+		return rollback(err, true)
+	}
+	if err := workCtx.Err(); err != nil {
+		return rollback(err, true)
+	}
+	if destinationRollbackPath != "" {
+		if err := os.Remove(destinationRollbackPath); err != nil {
+			return rollback(fmt.Errorf("remove replacement rollback backup: %w", err), true)
+		}
 	}
 
 	result.Success = true
@@ -429,20 +538,92 @@ func runSuspiciousRedownloadWithDeps(ctx context.Context, req SuspiciousRedownlo
 	return result
 }
 
-func resolveYouTubeStagedMedia(outputBase, reportedPath string) (string, error) {
+func moveToUniqueYouTubeRollback(path string) (string, error) {
+	rollbackFile, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".youtube-rollback-*")
+	if err != nil {
+		return "", fmt.Errorf("reserve replacement rollback path: %w", err)
+	}
+	rollbackPath := rollbackFile.Name()
+	if err := rollbackFile.Close(); err != nil {
+		_ = os.Remove(rollbackPath)
+		return "", fmt.Errorf("close replacement rollback reservation: %w", err)
+	}
+	if err := os.Remove(rollbackPath); err != nil {
+		return "", fmt.Errorf("release replacement rollback reservation: %w", err)
+	}
+	if err := MoveFileWithFallback(path, rollbackPath); err != nil {
+		_ = os.Remove(rollbackPath)
+		return "", fmt.Errorf("preserve replacement destination: %w", err)
+	}
+	return rollbackPath, nil
+}
+
+func pathResolvesInsideDirectory(path, dir string) bool {
+	if pathInsideDirectory(path, dir) {
+		return true
+	}
+	resolvedDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return false
+	}
+	resolvedPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		resolvedParent, parentErr := filepath.EvalSymlinks(filepath.Dir(path))
+		if parentErr != nil {
+			return false
+		}
+		resolvedPath = filepath.Join(resolvedParent, filepath.Base(path))
+	}
+	return pathInsideDirectory(resolvedPath, resolvedDir)
+}
+
+func pathInsideDirectory(path, dir string) bool {
+	pathAbs, pathErr := filepath.Abs(path)
+	dirAbs, dirErr := filepath.Abs(dir)
+	if pathErr != nil || dirErr != nil {
+		return false
+	}
+	pathAbs = filepath.Clean(pathAbs)
+	dirAbs = filepath.Clean(dirAbs)
+	if runtime.GOOS == "windows" {
+		pathAbs = strings.ToLower(pathAbs)
+		dirAbs = strings.ToLower(dirAbs)
+	}
+	rel, err := filepath.Rel(dirAbs, pathAbs)
+	if err != nil || filepath.IsAbs(rel) {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
+func resolveYouTubeStagedMedia(operationDir, outputBase, reportedPath string) (string, error) {
 	reportedPath = filepath.Clean(strings.TrimSpace(reportedPath))
 	if strings.TrimSpace(reportedPath) == "" {
 		return "", errors.New("yt-dlp returned an empty media path")
 	}
-	if strings.TrimSuffix(reportedPath, filepath.Ext(reportedPath)) != filepath.Clean(outputBase) {
+	if !sameFilesystemPath(strings.TrimSuffix(reportedPath, filepath.Ext(reportedPath)), outputBase) {
 		return "", fmt.Errorf("yt-dlp media is outside the expected job output: %s", reportedPath)
 	}
-	info, err := os.Stat(reportedPath)
+	info, err := os.Lstat(reportedPath)
 	if err != nil {
 		return "", fmt.Errorf("stat yt-dlp media: %w", err)
 	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("yt-dlp media is a symlink: %s", reportedPath)
+	}
 	if !info.Mode().IsRegular() || info.Size() == 0 {
 		return "", fmt.Errorf("yt-dlp media is not a non-empty regular file: %s", reportedPath)
+	}
+	realOperationDir, err := filepath.EvalSymlinks(operationDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve YouTube operation directory: %w", err)
+	}
+	realMediaPath, err := filepath.EvalSymlinks(reportedPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve yt-dlp media: %w", err)
+	}
+	if !pathInsideDirectory(realMediaPath, realOperationDir) {
+		return "", fmt.Errorf("yt-dlp media resolves outside the operation directory: %s", reportedPath)
 	}
 	return reportedPath, nil
 }
