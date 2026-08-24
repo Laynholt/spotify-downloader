@@ -35,8 +35,7 @@ import { useCover } from "@/hooks/useCover";
 import { useDownloadQueueDialog } from "@/hooks/useDownloadQueueDialog";
 import { useDownloadProgress } from "@/hooks/useDownloadProgress";
 import { isNewerVersion } from "@/lib/version";
-import { makeQueueId, parseSpotifyCollectionURL, type DownloadQueueContext } from "@/lib/download-jobs";
-import { selectQueueStatus } from "@/lib/download-queue-selectors";
+import { selectCollectionQueue, selectQueueStatus } from "@/lib/download-queue-selectors";
 const HISTORY_KEY = "spotidownloader_fetch_history";
 const MAX_HISTORY = 5;
 interface AppUpdateStatus {
@@ -77,35 +76,10 @@ function App() {
     const cover = useCover();
     const downloadQueue = useDownloadQueueDialog();
     const downloadProgress = useDownloadProgress();
-    const collectionQueue = useMemo<DownloadQueueContext | undefined>(() => {
-        if (!metadata.metadata) {
-            return undefined;
-        }
-        let kind: DownloadQueueContext["kind"];
-        let title: string;
-        if ("playlist_info" in metadata.metadata) {
-            kind = "playlist";
-            title = metadata.metadata.playlist_info.name || metadata.metadata.playlist_info.owner.display_name || metadata.metadata.playlist_info.owner.name;
-        }
-        else if ("album_info" in metadata.metadata) {
-            kind = "album";
-            title = metadata.metadata.album_info.name;
-        }
-        else if ("artist_info" in metadata.metadata) {
-            kind = "artist";
-            title = metadata.metadata.artist_info.name;
-        }
-        else {
-            return undefined;
-        }
-        const parsed = parseSpotifyCollectionURL(spotifyUrl);
-        const sourceId = parsed?.kind === kind
-            ? parsed.id
-            : kind === "artist"
-                ? extractArtistID(spotifyUrl)
-                : undefined;
-        return sourceId ? { id: makeQueueId(kind, sourceId), title, kind } : undefined;
-    }, [metadata.metadata, spotifyUrl]);
+    const collectionQueue = useMemo(
+        () => selectCollectionQueue(metadata.loadedMetadata),
+        [metadata.loadedMetadata],
+    );
     const currentDownloadQueue = collectionQueue
         ? download.downloadQueueSnapshot.queues[collectionQueue.id]
         : undefined;
@@ -319,13 +293,13 @@ function App() {
         }
     };
     useEffect(() => {
-        if (!metadata.metadata || !spotifyUrl)
+        if (!metadata.metadata || !metadata.loadedMetadata)
             return;
         let historyItem: Omit<HistoryItem, "id" | "timestamp"> | null = null;
         if ("track" in metadata.metadata) {
             const { track } = metadata.metadata;
             historyItem = {
-                url: spotifyUrl,
+                url: metadata.loadedMetadata.sourceUrl,
                 type: "track",
                 name: track.name,
                 artist: track.artists,
@@ -335,7 +309,7 @@ function App() {
         else if ("album_info" in metadata.metadata) {
             const { album_info } = metadata.metadata;
             historyItem = {
-                url: spotifyUrl,
+                url: metadata.loadedMetadata.sourceUrl,
                 type: "album",
                 name: album_info.name,
                 artist: `${album_info.total_tracks.toLocaleString()} tracks`,
@@ -345,7 +319,7 @@ function App() {
         else if ("playlist_info" in metadata.metadata) {
             const { playlist_info } = metadata.metadata;
             historyItem = {
-                url: spotifyUrl,
+                url: metadata.loadedMetadata.sourceUrl,
                 type: "playlist",
                 name: playlist_info.owner.name,
                 artist: `${playlist_info.tracks.total.toLocaleString()} tracks`,
@@ -355,7 +329,7 @@ function App() {
         else if ("artist_info" in metadata.metadata) {
             const { artist_info } = metadata.metadata;
             historyItem = {
-                url: spotifyUrl,
+                url: metadata.loadedMetadata.sourceUrl,
                 type: "artist",
                 name: artist_info.name,
                 artist: `${artist_info.total_albums.toLocaleString()} albums`,
@@ -365,7 +339,7 @@ function App() {
         if (historyItem) {
             addToHistory(historyItem);
         }
-    }, [metadata.metadata]);
+    }, [metadata.metadata, metadata.loadedMetadata]);
     const handleSearchChange = (value: string) => {
         setSearchQuery(value);
         setCurrentListPage(1);
@@ -494,8 +468,9 @@ function App() {
             case "about":
                 return <AboutPage version={CURRENT_VERSION}/>;
             case "history":
-                return <HistoryPage onHistorySelect={(data: string) => {
-                        metadata.loadFromCache(data);
+                return <HistoryPage onHistorySelect={(data: string, sourceUrl: string) => {
+                        setSpotifyUrl(sourceUrl);
+                        metadata.loadFromCache(data, sourceUrl);
                         setCurrentPage("main");
                     }}/>;
             case "audio-analysis":

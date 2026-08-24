@@ -43,7 +43,7 @@ interface FetchHistoryItem {
     timestamp: number;
 }
 interface HistoryPageProps {
-    onHistorySelect?: (cachedData: string) => void;
+    onHistorySelect?: (cachedData: string, sourceUrl: string) => void;
 }
 const parseDuration = (str: string) => {
     const parts = str.split(':').map(Number);
@@ -466,7 +466,7 @@ export function HistoryPage({ onHistorySelect }: HistoryPageProps) {
                                 </tr>
                             </thead>
                             <tbody>
-                                {paginated.map((item, index) => (<tr key={item.id} className="border-b transition-colors hover:bg-muted/50 cursor-pointer" onClick={() => onHistorySelect?.(item.data)}>
+                                {paginated.map((item, index) => (<tr key={item.id} className="border-b transition-colors hover:bg-muted/50 cursor-pointer" onClick={() => onHistorySelect?.(item.data, item.url)}>
                                         <td className="p-3 align-middle text-sm text-muted-foreground text-left font-mono">
                                             {startIndex + index + 1}
                                         </td>
@@ -494,7 +494,7 @@ export function HistoryPage({ onHistorySelect }: HistoryPageProps) {
                                                 <TooltipProvider>
                                                     <Tooltip delayDuration={0}>
                                                         <TooltipTrigger asChild>
-                                                            <Button variant="ghost" size="icon" className="h-8 w-8 cursor-pointer" onClick={() => onHistorySelect?.(item.data)}>
+                                                            <Button variant="ghost" size="icon" className="h-8 w-8 cursor-pointer" onClick={() => onHistorySelect?.(item.data, item.url)}>
                                                                 <CloudUpload className="h-4 w-4"/>
                                                             </Button>
                                                         </TooltipTrigger>

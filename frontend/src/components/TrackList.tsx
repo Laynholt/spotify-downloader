@@ -63,6 +63,7 @@ interface TrackListProps {
 }
 export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloadedTracks, failedTracks, skippedTracks, suspiciousTracks, downloadQueue, downloadItemsByJobId, currentPage, itemsPerPage, showCheckboxes = false, hideAlbumColumn = false, folderName, isArtistDiscography = false, isAlbum = false, downloadedLyrics, failedLyrics, skippedLyrics, downloadingLyricsTrack, downloadedCovers, failedCovers, skippedCovers, downloadingCoverTrack, onToggleTrack, onToggleSelectAll, onDownloadTrack, onDownloadLyrics, onDownloadCover, onPageChange, onAlbumClick, onArtistClick, onTrackClick, }: TrackListProps) {
     const { playPreview, loadingPreview, playingTrack } = usePreview();
+    const useLegacyMediaState = downloadQueue === undefined;
     const sourceIndexByTrack = new Map(tracks.map((track, index) => [track, index]));
     const attemptFor = (track: TrackMetadata): TrackAttemptView | undefined => {
         if (!downloadQueue) {
@@ -75,13 +76,13 @@ export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloa
         const attempt = attemptFor(track);
         return attempt
             ? attempt.status === "completed" || attempt.status === "skipped" || attempt.status === "suspicious"
-            : Boolean(track.spotify_id && downloadedTracks.has(track.spotify_id));
+            : useLegacyMediaState && Boolean(track.spotify_id && downloadedTracks.has(track.spotify_id));
     };
     const isFailed = (track: TrackMetadata): boolean => {
         const attempt = attemptFor(track);
         return attempt
             ? attempt.status === "failed" || attempt.status === "unavailable"
-            : Boolean(track.spotify_id && failedTracks.has(track.spotify_id));
+            : useLegacyMediaState && Boolean(track.spotify_id && failedTracks.has(track.spotify_id));
     };
     let filteredTracks = tracks.filter((track) => {
         if (!searchQuery)
@@ -295,8 +296,22 @@ export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloa
             const transfer = attempt?.totalBytes
                 ? formatTransferProgress(attempt.downloadedBytes ?? 0, attempt.totalBytes)
                 : "";
-            const suspiciousInfo = track.spotify_id ? suspiciousTracks?.get(track.spotify_id) : undefined;
+            const legacySkipped = useLegacyMediaState && Boolean(track.spotify_id && skippedTracks.has(track.spotify_id));
+            const legacyDownloaded = useLegacyMediaState && Boolean(track.spotify_id && downloadedTracks.has(track.spotify_id));
+            const legacyFailed = useLegacyMediaState && Boolean(track.spotify_id && failedTracks.has(track.spotify_id));
+            const suspiciousInfo = useLegacyMediaState && track.spotify_id ? suspiciousTracks?.get(track.spotify_id) : undefined;
             const isSuspicious = attempt ? attempt.status === "suspicious" : !!suspiciousInfo;
+            const mediaLabel = attempt
+                ? attemptTooltip(attempt)
+                : isSuspicious
+                    ? formatSuspiciousTooltip(suspiciousInfo)
+                    : legacySkipped
+                        ? "Already exists"
+                        : legacyDownloaded
+                            ? "Downloaded"
+                            : legacyFailed
+                                ? "Failed"
+                                : "Download Track";
             return (<tr key={index} className="border-b transition-colors hover:bg-muted/50">
               {showCheckboxes && (<td className="p-4 align-middle">
                 {track.spotify_id && (<Checkbox checked={selectedTracks.includes(track.spotify_id)} onCheckedChange={() => onToggleTrack(track.spotify_id!)}/>)}
@@ -331,7 +346,7 @@ export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloa
                         <TooltipContent>
                           <p>{formatSuspiciousTooltip(suspiciousInfo)}</p>
                         </TooltipContent>
-                      </Tooltip>) : track.spotify_id && skippedTracks.has(track.spotify_id) ? (<FileCheck className="h-4 w-4 text-yellow-500 shrink-0"/>) : track.spotify_id && downloadedTracks.has(track.spotify_id) ? (<CheckCircle className="h-4 w-4 text-green-500 shrink-0"/>) : track.spotify_id && failedTracks.has(track.spotify_id) ? (<XCircle className="h-4 w-4 text-red-500 shrink-0"/>) : null}
+                      </Tooltip>) : legacySkipped ? (<FileCheck className="h-4 w-4 text-yellow-500 shrink-0"/>) : legacyDownloaded ? (<CheckCircle className="h-4 w-4 text-green-500 shrink-0"/>) : legacyFailed ? (<XCircle className="h-4 w-4 text-red-500 shrink-0"/>) : null}
                     </div>
                     <span className="text-sm text-muted-foreground">
                       {track.artists_data && track.artists_data.length > 0 ? ((() => {
@@ -389,12 +404,12 @@ export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloa
                 <div className="flex items-center justify-center gap-1">
                   <Tooltip>
                     <TooltipTrigger asChild>
-                      <Button onClick={() => onDownloadTrack(track, folderName, isArtistDiscography, isAlbum, sourceIndex + 1)} size="icon" disabled={attemptBusy}>
-                        {attempt ? attemptIcon(attempt) : isSuspicious ? (<AlertTriangle className="h-4 w-4"/>) : track.spotify_id && skippedTracks.has(track.spotify_id) ? (<FileCheck className="h-4 w-4"/>) : track.spotify_id && downloadedTracks.has(track.spotify_id) ? (<CheckCircle className="h-4 w-4"/>) : track.spotify_id && failedTracks.has(track.spotify_id) ? (<XCircle className="h-4 w-4"/>) : (<Download className="h-4 w-4"/>)}
+                      <Button onClick={() => onDownloadTrack(track, folderName, isArtistDiscography, isAlbum, sourceIndex + 1)} size="icon" disabled={attemptBusy} aria-label={mediaLabel}>
+                        {attempt ? attemptIcon(attempt) : isSuspicious ? (<AlertTriangle className="h-4 w-4"/>) : legacySkipped ? (<FileCheck className="h-4 w-4"/>) : legacyDownloaded ? (<CheckCircle className="h-4 w-4"/>) : legacyFailed ? (<XCircle className="h-4 w-4"/>) : (<Download className="h-4 w-4"/>)}
                       </Button>
                     </TooltipTrigger>
                     <TooltipContent>
-                      <p>{attempt ? attemptTooltip(attempt) : isSuspicious ? formatSuspiciousTooltip(suspiciousInfo) : track.spotify_id && skippedTracks.has(track.spotify_id) ? "Already exists" : track.spotify_id && downloadedTracks.has(track.spotify_id) ? "Downloaded" : track.spotify_id && failedTracks.has(track.spotify_id) ? "Failed" : "Download Track"}</p>
+                      <p>{mediaLabel}</p>
                     </TooltipContent>
                   </Tooltip>
                   {track.spotify_id && (<Tooltip>

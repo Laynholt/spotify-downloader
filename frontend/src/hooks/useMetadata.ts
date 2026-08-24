@@ -6,9 +6,20 @@ import { logDuplicateTracks } from "@/lib/duplicate-tracks";
 import { extractArtistID } from "@/lib/spotify-url";
 import { AddFetchHistory } from "../../wailsjs/go/main/App";
 import type { SpotifyMetadataResponse } from "@/types/api";
+import type { LoadedSpotifyMetadata } from "@/lib/download-queue-selectors";
+
+export function loadedMetadataAfterAttempt(
+    current: LoadedSpotifyMetadata | null,
+    sourceUrl: string,
+    data?: SpotifyMetadataResponse,
+): LoadedSpotifyMetadata | null {
+    return data ? { data, sourceUrl } : current;
+}
+
 export function useMetadata() {
     const [loading, setLoading] = useState(false);
-    const [metadata, setMetadata] = useState<SpotifyMetadataResponse | null>(null);
+    const [loadedMetadata, setLoadedMetadata] = useState<LoadedSpotifyMetadata | null>(null);
+    const metadata = loadedMetadata?.data ?? null;
     const [showAlbumDialog, setShowAlbumDialog] = useState(false);
     const [selectedAlbum, setSelectedAlbum] = useState<{
         id: string;
@@ -114,7 +125,7 @@ export function useMetadata() {
                     return;
                 }
             }
-            setMetadata(data);
+            setLoadedMetadata(current => loadedMetadataAfterAttempt(current, url, data));
             saveToHistory(url, data);
             if ("track" in data) {
                 logger.success(`fetched track: ${data.track.name} - ${data.track.artists}`);
@@ -139,6 +150,7 @@ export function useMetadata() {
             toast.success("Metadata fetched successfully");
         }
         catch (err) {
+            setLoadedMetadata(current => loadedMetadataAfterAttempt(current, url));
             const errorMsg = err instanceof Error ? err.message : "Failed to fetch metadata";
             logger.error(`fetch failed: ${errorMsg}`);
             toast.error(errorMsg);
@@ -147,10 +159,10 @@ export function useMetadata() {
             setLoading(false);
         }
     };
-    const loadFromCache = (cachedData: string) => {
+    const loadFromCache = (cachedData: string, sourceUrl: string) => {
         try {
-            const data = JSON.parse(cachedData);
-            setMetadata(data);
+            const data = JSON.parse(cachedData) as SpotifyMetadataResponse;
+            setLoadedMetadata(current => loadedMetadataAfterAttempt(current, sourceUrl, data));
             toast.success("Loaded from cache");
         }
         catch (err) {
@@ -202,7 +214,7 @@ export function useMetadata() {
         logger.debug(`url: ${albumUrl}`);
         setShowAlbumDialog(false);
         setLoading(true);
-        setMetadata(null);
+        setLoadedMetadata(null);
         try {
             const startTime = Date.now();
             const data = await fetchSpotifyMetadata(albumUrl);
@@ -212,12 +224,12 @@ export function useMetadata() {
                 if (!albumInfo.name && albumInfo.total_tracks === 0 && data.track_list.length === 0) {
                     logger.warning("album appears to be empty or not found");
                     toast.error("Album not found or may be private");
-                    setMetadata(null);
+                    setLoadedMetadata(null);
                     setSelectedAlbum(null);
                     return albumUrl;
                 }
             }
-            setMetadata(data);
+            setLoadedMetadata(current => loadedMetadataAfterAttempt(current, albumUrl, data));
             saveToHistory(albumUrl, data);
             if ("album_info" in data) {
                 logger.success(`fetched album: ${data.album_info.name}`);
@@ -241,6 +253,7 @@ export function useMetadata() {
     return {
         loading,
         metadata,
+        loadedMetadata,
         showAlbumDialog,
         setShowAlbumDialog,
         selectedAlbum,
@@ -248,6 +261,6 @@ export function useMetadata() {
         handleAlbumClick,
         handleConfirmAlbumFetch,
         loadFromCache,
-        resetMetadata: () => setMetadata(null),
+        resetMetadata: () => setLoadedMetadata(null),
     };
 }

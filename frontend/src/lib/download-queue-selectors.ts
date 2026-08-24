@@ -1,5 +1,13 @@
 import type { backend } from "../../wailsjs/go/models";
-import type { MediaJobPayload, MediaJobResult } from "./download-jobs";
+import type { SpotifyMetadataResponse } from "@/types/api";
+import {
+    makeQueueId,
+    parseSpotifyCollectionURL,
+    type DownloadQueueContext,
+    type MediaJobPayload,
+    type MediaJobResult,
+} from "./download-jobs";
+import { extractArtistID } from "./spotify-url";
 import type {
     DownloadJob,
     DownloadJobStatus,
@@ -28,6 +36,41 @@ export interface TrackAttemptView {
     speedMbps?: number;
     warning?: string;
     error?: string;
+}
+
+export interface LoadedSpotifyMetadata {
+    data: SpotifyMetadataResponse;
+    sourceUrl: string;
+}
+
+export function selectCollectionQueue(
+    loaded: LoadedSpotifyMetadata | null,
+): DownloadQueueContext | undefined {
+    if (!loaded) return undefined;
+
+    const { data, sourceUrl } = loaded;
+    const parsed = parseSpotifyCollectionURL(sourceUrl);
+    if ("playlist_info" in data) {
+        if (parsed?.kind !== "playlist") return undefined;
+        const title = data.playlist_info.name || data.playlist_info.owner.name ||
+            data.playlist_info.owner.display_name || "Playlist";
+        return { id: makeQueueId("playlist", parsed.id), title, kind: "playlist" };
+    }
+    if ("album_info" in data) {
+        const sourceId = data.track_list.find(track => track.album_id)?.album_id ||
+            (parsed?.kind === "album" ? parsed.id : undefined);
+        return sourceId
+            ? { id: makeQueueId("album", sourceId), title: data.album_info.name, kind: "album" }
+            : undefined;
+    }
+    if ("artist_info" in data) {
+        const sourceId = extractArtistID(data.artist_info.external_urls) ||
+            (parsed?.kind === "artist" ? parsed.id : extractArtistID(sourceUrl));
+        return sourceId
+            ? { id: makeQueueId("artist", sourceId), title: data.artist_info.name, kind: "artist" }
+            : undefined;
+    }
+    return undefined;
 }
 
 function isTerminal(status: DownloadJobStatus): boolean {

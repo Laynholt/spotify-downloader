@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { backend } from "../../wailsjs/go/models";
+import type { SpotifyMetadataResponse } from "@/types/api";
 import type { MediaJobPayload, MediaJobResult } from "./download-jobs";
 import type {
     DownloadJob,
@@ -7,7 +8,12 @@ import type {
     DownloadQueueSnapshot,
     DownloadSchedulerSnapshot,
 } from "./download-queue-manager";
-import { selectLatestTrackAttempt, selectQueueStatus } from "./download-queue-selectors";
+import {
+    selectCollectionQueue,
+    selectLatestTrackAttempt,
+    selectQueueStatus,
+    type LoadedSpotifyMetadata,
+} from "./download-queue-selectors";
 
 const queueId = "playlist:p1";
 
@@ -63,7 +69,48 @@ function backendItem(values: Partial<backend.DownloadItem>): backend.DownloadIte
     return values as backend.DownloadItem;
 }
 
+function playlistMetadata(title: string): SpotifyMetadataResponse {
+    return {
+        playlist_info: {
+            name: "",
+            tracks: { total: 0 },
+            followers: { total: 0 },
+            owner: { display_name: "Owner", name: title, images: "" },
+        },
+        track_list: [],
+    };
+}
+
 describe("download queue selectors", () => {
+    it("keeps the rendered collection identity when the editable input changes to another type", () => {
+        const loadedA: LoadedSpotifyMetadata = {
+            data: playlistMetadata("Collection A"),
+            sourceUrl: "https://open.spotify.com/playlist/a",
+        };
+        const draftInput = "https://open.spotify.com/album/b";
+
+        expect(draftInput).not.toBe(loadedA.sourceUrl);
+        expect(selectCollectionQueue(loadedA)).toEqual({
+            id: "playlist:a",
+            title: "Collection A",
+            kind: "playlist",
+        });
+    });
+
+    it("replaces collection identity atomically when cached history B is loaded", () => {
+        const loadedA: LoadedSpotifyMetadata = {
+            data: playlistMetadata("Same Name"),
+            sourceUrl: "https://open.spotify.com/playlist/a",
+        };
+        const loadedB: LoadedSpotifyMetadata = {
+            data: playlistMetadata("Same Name"),
+            sourceUrl: "https://open.spotify.com/playlist/b",
+        };
+
+        expect(selectCollectionQueue(loadedA)?.id).toBe("playlist:a");
+        expect(selectCollectionQueue(loadedB)?.id).toBe("playlist:b");
+    });
+
     it("returns queued, all three active rows, and every terminal row state", () => {
         const jobs = [
             job("active-1", "spotify:active-1", "active"),
