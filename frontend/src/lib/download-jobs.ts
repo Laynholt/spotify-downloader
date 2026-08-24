@@ -128,22 +128,23 @@ export function buildYouTubeCandidate(
     sourceIndex: number,
 ): DownloadJobCandidate<YouTubeRedownloadPayload> {
     const metadata = request.metadata;
+    const track = {
+        spotify_id: metadata.track_id,
+        name: metadata.track_name || "Unknown track",
+        artists: metadata.artist_name || "",
+        album_name: metadata.album_name || "",
+    } as TrackMetadata;
     return {
         id: crypto.randomUUID(),
         queueId: queue.id,
         queueTitle: queue.title,
-        trackKey: `youtube:${sourceResultId}`,
+        trackKey: makeTrackKey(track, sourceIndex),
         sourceIndex,
         kind: "youtube-redownload",
         payload: {
             request,
             sourceResultId,
-            track: {
-                spotify_id: metadata.track_id,
-                name: metadata.track_name || "Unknown track",
-                artists: metadata.artist_name || "",
-                album_name: metadata.album_name || "",
-            } as TrackMetadata,
+            track,
             settings: {} as Settings,
             queue,
             isAlbum: queue.kind === "album",

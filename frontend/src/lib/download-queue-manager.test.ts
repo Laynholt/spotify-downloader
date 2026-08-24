@@ -10,7 +10,7 @@ interface JobPayload {
 }
 
 interface Result {
-    status: "completed" | "skipped" | "failed" | "suspicious";
+    status: "completed" | "skipped" | "failed" | "suspicious" | "cancelled";
     value?: string;
 }
 
@@ -180,14 +180,14 @@ describe("createDynamicDownloadScheduler", () => {
         await scheduler.dispose();
     });
 
-    it("cancels only the selected queue, aborts active work, and protects cancellation state", async () => {
+    it("keeps cancelled executors active until their authoritative results settle", async () => {
         const started: string[] = [];
         const signals = new Map<string, AbortSignal>();
         const gates = new Map<string, ReturnType<typeof deferred<Result>>>();
         const backendGate = deferred<number>();
         const cancelBackendQueue = vi.fn(async () => backendGate.promise);
         const scheduler = createDynamicDownloadScheduler<JobPayload, Result>({
-            concurrency: 2,
+            concurrency: 3,
             execute: async (job, signal) => {
                 started.push(job.id);
                 signals.set(job.id, signal);
@@ -200,32 +200,94 @@ describe("createDynamicDownloadScheduler", () => {
             now: monotonicTestClock(),
         });
         expect(scheduler.enqueue(candidate("a", "a1"), "unseen-only").added).toBe(true);
-        expect(scheduler.enqueue(candidate("b", "b1"), "unseen-only").added).toBe(true);
         expect(scheduler.enqueue(candidate("a", "a2"), "unseen-only").added).toBe(true);
+        expect(scheduler.enqueue(candidate("b", "b1"), "unseen-only").added).toBe(true);
+        expect(scheduler.enqueue(candidate("a", "a3"), "unseen-only").added).toBe(true);
         expect(scheduler.enqueue(candidate("b", "b2"), "unseen-only").added).toBe(true);
-        expect(started).toEqual(["a1", "b1"]);
+        expect(started).toEqual(["a1", "a2", "b1"]);
 
         const cancellation = scheduler.cancelQueue("a");
         await flushPromises();
-        expect(started).toEqual(["a1", "b1", "b2"]);
+        expect(started).toEqual(["a1", "a2", "b1"]);
         expect(signals.get("a1")!.aborted).toBe(true);
+        expect(signals.get("a2")!.aborted).toBe(true);
         expect(cancelBackendQueue).toHaveBeenCalledTimes(1);
         expect(cancelBackendQueue).toHaveBeenCalledWith("a");
-        expect(scheduler.getSnapshot().queues.a.jobs.map(job => job.status)).toEqual(["cancelled", "cancelled"]);
+        expect(scheduler.getSnapshot().activeCount).toBe(3);
+        expect(scheduler.getSnapshot().queues.a.jobs.map(job => job.status)).toEqual(["active", "active", "cancelled"]);
 
         gates.get("a1")!.resolve({ status: "completed" });
         await flushPromises();
-        expect(scheduler.getSnapshot().queues.a.jobs.map(job => job.status)).toEqual(["cancelled", "cancelled"]);
+        expect(started).toEqual(["a1", "a2", "b1", "b2"]);
+        expect(scheduler.getSnapshot().queues.a.jobs.map(job => job.status)).toEqual(["completed", "active", "cancelled"]);
+        expect(scheduler.getSnapshot().activeCount).toBe(3);
+
+        gates.get("a2")!.resolve({ status: "cancelled" });
+        await flushPromises();
+        expect(scheduler.getSnapshot().queues.a.jobs.map(job => job.status)).toEqual(["completed", "cancelled", "cancelled"]);
 
         backendGate.resolve(99);
-        expect(await cancellation).toBe(2);
+        expect(await cancellation).toBe(3);
         gates.get("b1")!.resolve({ status: "completed" });
-        await flushPromises();
-        expect(started).toEqual(["a1", "b1", "b2"]);
         gates.get("b2")!.resolve({ status: "completed" });
         await flushPromises();
         expect(await scheduler.cancelQueue("a")).toBe(0);
         expect(cancelBackendQueue).toHaveBeenCalledTimes(1);
+        await scheduler.dispose();
+    });
+
+    it("reopens a stopped queue when a terminal track is retried", async () => {
+        const gates: Array<ReturnType<typeof deferred<Result>>> = [];
+        const cancelBackendQueue = vi.fn(async () => 1);
+        const scheduler = createDynamicDownloadScheduler<JobPayload, Result>({
+            concurrency: 1,
+            execute: async () => {
+                const gate = deferred<Result>();
+                gates.push(gate);
+                return gate.promise;
+            },
+            classifyResult: (result) => result.status,
+            cancelBackendQueue,
+            now: monotonicTestClock(),
+        });
+
+        scheduler.enqueue(candidate("a", "first", { trackKey: "track" }), "unseen-only");
+        await scheduler.cancelQueue("a");
+        expect(scheduler.getSnapshot().queues.a.jobs[0]?.status).toBe("active");
+        gates[0].resolve({ status: "cancelled" });
+        await flushPromises();
+
+        const retry = scheduler.enqueue(candidate("a", "retry", { trackKey: "track" }), "retry-terminal");
+
+        expect(retry.added).toBe(true);
+        expect(scheduler.getSnapshot().queues.a.jobs.map(job => job.status)).toEqual(["cancelled", "active"]);
+        gates[1].resolve({ status: "completed" });
+        await flushPromises();
+        expect(scheduler.getSnapshot().queues.a.jobs.map(job => job.status)).toEqual(["cancelled", "completed"]);
+        await scheduler.dispose();
+    });
+
+    it("deduplicates in-flight attempts by track across executor kinds", async () => {
+        const gate = deferred<Result>();
+        const scheduler = createDynamicDownloadScheduler<JobPayload, Result>({
+            concurrency: 1,
+            execute: async () => gate.promise,
+            classifyResult: (result) => result.status,
+            cancelBackendQueue: vi.fn(async () => 0),
+            now: monotonicTestClock(),
+        });
+
+        scheduler.enqueue(candidate("a", "youtube", {
+            trackKey: "spotify:track",
+            kind: "youtube-redownload",
+        }), "retry-terminal");
+
+        expect(scheduler.enqueue(candidate("a", "spotify", {
+            trackKey: "spotify:track",
+            kind: "spotify-download",
+        }), "retry-terminal")).toEqual({ added: false, reason: "already-in-flight" });
+        gate.resolve({ status: "completed" });
+        await flushPromises();
         await scheduler.dispose();
     });
 

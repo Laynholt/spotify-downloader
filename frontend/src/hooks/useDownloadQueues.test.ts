@@ -361,6 +361,29 @@ describe("createDownloadQueueHarness", () => {
         await harness.dispose();
     });
 
+    it("makes a YouTube retry the latest attempt for its source playlist row", async () => {
+        const harness = createDownloadQueueHarness({
+            executeSpotify: async () => ({ success: false, message: "failed", error: "network" }),
+            api: backendApi({
+                redownloadTrackFromYouTube: async () => ({ success: true, status: "replaced" }),
+            }),
+            youtubeRequestFor: () => youtubeRequest("one"),
+        });
+
+        await harness.enqueueAll(playlistA, [track("one")], args);
+        await waitFor(() => harness.snapshot().queues[playlistA.id].jobs[0]?.status === "failed");
+        await harness.enqueueYouTubeRetries(playlistA, ["failed-1"], youtubeSummary());
+        await waitFor(() => harness.snapshot().queues[playlistA.id].jobs[1]?.status === "completed");
+
+        expect(harness.snapshot().queues[playlistA.id].jobs).toMatchObject([
+            { trackKey: "spotify:one", kind: "spotify-download", status: "failed" },
+            { trackKey: "spotify:one", kind: "youtube-redownload", status: "completed", force: true },
+        ]);
+        expect(harness.snapshot().queues[playlistA.id].jobs[1]?.id)
+            .not.toBe(harness.snapshot().queues[playlistA.id].jobs[0]?.id);
+        await harness.dispose();
+    });
+
     it("maps a cancelled YouTube result and Stop this queue through the shared scheduler", async () => {
         const gate = deferred<SuspiciousRedownloadResult>();
         const cancelDownloadQueue = vi.fn(async () => 1);
@@ -376,6 +399,7 @@ describe("createDownloadQueueHarness", () => {
         const stopped = harness.stopQueue(playlistB.id);
         gate.resolve({ success: false, status: "cancelled", stage: "media_download", diagnostics: "cancelled" });
         await stopped;
+        await waitFor(() => harness.snapshot().queues[playlistB.id].jobs[0]?.status === "cancelled");
 
         expect(cancelDownloadQueue).toHaveBeenCalledWith(playlistB.id);
         expect(harness.snapshot().queues[playlistB.id].jobs[0].status).toBe("cancelled");
@@ -561,7 +585,7 @@ describe("createDownloadQueueHarness", () => {
         expect(cancelDownloadItem).toHaveBeenCalledTimes(1);
         expect(backendStatus).toBe("cancelled");
         releaseMark.resolve(undefined);
-        await flushPromises();
+        await waitFor(() => harness.snapshot().queues[playlistA.id].jobs[0]?.status === "cancelled");
         expect(markDownloadItemFailed).toHaveBeenCalledTimes(1);
         expect(cancelDownloadItem).toHaveBeenCalledTimes(1);
         expect(backendStatus).toBe("cancelled");
@@ -832,10 +856,11 @@ describe("createDownloadQueueHarness", () => {
         expect(cancelDownloadQueue).toHaveBeenCalledWith(playlistA.id);
         expect(signals.get(playlistA.id)?.aborted).toBe(true);
         expect(signals.get(playlistB.id)?.aborted).toBe(false);
-        expect(harness.snapshot().queues[playlistA.id].jobs[0].status).toBe("cancelled");
+        expect(harness.snapshot().queues[playlistA.id].jobs[0].status).toBe("active");
         expect(harness.snapshot().queues[playlistB.id].jobs[0].status).toBe("active");
         gate.resolve({ success: true, message: "Downloaded" });
         await flushPromises();
+        expect(harness.snapshot().queues[playlistA.id].jobs[0].status).toBe("completed");
         await harness.dispose();
     });
 

@@ -188,7 +188,7 @@ export function createDynamicDownloadScheduler<TPayload, TResult>(
     };
 
     const matchingKey = (candidate: DownloadJobCandidate<TPayload>): string =>
-        `${candidate.queueId}\u0000${candidate.trackKey}\u0000${candidate.kind}`;
+        `${candidate.queueId}\u0000${candidate.trackKey}`;
 
     const createJobId = (candidate: DownloadJobCandidate<TPayload>): string => {
         if (!usedJobIds.has(candidate.id)) {
@@ -277,7 +277,7 @@ export function createDynamicDownloadScheduler<TPayload, TResult>(
                     }
                     job.settled = true;
                     activeCount--;
-                    job.status = "failed";
+                    job.status = job.controller?.signal.aborted ? "cancelled" : "failed";
                     job.error = errorMessage(reason);
                     job.finishedAt = now();
                     job.controller = undefined;
@@ -294,7 +294,7 @@ export function createDynamicDownloadScheduler<TPayload, TResult>(
         }
         const queue = queueFor(candidate);
         const matchingJobs = queue.jobs.filter(job =>
-            job.trackKey === candidate.trackKey && job.kind === candidate.kind,
+            job.trackKey === candidate.trackKey,
         );
         if (policy === "unseen-only" && matchingJobs.length > 0) {
             return { added: false, reason: "already-represented" };
@@ -304,18 +304,20 @@ export function createDynamicDownloadScheduler<TPayload, TResult>(
             return { added: false, reason: "already-in-flight" };
         }
 
+        queue.cancelled = false;
+        queue.cancelPromise = undefined;
+
         const jobId = createJobId(candidate);
         const timestamp = now();
         const unavailable = candidate.unavailableReason !== undefined;
         const job: MutableDownloadJob<TPayload, TResult> = {
             ...candidate,
             id: jobId,
-            status: unavailable || queue.cancelled ? (unavailable ? "unavailable" : "cancelled") : "queued",
+            status: unavailable ? "unavailable" : "queued",
             force: policy === "retry-terminal" && matchingJobs.length > 0,
             enqueuedAt: timestamp,
             ...(unavailable ? { error: candidate.unavailableReason, finishedAt: timestamp } : {}),
-            ...(queue.cancelled && !unavailable ? { finishedAt: timestamp } : {}),
-            settled: unavailable || queue.cancelled,
+            settled: unavailable,
         };
         queue.jobs.push(job);
         publish();
@@ -354,11 +356,6 @@ export function createDynamicDownloadScheduler<TPayload, TResult>(
                 }
                 else if (job.status === "active") {
                     job.controller?.abort();
-                    job.status = "cancelled";
-                    job.finishedAt = now();
-                    job.settled = true;
-                    job.controller = undefined;
-                    activeCount--;
                     targeted++;
                 }
             }

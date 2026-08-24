@@ -157,7 +157,7 @@ function classifySpotifyResult(response: DownloadResponse) {
         if (response.already_exists) return "skipped" as const;
         return "completed" as const;
     }
-    return isCancellation(response.error || response.message) ? "cancelled" as const : "failed" as const;
+    return isCancellation(response.error) || isCancellation(response.message) ? "cancelled" as const : "failed" as const;
 }
 
 function classifyMediaResult(result: MediaJobResult) {

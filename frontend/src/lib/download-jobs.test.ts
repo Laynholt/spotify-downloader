@@ -70,7 +70,7 @@ describe("download job builders", () => {
         });
     });
 
-    it("builds a YouTube retry candidate from the stable summary result ID", () => {
+    it("builds a unique YouTube retry attempt with the source track identity", () => {
         const queue = { id: "playlist:p1", title: "Mix", kind: "playlist" as const };
         const request = {
             original_file_path: "bad.mp3",
@@ -84,13 +84,16 @@ describe("download job builders", () => {
         } as SuspiciousRedownloadRequest;
 
         const candidate = buildYouTubeCandidate(queue, "attempt-1:terminal", request, 2);
+        const second = buildYouTubeCandidate(queue, "attempt-1:terminal", request, 2);
 
         expect(candidate).toMatchObject({
             queueId: queue.id,
-            trackKey: "youtube:attempt-1:terminal",
+            trackKey: "spotify:track-1",
             sourceIndex: 2,
             kind: "youtube-redownload",
             payload: { request, sourceResultId: "attempt-1:terminal" },
         });
+        expect(second.trackKey).toBe(candidate.trackKey);
+        expect(second.id).not.toBe(candidate.id);
     });
 });
