@@ -30,6 +30,8 @@ type App struct {
 	runtimeInitErr             error
 	metadataCache              *backend.MetadataCache
 	activeMu                   sync.Mutex
+	activeWG                   sync.WaitGroup
+	shuttingDown               bool
 	activeDownloads            map[string]activeDownload
 	runTrackPipeline           func(context.Context, backend.TrackPipelineRequest) (backend.TrackPipelineResult, error)
 	moveSuspiciousDownload     func(string, string) (string, error)
@@ -80,7 +82,11 @@ func (a *App) startup(ctx context.Context) {
 }
 
 func (a *App) shutdown(ctx context.Context) {
+	a.activeMu.Lock()
+	a.shuttingDown = true
+	a.activeMu.Unlock()
 	a.CancelActiveDownloads()
+	a.activeWG.Wait()
 	if a.metadataCache != nil {
 		if err := a.metadataCache.Close(); err != nil {
 			fmt.Printf("Metadata cache close warning: %v\n", err)

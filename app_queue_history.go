@@ -29,6 +29,12 @@ func (a *App) beginTrack(itemID, queueID string) (context.Context, func()) {
 	trackCtx, cancel := context.WithCancel(parent)
 
 	a.activeMu.Lock()
+	if a.shuttingDown {
+		a.activeMu.Unlock()
+		cancel()
+		return trackCtx, cancel
+	}
+	a.activeWG.Add(1)
 	if a.activeDownloads == nil {
 		a.activeDownloads = make(map[string]activeDownload)
 	}
@@ -52,6 +58,7 @@ func (a *App) beginTrack(itemID, queueID string) (context.Context, func()) {
 				delete(a.activeDownloads, itemID)
 			}
 			a.activeMu.Unlock()
+			a.activeWG.Done()
 		})
 	}
 	return trackCtx, cleanup

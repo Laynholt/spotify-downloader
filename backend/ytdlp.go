@@ -31,6 +31,11 @@ var (
 	ytDlpEnsureDenoInstalledOrUpdatedContext = EnsureDenoInstalledOrUpdatedContext
 	ytDlpGetFFmpegPath                       = GetFFmpegPath
 	ytDlpDebugLogf                           = log.Printf
+	ytDlpInstallGate                         = func() chan struct{} {
+		gate := make(chan struct{}, 1)
+		gate <- struct{}{}
+		return gate
+	}()
 )
 
 type GitHubReleaseAsset struct {
@@ -214,6 +219,13 @@ func EnsureYtDlpInstalledOrUpdatedContext(ctx context.Context) (YtDlpStatus, err
 	if err := ctx.Err(); err != nil {
 		return YtDlpStatus{Error: err.Error()}, err
 	}
+	select {
+	case <-ctx.Done():
+		return YtDlpStatus{Error: ctx.Err().Error()}, ctx.Err()
+	case <-ytDlpInstallGate:
+	}
+	defer func() { ytDlpInstallGate <- struct{}{} }()
+
 	current, checkErr := CheckYtDlpInstalledContext(ctx)
 	if checkErr != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -351,8 +363,13 @@ func DownloadWithYtDlpContext(ctx context.Context, req YtDlpDownloadRequest) YtD
 	}
 
 	audioFormat := normalizeYtDlpAudioFormat(req.AudioFormat)
+	paths, err := CurrentRuntimePaths()
+	if err != nil {
+		return ytDlpFailure(ctx, stage, err, nil)
+	}
 	stage = YtDlpStageSearch
 	cmd := newManagedCommand(ctx, ytDlpPath, BuildYtDlpArgs(req, denoPath, ffmpegPath)...)
+	cmd.Env = denoPortableEnvironment(cmd.Environ(), paths)
 	output, err := cmd.CombinedOutput()
 	if len(output) > 0 {
 		ytDlpDebugLogf("%s", output)
@@ -548,16 +565,12 @@ func downloadYtDlpAssetContext(ctx context.Context, asset GitHubReleaseAsset, re
 		return "", fmt.Errorf("failed to download yt-dlp: HTTP %d %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	tmpPath := path + ".tmp"
-	defer func() {
-		if err != nil || ctx.Err() != nil {
-			_ = os.Remove(tmpPath)
-		}
-	}()
-	out, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+	out, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
 	if err != nil {
 		return "", err
 	}
+	tmpPath := out.Name()
+	defer os.Remove(tmpPath)
 	copyErr := error(nil)
 	hasher := sha256.New()
 	if _, err := io.Copy(io.MultiWriter(out, hasher), resp.Body); err != nil {

@@ -552,6 +552,93 @@ func TestCancelActiveDownloadsIsIdempotentAfterTrackCleanup(t *testing.T) {
 	}
 }
 
+func TestShutdownWaitsForTrackCleanupBeforeReturning(t *testing.T) {
+	app := &App{ctx: context.Background(), runtimeInitErr: errors.New("skip runtime cleanup")}
+	trackCtx, cleanup := app.beginTrack("shutdown-item", "playlist:a")
+	cancelled := make(chan struct{})
+	releaseCleanup := make(chan struct{})
+	cleanupReleased := false
+	defer func() {
+		if !cleanupReleased {
+			close(releaseCleanup)
+		}
+	}()
+	go func() {
+		<-trackCtx.Done()
+		close(cancelled)
+		<-releaseCleanup
+		cleanup()
+	}()
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		app.shutdown(context.Background())
+		close(shutdownDone)
+	}()
+
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not cancel the registered track")
+	}
+	select {
+	case <-shutdownDone:
+		t.Fatal("shutdown returned before the registered track cleaned up")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseCleanup)
+	cleanupReleased = true
+	select {
+	case <-shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not return after track cleanup")
+	}
+}
+
+func TestBeginTrackRejectsRegistrationAfterShutdownStarts(t *testing.T) {
+	app := &App{ctx: context.Background(), runtimeInitErr: errors.New("skip runtime cleanup")}
+	trackCtx, cleanup := app.beginTrack("shutdown-item", "playlist:a")
+	cancelled := make(chan struct{})
+	releaseCleanup := make(chan struct{})
+	cleanupReleased := false
+	defer func() {
+		if !cleanupReleased {
+			close(releaseCleanup)
+		}
+	}()
+	go func() {
+		<-trackCtx.Done()
+		close(cancelled)
+		<-releaseCleanup
+		cleanup()
+	}()
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		app.shutdown(context.Background())
+		close(shutdownDone)
+	}()
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not start cancellation")
+	}
+
+	lateCtx, lateCleanup := app.beginTrack("late-item", "playlist:a")
+	defer lateCleanup()
+	if !errors.Is(lateCtx.Err(), context.Canceled) {
+		t.Fatalf("late track context error = %v, want context.Canceled", lateCtx.Err())
+	}
+
+	close(releaseCleanup)
+	cleanupReleased = true
+	select {
+	case <-shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not return after track cleanup")
+	}
+}
+
 func TestNormalizeDownloadRequestSetsDefaults(t *testing.T) {
 	t.Parallel()
 
