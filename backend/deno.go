@@ -2,6 +2,7 @@ package backend
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -15,13 +16,19 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
 	denoLatestReleaseURL    = "https://api.github.com/repos/denoland/deno/releases/latest"
 	denoUpdateCheckFilename = "deno.update-check"
+	denoInstallLockFilename = "deno.install.lock"
 	denoUpdateCheckTTL      = 24 * time.Hour
+	denoMaxReleaseJSONSize  = int64(4 << 20)
+	denoMaxChecksumSize     = int64(1 << 20)
+	denoMaxArchiveSize      = int64(256 << 20)
+	denoMaxExecutableSize   = int64(512 << 20)
 )
 
 var denoAssets = map[string]string{
@@ -34,8 +41,9 @@ var denoAssets = map[string]string{
 }
 
 var (
-	denoHTTPClientFactory = newHTTPClient
-	denoManagedCommand    = newManagedCommand
+	denoHTTPClientFactory  = newHTTPClient
+	denoManagedCommand     = newManagedCommand
+	denoProcessInstallLock = make(chan struct{}, 1)
 )
 
 type denoRelease struct {
@@ -108,15 +116,71 @@ func EnsureDenoInstalledOrUpdated() (DenoStatus, error) {
 	return EnsureDenoInstalledOrUpdatedContext(context.Background())
 }
 
-func EnsureDenoInstalledOrUpdatedContext(ctx context.Context) (DenoStatus, error) {
+func EnsureDenoInstalledOrUpdatedContext(ctx context.Context) (status DenoStatus, err error) {
+	release, err := acquireDenoTransactionLockContext(ctx)
+	if err != nil {
+		return DenoStatus{Error: err.Error()}, err
+	}
+	defer func() {
+		if releaseErr := release(); releaseErr != nil {
+			if err != nil {
+				err = errors.Join(err, fmt.Errorf("release Deno install lock: %w", releaseErr))
+				status.Error = err.Error()
+			} else {
+				status.Warning = appendDenoWarning(status.Warning, fmt.Sprintf("failed to release Deno install lock: %v", releaseErr))
+			}
+		}
+	}()
+	return ensureDenoInstalledOrUpdatedLockedContext(ctx)
+}
+
+func acquireDenoTransactionLockContext(ctx context.Context) (func() error, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case denoProcessInstallLock <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	paths, err := CurrentRuntimePaths()
+	if err != nil {
+		<-denoProcessInstallLock
+		return nil, err
+	}
+	fileRelease, err := acquireDenoFileLockContext(ctx, filepath.Join(paths.BinDir, denoInstallLockFilename))
+	if err != nil {
+		<-denoProcessInstallLock
+		return nil, err
+	}
+	var once sync.Once
+	var releaseErr error
+	return func() error {
+		once.Do(func() {
+			releaseErr = fileRelease()
+			<-denoProcessInstallLock
+		})
+		return releaseErr
+	}, nil
+}
+
+func ensureDenoInstalledOrUpdatedLockedContext(ctx context.Context) (DenoStatus, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
 		return DenoStatus{Error: err.Error()}, err
 	}
+	recoveryWarning, err := recoverDenoBackupContext(ctx)
+	if err != nil {
+		return DenoStatus{Error: err.Error()}, err
+	}
 
 	current, err := checkDenoInstalledContext(ctx)
+	current.Warning = appendDenoWarning(current.Warning, recoveryWarning)
 	if err != nil {
 		current.Error = err.Error()
 		return current, err
@@ -139,7 +203,7 @@ func EnsureDenoInstalledOrUpdatedContext(ctx context.Context) (DenoStatus, error
 	current.Latest = latest
 	if current.Installed && current.Version == latest {
 		if err := recordDenoReleaseCheck(markerPath, checkedAt); err != nil {
-			current.Warning = fmt.Sprintf("failed to record Deno update check: %v", err)
+			current.Warning = appendDenoWarning(current.Warning, fmt.Sprintf("failed to record Deno update check: %v", err))
 		}
 		return current, nil
 	}
@@ -148,7 +212,7 @@ func EnsureDenoInstalledOrUpdatedContext(ctx context.Context) (DenoStatus, error
 	if !ok {
 		return denoUpdateFailure(current, "failed to select Deno release asset", fmt.Errorf("Deno release has no archive/checksum pair for %s/%s", runtime.GOOS, runtime.GOARCH))
 	}
-	path, version, err := installDenoReleaseContext(ctx, archive, checksum)
+	path, version, installWarning, err := installDenoReleaseContext(ctx, archive, checksum)
 	if err != nil {
 		return denoUpdateFailure(current, "failed to install Deno", err)
 	}
@@ -159,20 +223,82 @@ func EnsureDenoInstalledOrUpdatedContext(ctx context.Context) (DenoStatus, error
 		Version:   version,
 		Latest:    latest,
 		Updated:   true,
+		Warning:   appendDenoWarning(recoveryWarning, installWarning),
 	}
 	if err := recordDenoReleaseCheck(markerPath, checkedAt); err != nil {
-		status.Warning = fmt.Sprintf("failed to record Deno update check: %v", err)
+		status.Warning = appendDenoWarning(status.Warning, fmt.Sprintf("failed to record Deno update check: %v", err))
 	}
 	return status, nil
 }
 
+func appendDenoWarning(current, warning string) string {
+	if current == "" {
+		return warning
+	}
+	if warning == "" {
+		return current
+	}
+	return current + "; " + warning
+}
+
 func denoUpdateFailure(current DenoStatus, action string, err error) (DenoStatus, error) {
 	if current.Installed && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		current.Warning = fmt.Sprintf("%s: %v", action, err)
+		current.Warning = appendDenoWarning(current.Warning, fmt.Sprintf("%s: %v", action, err))
 		return current, nil
 	}
 	current.Error = err.Error()
 	return current, err
+}
+
+func recoverDenoBackupContext(ctx context.Context) (string, error) {
+	finalPath, err := GetDenoPath()
+	if err != nil {
+		return "", err
+	}
+	backupPath := finalPath + ".bak"
+	if _, err := os.Lstat(backupPath); err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+
+	_, finalErr := validateDenoExecutableContext(ctx, finalPath)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", ctxErr
+	}
+	if finalErr == nil {
+		if err := os.Remove(backupPath); err != nil {
+			return fmt.Sprintf("failed to clean Deno backup: %v", err), nil
+		}
+		return "", nil
+	}
+
+	_, backupErr := validateDenoExecutableContext(ctx, backupPath)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", ctxErr
+	}
+	if backupErr != nil {
+		if err := os.Remove(backupPath); err != nil {
+			return "", fmt.Errorf("remove invalid Deno backup: %w", err)
+		}
+		return "removed invalid Deno backup", nil
+	}
+
+	if err := os.Remove(finalPath); err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("remove invalid Deno executable before recovery: %w", err)
+	}
+	if err := os.Rename(backupPath, finalPath); err != nil {
+		return "", fmt.Errorf("restore Deno backup: %w", err)
+	}
+	if _, err := validateDenoExecutableContext(ctx, finalPath); err != nil {
+		rollbackErr := os.Rename(finalPath, backupPath)
+		if rollbackErr != nil {
+			return "", errors.Join(err, fmt.Errorf("return invalid restored Deno to backup: %w", rollbackErr))
+		}
+		return "", err
+	}
+	return "restored Deno backup after incomplete update", nil
 }
 
 func checkDenoInstalledContext(ctx context.Context) (DenoStatus, error) {
@@ -296,8 +422,12 @@ func fetchLatestDenoReleaseContext(ctx context.Context) (denoRelease, error) {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return denoRelease{}, fmt.Errorf("GitHub returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
+	data, err := readDenoResponseBodyBounded(resp.Body, resp.ContentLength, denoMaxReleaseJSONSize, "Deno release response")
+	if err != nil {
+		return denoRelease{}, err
+	}
 	var release denoRelease
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 2*1024*1024)).Decode(&release); err != nil {
+	if err := json.Unmarshal(data, &release); err != nil {
 		return denoRelease{}, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -336,44 +466,44 @@ func validateDenoReleaseDownloadURL(rawURL string) error {
 	}
 }
 
-func installDenoReleaseContext(ctx context.Context, archive, checksum GitHubReleaseAsset) (path, version string, err error) {
-	checksumPath, err := downloadDenoAssetContext(ctx, checksum, "deno-checksum-*")
+func installDenoReleaseContext(ctx context.Context, archive, checksum GitHubReleaseAsset) (path, version, warning string, err error) {
+	checksumPath, err := downloadDenoAssetContext(ctx, checksum, "deno-checksum-*", denoMaxChecksumSize)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	defer os.Remove(checksumPath)
 
-	archivePath, err := downloadDenoAssetContext(ctx, archive, "deno-archive-*.zip")
+	archivePath, err := downloadDenoAssetContext(ctx, archive, "deno-archive-*.zip", denoMaxArchiveSize)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	defer os.Remove(archivePath)
 
 	expectedHash, err := readDenoChecksum(checksumPath, archive.Name)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	if err := verifyDenoArchiveChecksumContext(ctx, archivePath, archive.Name, expectedHash); err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	stagedPath, err := extractDenoArchiveToStageContext(ctx, archivePath)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	defer os.Remove(stagedPath)
 
 	path, err = GetDenoPath()
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
-	version, err = replaceDenoExecutableContext(ctx, stagedPath, path)
+	version, warning, err = replaceDenoExecutableContext(ctx, stagedPath, path)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
-	return path, version, nil
+	return path, version, warning, nil
 }
 
-func downloadDenoAssetContext(ctx context.Context, asset GitHubReleaseAsset, pattern string) (path string, err error) {
+func downloadDenoAssetContext(ctx context.Context, asset GitHubReleaseAsset, pattern string, maxSize int64) (path string, err error) {
 	if err := validateDenoReleaseDownloadURL(asset.BrowserDownloadURL); err != nil {
 		return "", err
 	}
@@ -414,7 +544,7 @@ func downloadDenoAssetContext(ctx context.Context, asset GitHubReleaseAsset, pat
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return "", fmt.Errorf("failed to download %s: HTTP %d %s", asset.Name, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	if _, err = io.Copy(temp, resp.Body); err != nil {
+	if _, err = copyDenoDownloadBounded(temp, resp.Body, resp.ContentLength, maxSize, asset.Name); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return "", ctxErr
 		}
@@ -430,13 +560,42 @@ func downloadDenoAssetContext(ctx context.Context, asset GitHubReleaseAsset, pat
 	return path, nil
 }
 
+func readDenoResponseBodyBounded(source io.Reader, contentLength, maxSize int64, label string) ([]byte, error) {
+	var destination bytes.Buffer
+	if _, err := copyDenoDownloadBounded(&destination, source, contentLength, maxSize, label); err != nil {
+		return nil, err
+	}
+	return destination.Bytes(), nil
+}
+
+func copyDenoDownloadBounded(destination io.Writer, source io.Reader, contentLength, maxSize int64, label string) (int64, error) {
+	if maxSize < 0 {
+		return 0, fmt.Errorf("invalid maximum size for %s", label)
+	}
+	if contentLength > maxSize {
+		return 0, fmt.Errorf("%s exceeds maximum size of %d bytes", label, maxSize)
+	}
+	written, err := io.Copy(destination, io.LimitReader(source, maxSize+1))
+	if err != nil {
+		return written, err
+	}
+	if written > maxSize {
+		return written, fmt.Errorf("%s exceeds maximum size of %d bytes", label, maxSize)
+	}
+	return written, nil
+}
+
 func readDenoChecksum(path, archiveName string) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, 2*1024*1024))
+	info, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	data, err := readDenoResponseBodyBounded(file, info.Size(), denoMaxChecksumSize, "Deno checksum")
 	if err != nil {
 		return "", err
 	}
@@ -444,19 +603,33 @@ func readDenoChecksum(path, archiveName string) (string, error) {
 }
 
 func parseDenoChecksum(data []byte, archiveName string) (string, error) {
+	matchingRecords := 0
+	matchedHash := ""
+	invalidHash := false
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) != 2 || strings.TrimPrefix(fields[1], "*") != archiveName {
 			continue
 		}
+		matchingRecords++
 		hash := strings.ToLower(fields[0])
 		decoded, err := hex.DecodeString(hash)
 		if err != nil || len(decoded) != sha256.Size {
-			return "", fmt.Errorf("invalid Deno checksum for %s", archiveName)
+			invalidHash = true
+			continue
 		}
-		return hash, nil
+		matchedHash = hash
 	}
-	return "", fmt.Errorf("Deno checksum missing for %s", archiveName)
+	if matchingRecords == 0 {
+		return "", fmt.Errorf("Deno checksum missing for %s", archiveName)
+	}
+	if matchingRecords != 1 {
+		return "", fmt.Errorf("Deno checksum has multiple records for %s", archiveName)
+	}
+	if invalidHash {
+		return "", fmt.Errorf("invalid Deno checksum for %s", archiveName)
+	}
+	return matchedHash, nil
 }
 
 func verifyDenoArchiveChecksumContext(ctx context.Context, path, archiveName, expectedHash string) error {
@@ -490,6 +663,13 @@ func verifyDenoArchiveChecksumContext(ctx context.Context, path, archiveName, ex
 }
 
 func extractDenoArchiveToStageContext(ctx context.Context, archivePath string) (path string, err error) {
+	return extractDenoArchiveToStageContextWithLimit(ctx, archivePath, denoMaxExecutableSize)
+}
+
+func extractDenoArchiveToStageContextWithLimit(ctx context.Context, archivePath string, maxExecutableSize int64) (path string, err error) {
+	if maxExecutableSize < 0 {
+		return "", fmt.Errorf("invalid maximum Deno executable size")
+	}
 	reader, err := zip.OpenReader(archivePath)
 	if err != nil {
 		return "", fmt.Errorf("open Deno ZIP: %w", err)
@@ -510,6 +690,9 @@ func extractDenoArchiveToStageContext(ctx context.Context, archivePath string) (
 	}
 	if entry.UncompressedSize64 == 0 {
 		return "", fmt.Errorf("Deno ZIP executable is empty")
+	}
+	if entry.UncompressedSize64 > uint64(maxExecutableSize) {
+		return "", fmt.Errorf("Deno ZIP executable exceeds maximum size of %d bytes", maxExecutableSize)
 	}
 
 	paths, err := CurrentRuntimePaths()
@@ -537,6 +720,7 @@ func extractDenoArchiveToStageContext(ctx context.Context, archivePath string) (
 	}
 	defer source.Close()
 	buffer := make([]byte, 32*1024)
+	written := int64(0)
 	for {
 		if err = ctx.Err(); err != nil {
 			return "", err
@@ -544,9 +728,17 @@ func extractDenoArchiveToStageContext(ctx context.Context, archivePath string) (
 		var n int
 		n, err = source.Read(buffer)
 		if n > 0 {
-			if _, writeErr := staged.Write(buffer[:n]); writeErr != nil {
+			if int64(n) > maxExecutableSize-written {
+				return "", fmt.Errorf("Deno ZIP executable exceeds maximum size of %d bytes", maxExecutableSize)
+			}
+			writeCount, writeErr := staged.Write(buffer[:n])
+			if writeErr != nil {
 				return "", writeErr
 			}
+			if writeCount != n {
+				return "", io.ErrShortWrite
+			}
+			written += int64(writeCount)
 		}
 		if err == io.EOF {
 			err = nil
@@ -568,59 +760,62 @@ func extractDenoArchiveToStageContext(ctx context.Context, archivePath string) (
 	if err != nil {
 		return "", err
 	}
-	if !info.Mode().IsRegular() || info.Size() == 0 {
+	if !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > maxExecutableSize {
 		return "", fmt.Errorf("staged Deno executable is invalid")
 	}
 	completed = true
 	return path, nil
 }
 
-func replaceDenoExecutableContext(ctx context.Context, stagedPath, finalPath string) (string, error) {
+func replaceDenoExecutableContext(ctx context.Context, stagedPath, finalPath string) (version, warning string, err error) {
 	if _, err := validateDenoExecutableContext(ctx, stagedPath); err != nil {
-		return "", fmt.Errorf("validate staged Deno: %w", err)
+		return "", "", fmt.Errorf("validate staged Deno: %w", err)
 	}
 	backupPath := finalPath + ".bak"
 	hadCurrent := false
 	if info, err := os.Lstat(finalPath); err == nil {
 		if !info.Mode().IsRegular() {
-			return "", fmt.Errorf("installed Deno is not a regular file")
+			return "", "", fmt.Errorf("installed Deno is not a regular file")
 		}
 		if _, backupErr := os.Lstat(backupPath); backupErr == nil {
-			return "", fmt.Errorf("Deno backup already exists: %s", backupPath)
+			if err := os.Remove(backupPath); err != nil {
+				return "", "", fmt.Errorf("remove stale Deno backup: %w", err)
+			}
 		} else if !os.IsNotExist(backupErr) {
-			return "", backupErr
+			return "", "", backupErr
 		}
 		if err := os.Rename(finalPath, backupPath); err != nil {
-			return "", err
+			return "", "", err
 		}
 		hadCurrent = true
 	} else if !os.IsNotExist(err) {
-		return "", err
+		return "", "", err
 	}
 
 	if err := os.Rename(stagedPath, finalPath); err != nil {
 		if hadCurrent {
 			if rollbackErr := os.Rename(backupPath, finalPath); rollbackErr != nil {
-				return "", errors.Join(err, fmt.Errorf("restore Deno backup: %w", rollbackErr))
+				return "", "", errors.Join(err, fmt.Errorf("restore Deno backup: %w", rollbackErr))
 			}
 		}
-		return "", err
+		return "", "", err
 	}
-	version, validationErr := validateDenoExecutableContext(ctx, finalPath)
+	var validationErr error
+	version, validationErr = validateDenoExecutableContext(ctx, finalPath)
 	if validationErr != nil {
 		rollbackErr := os.Remove(finalPath)
 		if hadCurrent {
 			rollbackErr = errors.Join(rollbackErr, os.Rename(backupPath, finalPath))
 		}
 		if rollbackErr != nil {
-			return "", errors.Join(validationErr, fmt.Errorf("rollback Deno update: %w", rollbackErr))
+			return "", "", errors.Join(validationErr, fmt.Errorf("rollback Deno update: %w", rollbackErr))
 		}
-		return "", validationErr
+		return "", "", validationErr
 	}
 	if hadCurrent {
 		if err := os.Remove(backupPath); err != nil {
-			return "", err
+			return version, fmt.Sprintf("failed to clean Deno backup: %v", err), nil
 		}
 	}
-	return version, nil
+	return version, "", nil
 }
