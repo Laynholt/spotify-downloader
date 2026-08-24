@@ -16,6 +16,7 @@ type RuntimePaths struct {
 	RootDir           string
 	BinDir            string
 	CacheDir          string
+	DenoCacheDir      string
 	TempDir           string
 	RunTempDir        string
 	MetadataCacheFile string
@@ -46,6 +47,7 @@ func ResolveRuntimePaths(executablePath, runID string) (RuntimePaths, error) {
 		RootDir:           root,
 		BinDir:            filepath.Join(root, "bin"),
 		CacheDir:          filepath.Join(root, "cache"),
+		DenoCacheDir:      filepath.Join(root, "cache", "deno"),
 		TempDir:           filepath.Join(root, "temp"),
 		RunTempDir:        filepath.Join(root, "temp", runID),
 		MetadataCacheFile: filepath.Join(root, "cache", "metadata-cache.json"),
@@ -54,7 +56,7 @@ func ResolveRuntimePaths(executablePath, runID string) (RuntimePaths, error) {
 
 // Prepare creates and verifies the portable runtime directories.
 func (p *RuntimePaths) Prepare() error {
-	for _, dir := range []string{p.RootDir, p.BinDir, p.CacheDir, p.RunTempDir} {
+	for _, dir := range []string{p.RootDir, p.BinDir, p.CacheDir, p.DenoCacheDir, p.RunTempDir} {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return p.portableWriteError(err)
 		}

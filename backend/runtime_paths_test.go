@@ -50,8 +50,27 @@ func TestResolveRuntimePathsUsesExecutableDirectory(t *testing.T) {
 	if paths.MetadataCacheFile != filepath.Join(wantRoot, "cache", "metadata-cache.json") {
 		t.Fatal(paths.MetadataCacheFile)
 	}
+	if paths.DenoCacheDir != filepath.Join(wantRoot, "cache", "deno") {
+		t.Fatal(paths.DenoCacheDir)
+	}
 	if paths.RunTempDir != filepath.Join(wantRoot, "temp", "run-42") {
 		t.Fatal(paths.RunTempDir)
+	}
+}
+
+// Production break caught: startup leaves DENO_DIR pointing at a cache path
+// that was never created inside the portable runtime.
+func TestPrepareRuntimePathsCreatesDenoCacheDirectory(t *testing.T) {
+	paths, err := ResolveRuntimePaths(filepath.Join(t.TempDir(), "SpotiDownloader.exe"), "run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := paths.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(paths.DenoCacheDir)
+	if err != nil || !info.IsDir() {
+		t.Fatalf("DenoCacheDir was not prepared: info=%v err=%v", info, err)
 	}
 }
 
