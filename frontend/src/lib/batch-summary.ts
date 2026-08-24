@@ -15,6 +15,7 @@ export interface BatchTrackResult {
     name: string;
     artists: string;
     status: BatchTrackStatus;
+    youtubeRetryable?: boolean;
     file?: string;
     error?: string;
     reason?: string;
@@ -44,6 +45,13 @@ export interface BatchDownloadSummary {
     elapsedMs: number;
     peakActive: number;
     results: BatchTrackResult[];
+}
+
+export interface YoutubeSummaryState {
+    summary: BatchDownloadSummary | null;
+    queueId: string | null;
+    selectedYoutubeResultIds: Set<string>;
+    isOpen: boolean;
 }
 
 export function createEmptyBatchSummary(title: string): BatchDownloadSummary {
@@ -116,10 +124,64 @@ export function hasProblemDetails(summary: BatchDownloadSummary): boolean {
         summary.youtubeStillSuspicious > 0;
 }
 
+function changeBatchStatusCount(summary: BatchDownloadSummary, status: BatchTrackStatus, change: number): void {
+    switch (status) {
+        case "downloaded":
+            summary.downloaded += change;
+            break;
+        case "skipped":
+            summary.skipped += change;
+            break;
+        case "metadata_updated":
+            summary.metadataUpdated += change;
+            break;
+        case "failed":
+            summary.failed += change;
+            break;
+        case "cancelled":
+            summary.cancelled += change;
+            break;
+        case "duplicate_skipped":
+            summary.duplicateSkipped += change;
+            break;
+        case "suspicious":
+            summary.suspicious += change;
+            break;
+        case "youtube_replaced":
+            summary.youtubeReplaced += change;
+            break;
+        case "youtube_failed":
+            summary.youtubeFailed += change;
+            break;
+        case "youtube_still_suspicious":
+            summary.youtubeStillSuspicious += change;
+            break;
+    }
+}
+
+export function replaceBatchResult(summary: BatchDownloadSummary, resultId: string, replacement: BatchTrackResult): BatchDownloadSummary {
+    const index = summary.results.findIndex((result) => result.id === resultId && result.youtubeRetryable);
+    if (index < 0) {
+        return summary;
+    }
+
+    const original = summary.results[index];
+    const results = [...summary.results];
+    results[index] = { ...replacement, id: resultId, youtubeRetryable: false };
+    const next = { ...summary, results };
+    changeBatchStatusCount(next, original.status, -1);
+    changeBatchStatusCount(next, replacement.status, 1);
+    return next;
+}
+
 export function youtubeEligibleResultIds(summary: BatchDownloadSummary): string[] {
     return summary.results
-        .filter((result) => result.status === "failed" || result.status === "suspicious")
+        .filter((result) => result.youtubeRetryable && (result.status === "failed" || result.status === "suspicious"))
         .map((result) => result.id);
+}
+
+export function resultIdForAttempt(attemptId: string, outcome: string): string {
+    return `${attemptId}:${outcome}`;
 }
 
 export function initialYoutubeSelection(summary: BatchDownloadSummary): Set<string> {
@@ -134,4 +196,27 @@ export function normalizeYoutubeSelection(summary: BatchDownloadSummary, selecte
 export function selectedYoutubeRetryResultIds(summary: BatchDownloadSummary, selected: ReadonlySet<string>): string[] {
     const normalized = normalizeYoutubeSelection(summary, selected);
     return youtubeEligibleResultIds(summary).filter((id) => normalized.has(id));
+}
+
+export function openYoutubeSummaryState(state: YoutubeSummaryState, summary: BatchDownloadSummary, queueId: string): YoutubeSummaryState {
+    const preserveSelection = state.isOpen && state.queueId === queueId;
+    return {
+        summary,
+        queueId,
+        selectedYoutubeResultIds: preserveSelection
+            ? normalizeYoutubeSelection(summary, state.selectedYoutubeResultIds)
+            : initialYoutubeSelection(summary),
+        isOpen: true,
+    };
+}
+
+export function updateYoutubeSummaryState(state: YoutubeSummaryState, summary: BatchDownloadSummary, queueId: string): YoutubeSummaryState {
+    if (state.queueId !== queueId) {
+        return state;
+    }
+    return {
+        ...state,
+        summary,
+        selectedYoutubeResultIds: normalizeYoutubeSelection(summary, state.selectedYoutubeResultIds),
+    };
 }

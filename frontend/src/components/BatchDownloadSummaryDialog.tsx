@@ -76,10 +76,11 @@ function formatElapsedMs(milliseconds: number): string {
     return `${(milliseconds / 1000).toFixed(2)}s`;
 }
 
-function ResultSection({ title, icon, results, selectedYoutubeResultIds, onToggleYoutubeResult }: {
+function ResultSection({ title, icon, results, youtubeEligibleIds, selectedYoutubeResultIds, onToggleYoutubeResult }: {
     title: string;
     icon: ReactNode;
     results: BatchTrackResult[];
+    youtubeEligibleIds?: ReadonlySet<string>;
     selectedYoutubeResultIds?: ReadonlySet<string>;
     onToggleYoutubeResult?: (id: string) => void;
 }) {
@@ -96,7 +97,7 @@ function ResultSection({ title, icon, results, selectedYoutubeResultIds, onToggl
             <div className="mt-3 max-h-48 space-y-2 overflow-y-auto pr-1">
                 {results.map((result) => (
                     <div key={`${result.status}-${result.id}-${result.file || result.replacementPath || ""}`} className="flex items-start gap-3 rounded-md bg-muted/40 px-3 py-2">
-                        {selectedYoutubeResultIds && onToggleYoutubeResult && (
+                        {youtubeEligibleIds?.has(result.id) && selectedYoutubeResultIds && onToggleYoutubeResult && (
                             <Checkbox
                                 checked={selectedYoutubeResultIds.has(result.id)}
                                 onCheckedChange={() => onToggleYoutubeResult(result.id)}
@@ -136,9 +137,9 @@ export function BatchDownloadSummaryDialog({
     const metadataUpdated = summary?.results.filter((result) => result.status === "metadata_updated") || [];
     const youtubeSucceeded = summary?.results.filter((result) => result.status === "youtube_replaced") || [];
     const youtubeFailed = summary?.results.filter((result) => result.status === "youtube_failed" || result.status === "youtube_still_suspicious") || [];
-    const youtubeEligibleIds = summary ? youtubeEligibleResultIds(summary) : [];
-    const selectedYoutubeIds = youtubeEligibleIds.filter((id) => selectedYoutubeResultIds.has(id));
-    const canRedownloadFromYouTube = youtubeEligibleIds.length > 0;
+    const youtubeEligibleIds = new Set(summary ? youtubeEligibleResultIds(summary) : []);
+    const selectedYoutubeIds = [...youtubeEligibleIds].filter((id) => selectedYoutubeResultIds.has(id));
+    const canRedownloadFromYouTube = youtubeEligibleIds.size > 0;
 
     return (
         <Dialog open={open} onOpenChange={(nextOpen) => {
@@ -173,8 +174,8 @@ export function BatchDownloadSummaryDialog({
                         <ScrollArea className="min-h-0 flex-1 pr-3">
                             {hasProblemDetails(summary) || metadataUpdated.length > 0 || youtubeSucceeded.length > 0 ? (
                                 <div className="space-y-3">
-                                    <ResultSection title="Suspicious Tracks" icon={<AlertTriangle className="h-4 w-4 text-yellow-500" />} results={suspicious} selectedYoutubeResultIds={selectedYoutubeResultIds} onToggleYoutubeResult={onToggleYoutubeResult} />
-                                    <ResultSection title="Failed Tracks" icon={<XCircle className="h-4 w-4 text-red-500" />} results={failed} selectedYoutubeResultIds={selectedYoutubeResultIds} onToggleYoutubeResult={onToggleYoutubeResult} />
+                                    <ResultSection title="Suspicious Tracks" icon={<AlertTriangle className="h-4 w-4 text-yellow-500" />} results={suspicious} youtubeEligibleIds={youtubeEligibleIds} selectedYoutubeResultIds={selectedYoutubeResultIds} onToggleYoutubeResult={onToggleYoutubeResult} />
+                                    <ResultSection title="Failed Tracks" icon={<XCircle className="h-4 w-4 text-red-500" />} results={failed} youtubeEligibleIds={youtubeEligibleIds} selectedYoutubeResultIds={selectedYoutubeResultIds} onToggleYoutubeResult={onToggleYoutubeResult} />
                                     <ResultSection title="Cancelled Tracks" icon={<XCircle className="h-4 w-4 text-orange-500" />} results={cancelled} />
                                     {summary.cancelled > 0 && cancelled.length === 0 && <div className="rounded-md border border-border/60 px-3 py-2 text-sm text-muted-foreground">{formatCancelledSummary(summary.cancelled)}</div>}
                                     <ResultSection title="Duplicate Tracks" icon={<FileCheck className="h-4 w-4 text-yellow-500" />} results={duplicateSkipped} />
