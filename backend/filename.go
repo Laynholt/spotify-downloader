@@ -5,7 +5,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"unicode/utf8"
+	"unicode"
+	"unicode/utf16"
 )
 
 func BuildFilename(trackName, artistName, albumName, albumArtist, releaseDate string, discNumber int, format string, includeTrackNumber bool, position int, useAlbumTrackNumber bool, playlistName, playlistOwner string) string {
@@ -44,10 +45,9 @@ func BuildFilename(trackName, artistName, albumName, albumArtist, releaseDate st
 		if position > 0 {
 			filename = strings.ReplaceAll(filename, "{track}", fmt.Sprintf("%02d", position))
 		} else {
-
-			filename = regexp.MustCompile(`\{track\}\.\s*`).ReplaceAllString(filename, "")
-			filename = regexp.MustCompile(`\{track\}\s*-\s*`).ReplaceAllString(filename, "")
-			filename = regexp.MustCompile(`\{track\}\s*`).ReplaceAllString(filename, "")
+			filename = trackDotPlaceholder.ReplaceAllString(filename, "")
+			filename = trackDashPlaceholder.ReplaceAllString(filename, "")
+			filename = trackPlaceholder.ReplaceAllString(filename, "")
 		}
 		return filename
 	}
@@ -68,51 +68,53 @@ func BuildFilename(trackName, artistName, albumName, albumArtist, releaseDate st
 	return filename
 }
 
+// maxFilenameUnits keeps a name (plus its extension and temp suffix) under the
+// 255 UTF-16 unit limit of NTFS and most other filesystems.
+const maxFilenameUnits = 200
+
+var (
+	filenameInvalidChars = strings.NewReplacer("/", " ", "\\", " ", ":", " ", "*", " ", "?", " ", "\"", " ", "<", " ", ">", " ", "|", " ")
+	whitespaceRun        = regexp.MustCompile(`\s+`)
+	underscoreRun        = regexp.MustCompile(`_+`)
+	trackDotPlaceholder  = regexp.MustCompile(`\{track\}\.\s*`)
+	trackDashPlaceholder = regexp.MustCompile(`\{track\}\s*-\s*`)
+	trackPlaceholder     = regexp.MustCompile(`\{track\}\s*`)
+	windowsReservedName  = regexp.MustCompile(`(?i)^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$`)
+)
+
 func SanitizeFilename(filename string) string {
-
-	result := strings.ReplaceAll(filename, "/", " ")
-
-	invalid := []string{"\\", ":", "*", "?", "\"", "<", ">", "|"}
-	for _, char := range invalid {
-		result = strings.ReplaceAll(result, char, " ")
-	}
-
-	var sanitized strings.Builder
-	for _, r := range result {
-
-		if r < 0x20 && r != 0x09 && r != 0x0A && r != 0x0D {
-			continue
+	result := strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return ' '
 		}
-		if r == 0x7F {
-			continue
+		if unicode.IsControl(r) {
+			return -1
 		}
-
-		sanitized.WriteRune(r)
-	}
-
-	result = sanitized.String()
-	result = strings.TrimSpace(result)
-
-	result = strings.Trim(result, ". ")
-
-	re := regexp.MustCompile(`\s+`)
-	result = re.ReplaceAllString(result, " ")
-
-	re = regexp.MustCompile(`_+`)
-	result = re.ReplaceAllString(result, "_")
-
-	result = strings.TrimSpace(result)
-
+		return r
+	}, filenameInvalidChars.Replace(strings.ToValidUTF8(filename, "_")))
+	result = whitespaceRun.ReplaceAllString(result, " ")
+	result = underscoreRun.ReplaceAllString(result, "_")
+	result = truncateUTF16(strings.Trim(result, ". "), maxFilenameUnits)
+	// Truncation can expose a trailing dot or space again; Windows strips them.
+	result = strings.TrimRight(result, ". ")
 	if result == "" {
 		return "Unknown"
 	}
-
-	if !utf8.ValidString(result) {
-
-		result = strings.ToValidUTF8(result, "_")
+	if windowsReservedName.MatchString(result) {
+		return "_" + result
 	}
-
 	return result
+}
+
+func truncateUTF16(s string, maxUnits int) string {
+	units := 0
+	for i, r := range s {
+		units += utf16.RuneLen(r)
+		if units > maxUnits {
+			return s[:i]
+		}
+	}
+	return s
 }
 
 func GetFirstArtist(artistString string) string {

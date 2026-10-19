@@ -3,7 +3,7 @@ import { fetchSpotifyMetadata, updateTrackMetadata } from "@/lib/api";
 import { CheckFilesExistence, CreateM3U8File } from "../../wailsjs/go/main/App";
 import { getSettingsWithDefaults, parseTemplate, type Settings, type TemplateData } from "@/lib/settings";
 import { toastWithSound as toast } from "@/lib/toast-with-sound";
-import { joinPath, sanitizePath, getFirstArtist } from "@/lib/utils";
+import { joinPath, sanitizePath } from "@/lib/utils";
 import { logger } from "@/lib/logger";
 import { logDuplicateTracks } from "@/lib/duplicate-tracks";
 import {
@@ -22,20 +22,13 @@ import {
     type YoutubeSummaryState,
 } from "@/lib/batch-summary";
 import type { DownloadResponse, SuspiciousRedownloadRequest, TrackMetadata, TrackMetadataUpdateRequest, TrackMetadataUpdateResult } from "@/types/api";
-import { latestTerminalQueueJobs, orderedQueueFilePaths, selectTracksWithSourceIndices } from "@/lib/batch-download";
+import { latestTerminalQueueJobs, selectTracksWithSourceIndices } from "@/lib/batch-download";
 import { useDownloadQueues, type CollectionDownloadArgs } from "@/hooks/useDownloadQueues";
 import { applyYouTubeResultToSummary } from "@/hooks/useDownloadQueues";
 import type { DownloadQueueContext, MediaJobPayload, MediaJobResult, SpotifyDownloadPayload } from "@/lib/download-jobs";
 import type { DownloadJob } from "@/lib/download-queue-manager";
-export interface BatchTrackPathInfo {
-    displayArtist: string;
-    displayAlbumArtist: string;
-    baseOutputDir: string;
-    targetOutputDir: string;
-    relativePath: string;
-    trackPosition: number;
-    useAlbumTrackNumber: boolean;
-}
+export type { BatchTrackPathInfo } from "@/lib/track-paths";
+import { buildBatchTrackPathInfo, normalizeReleaseDate, getReleaseYear, type BatchTrackPathInfo } from "@/lib/track-paths";
 export interface SuspiciousTrackInfo {
     expectedDurationSeconds?: number;
     actualDurationSeconds?: number;
@@ -103,21 +96,6 @@ function getExistenceRootDir(pathInfo: BatchTrackPathInfo | undefined, settings:
     return pathInfo.targetOutputDir;
 }
 
-function normalizeReleaseDate(releaseDate?: string): string {
-    if (!releaseDate) {
-        return "";
-    }
-    const trimmedReleaseDate = releaseDate.trim();
-    if (!trimmedReleaseDate) {
-        return "";
-    }
-    const dateWithoutTime = trimmedReleaseDate.split("T")[0] || trimmedReleaseDate;
-    return dateWithoutTime.split(" ")[0] || dateWithoutTime;
-}
-function getReleaseYear(releaseDate?: string): string {
-    const normalizedReleaseDate = normalizeReleaseDate(releaseDate);
-    return normalizedReleaseDate.length >= 4 ? normalizedReleaseDate.slice(0, 4) : "";
-}
 function folderTemplateNeedsReleaseDate(settings: Settings): boolean {
     const folderTemplate = settings.folderTemplate || "";
     return folderTemplate.includes("{year}") || folderTemplate.includes("{date}");
@@ -160,63 +138,6 @@ async function enrichTracksReleaseDates(tracks: TrackMetadata[], settings: Setti
         return tracks;
     }
     return await Promise.all(tracks.map((track) => enrichTrackReleaseDate(track, settings)));
-}
-function buildBatchTrackPathInfo(track: TrackMetadata, settings: Settings, playlistName: string | undefined, isAlbum: boolean | undefined, fallbackPosition: number): BatchTrackPathInfo {
-    const os = settings.operatingSystem;
-    const placeholder = "__SLASH_PLACEHOLDER__";
-    const folderTemplate = settings.folderTemplate || "";
-    const finalTrackNumber = track.track_number || 0;
-    const hasSubfolder = folderTemplate.trim() !== "";
-    const trackPosition = hasSubfolder && finalTrackNumber > 0 ? finalTrackNumber : fallbackPosition;
-    const displayArtist = settings.useFirstArtistOnly && track.artists ? getFirstArtist(track.artists) : (track.artists || "");
-    const displayAlbumArtist = settings.useFirstArtistOnly && track.album_artist
-        ? getFirstArtist(track.album_artist)
-        : (track.album_artist || track.artists || "");
-    const templateData: TemplateData = {
-        artist: displayArtist.replace(/\//g, placeholder),
-        album: (track.album_name || "").replace(/\//g, placeholder),
-        album_artist: displayAlbumArtist.replace(/\//g, placeholder),
-        title: (track.name || "").replace(/\//g, placeholder),
-        track: trackPosition,
-        disc: track.disc_number,
-        year: getReleaseYear(track.release_date),
-        date: normalizeReleaseDate(track.release_date),
-        playlist: playlistName?.replace(/\//g, placeholder),
-    };
-    const useAlbumSubfolder = folderTemplate.includes("{album}") ||
-        folderTemplate.includes("{album_artist}") ||
-        folderTemplate.includes("{playlist}");
-    let baseOutputDir = settings.downloadPath;
-    if (settings.createPlaylistFolder &&
-        playlistName &&
-        (!isAlbum || !useAlbumSubfolder)) {
-        baseOutputDir = joinPath(os, baseOutputDir, sanitizePath(playlistName.replace(/\//g, " "), os));
-    }
-    let targetOutputDir = baseOutputDir;
-    let relativePath = "";
-    if (folderTemplate) {
-        const folderPath = parseTemplate(folderTemplate, templateData);
-        if (folderPath) {
-            const parts = folderPath.split("/").filter((p: string) => p.trim());
-            const sanitizedParts = parts.map((part: string) => {
-                const sanitizedPart = part.replace(new RegExp(placeholder, "g"), " ");
-                return sanitizePath(sanitizedPart, os);
-            });
-            relativePath = sanitizedParts.join(os === "Windows" ? "\\" : "/");
-            for (const part of sanitizedParts) {
-                targetOutputDir = joinPath(os, targetOutputDir, part);
-            }
-        }
-    }
-    return {
-        displayArtist,
-        displayAlbumArtist,
-        baseOutputDir,
-        targetOutputDir,
-        relativePath,
-        trackPosition,
-        useAlbumTrackNumber: hasSubfolder,
-    };
 }
 function buildMetadataUpdateRequest(track: TrackMetadata, settings: Settings, pathInfo: BatchTrackPathInfo, filePath: string): TrackMetadataUpdateRequest {
     return {
@@ -477,6 +398,7 @@ export function useDownload() {
     const failedRedownloadRequestsRef = useRef<Map<string, Map<string, SuspiciousRedownloadRequest>>>(new Map());
     const youtubeSummaryGenerationsRef = useRef<WeakMap<BatchDownloadSummary, { queueId: string; generation: number }>>(new WeakMap());
     const summarizedSpotifyJobsByQueueRef = useRef<Map<string, number>>(new Map());
+    const playlistPathsByQueueRef = useRef<Map<string, Map<number, string>>>(new Map());
     const youtubeSummaryStateRef = useRef<YoutubeSummaryState>({
         summary: null,
         queueId: null,
@@ -857,7 +779,14 @@ export function useDownload() {
             }
             if (args?.settings.createM3u8File && queue.id.startsWith("playlist:") &&
                 args.playlistName && args.m3u8OutputDir) {
-                const paths = orderedQueueFilePaths(spotifyJobs);
+                const pathsByIndex = playlistPathsByQueueRef.current.get(queue.id) ?? new Map<number, string>();
+                for (const job of spotifyJobs) {
+                    if ((job.status === "completed" || job.status === "skipped") && job.result?.file) {
+                        pathsByIndex.set(job.sourceIndex, job.result.file);
+                    }
+                }
+                playlistPathsByQueueRef.current.set(queue.id, pathsByIndex);
+                const paths = [...pathsByIndex.entries()].sort(([left], [right]) => left - right).map(([, file]) => file);
                 if (paths.length > 0) {
                     try {
                         await CreateM3U8File(args.playlistName, args.m3u8OutputDir, paths);
@@ -1167,6 +1096,23 @@ export function useDownload() {
         handleRedownloadSelectedFromYouTube,
         handleStopDownload,
         stopQueue: downloadQueues.stopQueue,
+        stopAllQueues: downloadQueues.stopAllQueues,
+        clearCompletedQueues: async () => {
+            await downloadQueues.clearCompletedQueues();
+            summarizedSpotifyJobsByQueueRef.current.clear();
+        },
+        startNewSession: async () => {
+            await downloadQueues.startNewSession();
+            resetDownloadedTracks();
+            loggedStartedJobIdsRef.current.clear();
+            loggedTerminalJobIdsRef.current.clear();
+            summarizedSpotifyJobsByQueueRef.current.clear();
+            latestQueueIdRef.current = null;
+            playlistPathsByQueueRef.current.clear();
+            syncYoutubeSummaryState({ summary: null, queueId: null, selectedYoutubeResultIds: new Set(), isOpen: false,
+                generation: youtubeSummaryStateRef.current.generation + 1 });
+            setIsBatchSummaryMinimized(false);
+        },
         resetDownloadedTracks,
     };
 }

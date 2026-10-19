@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 )
@@ -50,58 +49,7 @@ func NewCoverClient() *CoverClient {
 }
 
 func buildCoverFilename(trackName, artistName, albumName, albumArtist, releaseDate, filenameFormat string, includeTrackNumber bool, position, discNumber int) string {
-	safeTitle := SanitizeFilename(trackName)
-	safeArtist := SanitizeFilename(artistName)
-	safeAlbum := SanitizeFilename(albumName)
-	safeAlbumArtist := SanitizeFilename(albumArtist)
-
-	year := ""
-	if len(releaseDate) >= 4 {
-		year = releaseDate[:4]
-	}
-
-	var filename string
-
-	if strings.Contains(filenameFormat, "{") {
-		filename = filenameFormat
-		filename = strings.ReplaceAll(filename, "{title}", safeTitle)
-		filename = strings.ReplaceAll(filename, "{artist}", safeArtist)
-		filename = strings.ReplaceAll(filename, "{album}", safeAlbum)
-		filename = strings.ReplaceAll(filename, "{album_artist}", safeAlbumArtist)
-		filename = strings.ReplaceAll(filename, "{year}", year)
-		filename = strings.ReplaceAll(filename, "{date}", SanitizeFilename(releaseDate))
-
-		if discNumber > 0 {
-			filename = strings.ReplaceAll(filename, "{disc}", fmt.Sprintf("%d", discNumber))
-		} else {
-			filename = strings.ReplaceAll(filename, "{disc}", "")
-		}
-
-		if position > 0 {
-			filename = strings.ReplaceAll(filename, "{track}", fmt.Sprintf("%02d", position))
-		} else {
-
-			filename = regexp.MustCompile(`\{track\}\.\s*`).ReplaceAllString(filename, "")
-			filename = regexp.MustCompile(`\{track\}\s*-\s*`).ReplaceAllString(filename, "")
-			filename = regexp.MustCompile(`\{track\}\s*`).ReplaceAllString(filename, "")
-		}
-	} else {
-
-		switch filenameFormat {
-		case "artist-title":
-			filename = fmt.Sprintf("%s - %s", safeArtist, safeTitle)
-		case "title":
-			filename = safeTitle
-		default:
-			filename = fmt.Sprintf("%s - %s", safeTitle, safeArtist)
-		}
-
-		if includeTrackNumber && position > 0 {
-			filename = fmt.Sprintf("%02d. %s", position, filename)
-		}
-	}
-
-	return filename + ".jpg"
+	return SanitizeFilename(BuildFilename(trackName, artistName, albumName, albumArtist, releaseDate, discNumber, filenameFormat, includeTrackNumber, position, false, "", "")) + ".jpg"
 }
 
 func convertSmallToMedium(imageURL string) string {

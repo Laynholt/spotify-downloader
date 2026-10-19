@@ -1,11 +1,11 @@
-import { useState, useEffect, useCallback, useLayoutEffect, useMemo } from "react";
+import { useState, useEffect, useCallback, useLayoutEffect, useMemo, useEffectEvent, useRef, lazy, Suspense } from "react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, } from "@/components/ui/dialog";
 import { Search, X, ArrowUp, ListChecks } from "lucide-react";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { getSettings, getSettingsWithDefaults, loadSettings, saveSettings, applyThemeMode, applyFont } from "@/lib/settings";
+import { getSettings, getSettingsLoadError, getSettingsWithDefaults, loadSettings, saveSettings, applyThemeMode, applyFont } from "@/lib/settings";
 import { applyTheme } from "@/lib/themes";
-import { CheckAppUpdate, DownloadAppUpdate, OpenFolder, CheckFFmpegInstalled, DownloadFFmpeg } from "../wailsjs/go/main/App";
+import { CheckAppUpdate, DownloadAppUpdate, OpenFolder, GetFFmpegStatus, DownloadFFmpeg } from "../wailsjs/go/main/App";
 import { EventsOn, EventsOff, Quit } from "../wailsjs/runtime/runtime";
 import { toastWithSound as toast } from "@/lib/toast-with-sound";
 import { extractArtistID } from "@/lib/spotify-url";
@@ -20,13 +20,13 @@ import { ArtistInfo } from "@/components/ArtistInfo";
 import { DownloadQueue } from "@/components/DownloadQueue";
 import { BatchDownloadSummaryDialog } from "@/components/BatchDownloadSummaryDialog";
 import { DownloadProgressToast } from "@/components/DownloadProgressToast";
-import { AudioAnalysisPage } from "@/components/AudioAnalysisPage";
-import { AudioConverterPage } from "@/components/AudioConverterPage";
-import { FileManagerPage } from "@/components/FileManagerPage";
-import { SettingsPage } from "@/components/SettingsPage";
-import { DebugLoggerPage } from "@/components/DebugLoggerPage";
-import { AboutPage } from "@/components/AboutPage";
-import { HistoryPage } from "@/components/HistoryPage";
+const AudioAnalysisPage = lazy(() => import("@/components/AudioAnalysisPage").then(module => ({ default: module.AudioAnalysisPage })));
+const AudioConverterPage = lazy(() => import("@/components/AudioConverterPage").then(module => ({ default: module.AudioConverterPage })));
+const FileManagerPage = lazy(() => import("@/components/FileManagerPage").then(module => ({ default: module.FileManagerPage })));
+const SettingsPage = lazy(() => import("@/components/SettingsPage").then(module => ({ default: module.SettingsPage })));
+const DebugLoggerPage = lazy(() => import("@/components/DebugLoggerPage").then(module => ({ default: module.DebugLoggerPage })));
+const AboutPage = lazy(() => import("@/components/AboutPage").then(module => ({ default: module.AboutPage })));
+const HistoryPage = lazy(() => import("@/components/HistoryPage").then(module => ({ default: module.HistoryPage })));
 import type { HistoryItem } from "@/components/FetchHistory";
 import { useDownload } from "@/hooks/useDownload";
 import { useMetadata } from "@/hooks/useMetadata";
@@ -39,6 +39,7 @@ import {
     selectCollectionQueue,
     selectCollectionQueueSnapshot,
     selectQueueStatus,
+    selectLatestTrackAttempt,
 } from "@/lib/download-queue-selectors";
 const HISTORY_KEY = "spotidownloader_fetch_history";
 const MAX_HISTORY = 5;
@@ -69,7 +70,8 @@ function App() {
     const [hasUnsavedSettings, setHasUnsavedSettings] = useState(false);
     const [pendingPageChange, setPendingPageChange] = useState<PageType | null>(null);
     const [showUnsavedChangesDialog, setShowUnsavedChangesDialog] = useState(false);
-    const [resetSettingsFn, setResetSettingsFn] = useState<(() => void) | null>(null);
+    const resetSettingsFn = useRef<(() => void) | null>(null);
+    const rememberSettingsReset = useCallback((reset: () => void) => { resetSettingsFn.current = reset; }, []);
     const [showChromeErrorDialog, setShowChromeErrorDialog] = useState(false);
     const [chromeErrorMessage, setChromeErrorMessage] = useState("");
     const ITEMS_PER_PAGE = 50;
@@ -92,9 +94,24 @@ function App() {
         ? selectQueueStatus(download.downloadQueueSnapshot, collectionQueue.id)
         : undefined;
     const [isFFmpegInstalled, setIsFFmpegInstalled] = useState<boolean | null>(null);
+    const [ffmpegStatus, setFFmpegStatus] = useState<{ installed: boolean; source: string; ffmpeg_path: string; ffprobe_path: string; error: string } | null>(null);
+    const [isCheckingFFmpeg, setIsCheckingFFmpeg] = useState(false);
     const [isInstallingFFmpeg, setIsInstallingFFmpeg] = useState(false);
     const [ffmpegInstallProgress, setFfmpegInstallProgress] = useState(0);
     const [ffmpegInstallStatus, setFfmpegInstallStatus] = useState("");
+    const checkFFmpeg = useCallback(async () => {
+        setIsCheckingFFmpeg(true);
+        try {
+            const status = await GetFFmpegStatus();
+            setFFmpegStatus(status);
+            setIsFFmpegInstalled(status.installed);
+        } catch (error) {
+            setFFmpegStatus({ installed: false, source: "", ffmpeg_path: "", ffprobe_path: "", error: String(error) });
+            setIsFFmpegInstalled(false);
+        } finally {
+            setIsCheckingFFmpeg(false);
+        }
+    }, []);
     useLayoutEffect(() => {
         const savedSettings = getSettings();
         if (savedSettings) {
@@ -109,23 +126,18 @@ function App() {
             applyThemeMode(settings.themeMode);
             applyTheme(settings.theme);
             applyFont(settings.fontFamily);
+            const loadError = getSettingsLoadError();
+            if (loadError) {
+                toast.error("Settings file could not be read; using the last local copy", { description: String(loadError) });
+                return;
+            }
             if (!settings.downloadPath) {
                 const settingsWithDefaults = await getSettingsWithDefaults();
                 await saveSettings(settingsWithDefaults);
             }
         };
-        initSettings();
-        const checkFFmpeg = async () => {
-            try {
-                const installed = await CheckFFmpegInstalled();
-                setIsFFmpegInstalled(installed);
-            }
-            catch (err) {
-                console.error("Failed to check FFmpeg:", err);
-                setIsFFmpegInstalled(false);
-            }
-        };
-        checkFFmpeg();
+        void initSettings().catch(error => toast.error(`Could not save initial settings: ${String(error)}`));
+        void checkFFmpeg();
         const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
         const handleChange = () => {
             const currentSettings = getSettings();
@@ -154,11 +166,11 @@ function App() {
             window.removeEventListener("scroll", handleScroll);
             window.removeEventListener("chromeNotInstalled", handleChromeNotInstalled);
         };
-    }, []);
+    }, [checkFFmpeg]);
     const scrollToTop = useCallback(() => {
         window.scrollTo({ top: 0, behavior: "smooth" });
     }, []);
-    useEffect(() => {
+    const resetForMetadata = useEffectEvent(() => {
         setSelectedTracks([]);
         setSearchQuery("");
         download.resetDownloadedTracks();
@@ -166,8 +178,9 @@ function App() {
         cover.resetCoverState();
         setSortBy("default");
         setCurrentListPage(1);
-    }, [metadata.metadata]);
-    const checkForUpdates = async () => {
+    });
+    useEffect(() => { resetForMetadata(); }, [metadata.metadata]);
+    const checkForUpdates = useEffectEvent(async () => {
         try {
             const status = await CheckAppUpdate(CURRENT_VERSION) as AppUpdateStatus;
             setAppUpdate(status);
@@ -177,7 +190,7 @@ function App() {
         catch (err) {
             console.error("Failed to check for updates:", err);
         }
-    };
+    });
     const handleApplyAppUpdate = async () => {
         if (!appUpdate?.available || isUpdatingApp)
             return;
@@ -240,7 +253,7 @@ function App() {
             EventsOff("ffmpeg:status");
             if (response.success) {
                 toast.success("FFmpeg installed successfully!");
-                setIsFFmpegInstalled(true);
+                await checkFFmpeg();
             }
             else {
                 toast.error(`Failed to install FFmpeg: ${response.error}`);
@@ -251,6 +264,8 @@ function App() {
             toast.error(`Error during FFmpeg installation: ${error}`);
         }
         finally {
+            EventsOff("ffmpeg:progress");
+            EventsOff("ffmpeg:status");
             setIsInstallingFFmpeg(false);
             setFfmpegInstallProgress(0);
             setFfmpegInstallStatus("");
@@ -264,7 +279,7 @@ function App() {
             console.error("Failed to save history:", err);
         }
     };
-    const addToHistory = (item: Omit<HistoryItem, "id" | "timestamp">) => {
+    const addToHistory = useEffectEvent((item: Omit<HistoryItem, "id" | "timestamp">) => {
         setFetchHistory((prev) => {
             const filtered = prev.filter((h) => h.url !== item.url);
             const newItem: HistoryItem = {
@@ -276,7 +291,7 @@ function App() {
             saveHistory(updated);
             return updated;
         });
-    };
+    });
     const removeFromHistory = (id: string) => {
         setFetchHistory((prev) => {
             const updated = prev.filter((h) => h.id !== id);
@@ -407,7 +422,8 @@ function App() {
         if ("track" in metadata.metadata) {
             const { track } = metadata.metadata;
             const trackId = track.spotify_id || "";
-            return (<TrackInfo track={track} isDownloading={download.isDownloading} downloadingTrack={download.downloadingTrack} isDownloaded={download.downloadedTracks.has(trackId)} isFailed={download.failedTracks.has(trackId)} isSkipped={download.skippedTracks.has(trackId)} downloadingLyricsTrack={lyrics.downloadingLyricsTrack} downloadedLyrics={lyrics.downloadedLyrics} failedLyrics={lyrics.failedLyrics} skippedLyrics={lyrics.skippedLyrics} downloadingCover={cover.downloadingCoverTrack === (track.spotify_id || `${track.name}-${track.artists}`)} downloadedCover={cover.downloadedCovers.has(track.spotify_id || "")} failedCover={cover.failedCovers.has(track.spotify_id || "")} skippedCover={cover.skippedCovers.has(track.spotify_id || "")} onDownload={download.handleDownloadTrack} onDownloadLyrics={(spotifyId, name, artists, albumName, albumArtist, releaseDate, discNumber) => lyrics.handleDownloadLyrics(spotifyId, name, artists, albumName, track.album_name, undefined, undefined, albumArtist, releaseDate, discNumber)} onDownloadCover={(coverUrl, trackName, artistName, albumName, _playlistName, _isArtistDiscography, _position, trackId, albumArtist, releaseDate, discNumber) => cover.handleDownloadCover(coverUrl, trackName, artistName, albumName, track.album_name, undefined, undefined, trackId, albumArtist, releaseDate, discNumber)} onOpenFolder={handleOpenFolder} onBack={metadata.resetMetadata}/>);
+            const adhocQueue = download.downloadQueueSnapshot.queues["adhoc:single"];
+            return (<TrackInfo attempt={adhocQueue ? selectLatestTrackAttempt(adhocQueue, `spotify:${trackId}`, downloadProgress.itemsByJobId) : undefined} track={track} isDownloading={download.isDownloading} downloadingTrack={download.downloadingTrack} isDownloaded={download.downloadedTracks.has(trackId)} isFailed={download.failedTracks.has(trackId)} isSkipped={download.skippedTracks.has(trackId)} downloadingLyricsTrack={lyrics.downloadingLyricsTrack} downloadedLyrics={lyrics.downloadedLyrics} failedLyrics={lyrics.failedLyrics} skippedLyrics={lyrics.skippedLyrics} downloadingCover={cover.downloadingCoverTrack === (track.spotify_id || `${track.name}-${track.artists}`)} downloadedCover={cover.downloadedCovers.has(track.spotify_id || "")} failedCover={cover.failedCovers.has(track.spotify_id || "")} skippedCover={cover.skippedCovers.has(track.spotify_id || "")} onDownload={download.handleDownloadTrack} onDownloadLyrics={(spotifyId, name, artists, albumName, albumArtist, releaseDate, discNumber) => lyrics.handleDownloadLyrics(spotifyId, name, artists, albumName, track.album_name, undefined, undefined, albumArtist, releaseDate, discNumber)} onDownloadCover={(coverUrl, trackName, artistName, albumName, _playlistName, _isArtistDiscography, _position, trackId, albumArtist, releaseDate, discNumber) => cover.handleDownloadCover(coverUrl, trackName, artistName, albumName, track.album_name, undefined, undefined, trackId, albumArtist, releaseDate, discNumber)} onOpenFolder={handleOpenFolder} onBack={metadata.resetMetadata}/>);
         }
         if ("album_info" in metadata.metadata) {
             const { album_info, track_list } = metadata.metadata;
@@ -448,8 +464,8 @@ function App() {
     };
     const handleDiscardChanges = () => {
         setShowUnsavedChangesDialog(false);
-        if (resetSettingsFn) {
-            resetSettingsFn();
+        if (resetSettingsFn.current) {
+            resetSettingsFn.current();
         }
         const savedSettings = getSettings();
         applyThemeMode(savedSettings.themeMode);
@@ -467,7 +483,7 @@ function App() {
     const renderPage = () => {
         switch (currentPage) {
             case "settings":
-                return <SettingsPage onUnsavedChangesChange={setHasUnsavedSettings} onResetRequest={setResetSettingsFn}/>;
+                return <SettingsPage onUnsavedChangesChange={setHasUnsavedSettings} onResetRequest={rememberSettingsReset}/>;
             case "debug":
                 return <DebugLoggerPage />;
             case "about":
@@ -491,10 +507,11 @@ function App() {
 
 
 
+
                     <Dialog open={metadata.showAlbumDialog} onOpenChange={metadata.setShowAlbumDialog}>
                         <DialogContent className="sm:max-w-[425px] p-6 [&>button]:hidden">
                             <div className="absolute right-4 top-4">
-                                <Button variant="ghost" size="icon" className="h-6 w-6 opacity-70 hover:opacity-100" onClick={() => metadata.setShowAlbumDialog(false)}>
+                                <Button variant="ghost" size="icon" className="h-6 w-6 opacity-70 hover:opacity-100" aria-label="Close album dialog" onClick={() => metadata.setShowAlbumDialog(false)}>
                                     <X className="h-4 w-4"/>
                                 </Button>
                             </div>
@@ -542,7 +559,7 @@ function App() {
 
             <div className="flex-1 ml-14 mt-10 p-4 md:p-8">
                 <div className="max-w-4xl mx-auto space-y-6">
-                    {renderPage()}
+                    <Suspense fallback={<div role="status" className="py-8 text-center text-muted-foreground">Loading pageвЂ¦</div>}>{renderPage()}</Suspense>
                 </div>
             </div>
 
@@ -550,7 +567,7 @@ function App() {
             <DownloadProgressToast onClick={downloadQueue.openQueue} snapshot={download.downloadQueueSnapshot} itemsByJobId={downloadProgress.itemsByJobId}/>
 
 
-            <DownloadQueue isOpen={downloadQueue.isOpen} onClose={downloadQueue.closeQueue} queueInfo={downloadProgress}/>
+            <DownloadQueue isOpen={downloadQueue.isOpen} onClose={downloadQueue.closeQueue} queueInfo={downloadProgress} schedulerSnapshot={download.downloadQueueSnapshot} onStopQueue={download.handleStopDownload} onStopAll={download.stopAllQueues} onClearCompleted={download.clearCompletedQueues} onNewSession={download.startNewSession}/>
 
             <BatchDownloadSummaryDialog open={download.isBatchSummaryOpen} summary={download.batchSummary} isRedownloadingSuspicious={download.isRedownloadingSuspicious} redownloadProgress={download.downloadProgress} redownloadCurrentTrack={download.currentDownloadInfo} onMinimize={download.minimizeBatchSummary} onClose={download.closeBatchSummary} selectedYoutubeResultIds={download.selectedYoutubeResultIds} onToggleYoutubeResult={download.toggleYoutubeResult} onSelectAllYoutube={download.selectAllYoutube} onClearYoutube={download.clearYoutubeSelection} onRedownloadSelectedFromYouTube={download.handleRedownloadSelectedFromYouTube}/>
 
@@ -561,7 +578,7 @@ function App() {
             </Button>)}
 
 
-            {showScrollTop && (<Button onClick={scrollToTop} className="fixed bottom-6 right-6 z-50 h-10 w-10 rounded-full shadow-lg" size="icon">
+            {showScrollTop && (<Button aria-label="Scroll to top" onClick={scrollToTop} className="fixed bottom-6 right-6 z-50 h-10 w-10 rounded-full shadow-lg" size="icon">
                 <ArrowUp className="h-5 w-5"/>
             </Button>)}
 
@@ -609,11 +626,12 @@ function App() {
                             FFmpeg Required
                         </DialogTitle>
                         <DialogDescription className="text-sm text-foreground/70 leading-relaxed font-normal">
-                            FFmpeg is essential for SpotiDownloader to function properly.
-                            This setup will download about <span className="text-foreground font-semibold">100-200MB</span> of data.
+                            No working FFmpeg and FFprobe pair was found in the portable runtime or system PATH.
+                            Installing a portable copy will download about <span className="text-foreground font-semibold">100-200MB</span> of data.
                         </DialogDescription>
                     </DialogHeader>
 
+                    {ffmpegStatus?.error && <p role="alert" className="text-xs text-muted-foreground break-words">{ffmpegStatus.error}</p>}
                     {isInstallingFFmpeg && (<div className="space-y-4">
                             {ffmpegInstallStatus === "extracting" ? (<div className="flex flex-col items-center justify-center py-2 animate-in fade-in duration-500">
                                     <div className="flex items-center gap-3">
@@ -642,7 +660,8 @@ function App() {
                         {!isInstallingFFmpeg && (<Button variant="outline" className="flex-1 h-11 text-sm font-bold transition-colors" onClick={() => Quit()}>
                                 Exit
                             </Button>)}
-                        <Button className={`${isInstallingFFmpeg ? 'w-full' : 'flex-1'} h-11 text-sm font-bold shadow-lg shadow-primary/10`} onClick={handleInstallFFmpeg} disabled={isInstallingFFmpeg}>
+                        {!isInstallingFFmpeg && <Button variant="outline" onClick={() => void checkFFmpeg()} disabled={isCheckingFFmpeg}>{isCheckingFFmpeg ? "CheckingвЂ¦" : "Check again"}</Button>}
+                        <Button className={`${isInstallingFFmpeg ? 'w-full' : 'flex-1'} h-11 text-sm font-bold shadow-lg shadow-primary/10`} onClick={handleInstallFFmpeg} disabled={isInstallingFFmpeg || isCheckingFFmpeg}>
                             {isInstallingFFmpeg ? "Installing..." : "Install now"}
                         </Button>
                     </DialogFooter>

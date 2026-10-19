@@ -29,6 +29,7 @@ export function SettingsPage({ onUnsavedChangesChange, onResetRequest }: Setting
     const [tempSettings, setTempSettings] = useState<SettingsType>(savedSettings);
     const [isDark, setIsDark] = useState(document.documentElement.classList.contains('dark'));
     const [showResetConfirm, setShowResetConfirm] = useState(false);
+    const [isSaving, setIsSaving] = useState(false);
     const hasUnsavedChanges = JSON.stringify(savedSettings) !== JSON.stringify(tempSettings);
     const resetToSaved = useCallback(() => {
         const freshSavedSettings = getSettings();
@@ -67,31 +68,53 @@ export function SettingsPage({ onUnsavedChangesChange, onResetRequest }: Setting
         }, 0);
     }, [tempSettings.themeMode, tempSettings.theme, tempSettings.fontFamily]);
     useEffect(() => {
+        let cancelled = false;
         const loadDefaults = async () => {
             if (!savedSettings.downloadPath) {
-                const settingsWithDefaults = await getSettingsWithDefaults();
-                setSavedSettings(settingsWithDefaults);
-                setTempSettings(settingsWithDefaults);
-                await saveSettings(settingsWithDefaults);
+                setIsSaving(true);
+                try {
+                    const settingsWithDefaults = await getSettingsWithDefaults();
+                    if (cancelled) return;
+                    setTempSettings((current) => ({ ...current, downloadPath: current.downloadPath || settingsWithDefaults.downloadPath }));
+                    await saveSettings(settingsWithDefaults);
+                    if (!cancelled) setSavedSettings(getSettings());
+                }
+                catch (error) {
+                    if (!cancelled) toast.error(`Failed to save default settings: ${error}`);
+                }
+                finally {
+                    if (!cancelled) setIsSaving(false);
+                }
             }
         };
-        loadDefaults();
-    }, []);
+        void loadDefaults();
+        return () => { cancelled = true; };
+    }, [savedSettings.downloadPath]);
     const handleSave = async () => {
-        await saveSettings(tempSettings);
-        setSavedSettings(tempSettings);
-        toast.success("Settings saved");
-        onUnsavedChangesChange?.(false);
+        setIsSaving(true);
+        try {
+            await saveSettings(tempSettings);
+            setSavedSettings(getSettings());
+            toast.success("Settings saved");
+        }
+        catch (error) {
+            toast.error(`Failed to save settings: ${error}`);
+        }
+        finally { setIsSaving(false); }
     };
     const handleReset = async () => {
-        const defaultSettings = await resetToDefaultSettings();
-        setTempSettings(defaultSettings);
-        setSavedSettings(defaultSettings);
-        applyThemeMode(defaultSettings.themeMode);
-        applyTheme(defaultSettings.theme);
-        applyFont(defaultSettings.fontFamily);
-        setShowResetConfirm(false);
-        toast.success("Settings reset to default");
+        setIsSaving(true);
+        try {
+            const defaultSettings = await resetToDefaultSettings();
+            setTempSettings(defaultSettings);
+            setSavedSettings(defaultSettings);
+            setShowResetConfirm(false);
+            toast.success("Settings reset to default");
+        }
+        catch (error) {
+            toast.error(`Failed to reset settings: ${error}`);
+        }
+        finally { setIsSaving(false); }
     };
     const handleBrowseFolder = async () => {
         try {
@@ -110,11 +133,11 @@ export function SettingsPage({ onUnsavedChangesChange, onResetRequest }: Setting
       <div className="flex items-center justify-between shrink-0">
           <h1 className="text-2xl font-bold">Settings</h1>
           <div className="flex gap-2">
-            <Button variant="outline" onClick={() => setShowResetConfirm(true)} className="gap-1.5">
+            <Button variant="outline" disabled={isSaving} onClick={() => setShowResetConfirm(true)} className="gap-1.5">
               <RotateCcw className="h-4 w-4"/>
               Reset to Default
             </Button>
-            <Button onClick={handleSave} className="gap-1.5">
+            <Button onClick={handleSave} disabled={isSaving} className="gap-1.5">
               <Save className="h-4 w-4"/>
               Save Changes
             </Button>
@@ -362,7 +385,7 @@ export function SettingsPage({ onUnsavedChangesChange, onResetRequest }: Setting
         </DialogHeader>
         <DialogFooter>
           <Button variant="outline" onClick={() => setShowResetConfirm(false)}>Cancel</Button>
-          <Button onClick={handleReset}>Reset</Button>
+          <Button onClick={handleReset} disabled={isSaving}>Reset</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

@@ -12,7 +12,7 @@ The app fetches Spotify metadata, downloads audio through third-party sources, e
 ## Features
 
 - Fetch tracks, albums, playlists, and artist releases from Spotify URLs.
-- Download audio in MP3, FLAC, or M4A depending on settings.
+- Download audio in MP3 or FLAC. The separate audio converter also supports M4A.
 - Embed Spotify metadata, cover art, MusicBrainz metadata, genres, and lyrics.
 - Detect suspicious downloads by comparing Spotify duration with the downloaded file duration.
 - Move suspicious source downloads into a `Suspicious` subfolder.
@@ -34,13 +34,13 @@ For running a release build:
 
 - Windows 10 or newer.
 - Internet access.
-- FFmpeg for some audio operations. The app can help download it from settings.
+- FFmpeg and FFprobe for audio operations. A working portable pair takes priority, followed by a pair in system PATH. The startup dialog can install a portable copy if neither is available.
 
 For development:
 
-- Go 1.23 or newer.
-- Node.js and `pnpm`.
-- Wails CLI v2.
+- Go 1.26.4 or newer (see `go.mod`).
+- Node.js 24 and `pnpm` 10.30.2.
+- Wails CLI v2.11.0.
 - Python 3 if rebuilding the embedded token helper.
 - UPX is optional; `build.ps1` uses it when available.
 
@@ -87,7 +87,7 @@ Settings, history, and downloaded music keep their existing locations.
 
 The first YouTube retry lazily installs official `yt-dlp` and Deno executables
 under `SpotiDownloader.runtime/bin` beside the application. Release checks are
-cached for 24 hours. Downloads use the packaged FFmpeg path and an explicit
+cached for 24 hours. Downloads use the same resolved FFmpeg pair as conversion and an explicit
 `--js-runtimes deno:<path>` argument. If a retry fails, open the queue result to
 see its stage and bounded diagnostics; the complete yt-dlp output remains in the
 application debug log.
@@ -100,12 +100,19 @@ Run backend tests:
 go test ./...
 ```
 
-Run the frontend production build:
+Run frontend tests, lint, and the production build:
 
 ```powershell
 cd frontend
+pnpm test
+pnpm exec eslint . --max-warnings 0
 pnpm run build
 ```
+
+Pull requests and release builds run these checks on Windows, including Go tests,
+`go vet`, Wails binding generation, and a production application build.
+
+See [ROADMAP.md](ROADMAP.md) for implemented capabilities and possible future work.
 
 ## Repository Notes
 

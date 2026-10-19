@@ -16,13 +16,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 const (
 	spotidownloaderAPIBase = "https://api.spotidownloader.com"
 )
-
-var finalizeTaggedAudioFileForDownload = FinalizeTaggedAudioFile
 
 const (
 	networkRetryAttempts = 3
@@ -67,14 +67,7 @@ type SpotiDownloader struct {
 	sessionToken  string
 	httpClient    *http.Client
 	metadataCache *MetadataCache
-	// pipelineDeps is a package-internal seam for deterministic backend tests.
-	// Production instances leave it zero-valued and use the defaults in
-	// track_pipeline.go.
-	pipelineDeps      trackPipelineDeps
-	trackPipelineDeps trackPipelineDeps
-	trackDeps         trackPipelineDeps
-	// refreshToken is a per-instance seam for deterministic pipeline retry
-	// tests. Production instances use refreshSessionToken below.
+	// refreshToken replaces refreshSessionToken in pipeline retry tests.
 	refreshToken func(context.Context) error
 }
 
@@ -101,14 +94,6 @@ var (
 	sessionTokenMu       sync.RWMutex
 	rememberedSessionTok string
 )
-
-type FlacAvailableRequest struct {
-	ID string `json:"id"`
-}
-
-type FlacAvailableResponse struct {
-	Available bool `json:"available"`
-}
 
 type DownloadRequest struct {
 	ID string `json:"id"`
@@ -424,19 +409,6 @@ func fetchTaggingMetadataWithOutcomes(ctx context.Context, cache *MetadataCache,
 	return result, warnings, outcomes
 }
 
-func fetchTaggingMetadataInBackground(trackID, trackName, artistName, albumName, releaseDate string, useSingleGenre, embedGenre bool) <-chan taggingMetadataResult {
-	resultCh := make(chan taggingMetadataResult, 1)
-	go func() {
-		defer close(resultCh)
-		result, _ := fetchTaggingMetadata(context.Background(), CurrentMetadataCache(), TaggingMetadataRequest{
-			TrackID: trackID, TrackName: trackName, ArtistName: artistName, AlbumName: albumName,
-			ReleaseDate: releaseDate, UseSingleGenre: useSingleGenre, EmbedGenre: embedGenre,
-		})
-		resultCh <- result
-	}()
-	return resultCh
-}
-
 func RememberSessionToken(token string) {
 	token = strings.TrimSpace(token)
 	if token == "" {
@@ -462,16 +434,6 @@ func getPreferredSessionToken(token string) string {
 		RememberSessionToken(token)
 	}
 	return token
-}
-
-func (s *SpotiDownloader) setSessionToken(token string) {
-	token = strings.TrimSpace(token)
-	if token == "" {
-		return
-	}
-
-	s.sessionToken = token
-	RememberSessionToken(token)
 }
 
 func formatStatusBody(body []byte) string {
@@ -649,17 +611,9 @@ func convertDownloadedAudioContext(ctx context.Context, inputPath, outputBasePat
 		return inputPath, nil
 	}
 
-	ffmpegInstalled, err := IsFFmpegInstalledContext(ctx)
-	if err != nil || !ffmpegInstalled {
-		if err != nil {
-			return "", fmt.Errorf("downloaded format mismatch (%s -> %s), and ffmpeg is unavailable: %w", currentExt, desiredExt, err)
-		}
-		return "", fmt.Errorf("downloaded format mismatch (%s -> %s), and ffmpeg is not installed", currentExt, desiredExt)
-	}
-
-	ffmpegPath, err := GetFFmpegPath()
+	ffmpegPath, err := GetFFmpegPathContext(ctx)
 	if err != nil {
-		return "", fmt.Errorf("failed to get ffmpeg path for conversion: %w", err)
+		return "", fmt.Errorf("downloaded format mismatch (%s -> %s), and ffmpeg is unavailable: %w", currentExt, desiredExt, err)
 	}
 
 	outputPath := outputBasePath + desiredExt
@@ -742,177 +696,66 @@ func isSessionTokenError(err error) bool {
 	return errors.As(err, &tokenErr)
 }
 
-func (s *SpotiDownloader) refreshSessionToken() error {
-	return s.refreshSessionTokenContext(context.Background())
-}
+var (
+	sessionTokenRefresh singleflight.Group
+	fetchSessionToken   = FetchSessionTokenWithParamsContext
+)
 
-func (s *SpotiDownloader) refreshSessionTokenContext(ctx context.Context) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	fmt.Println("Session token expired, fetching a fresh token...")
-
-	token, err := FetchSessionTokenWithParamsContext(ctx, 15, 1)
-	if err != nil {
-		return fmt.Errorf("failed to refresh session token: %w", err)
-	}
-
-	s.setSessionToken(token)
-	return nil
-}
-
-func (s *SpotiDownloader) refreshSessionTokenForPipeline(ctx context.Context) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if s != nil && s.refreshToken != nil {
+// refreshSessionToken replaces a token the API rejected. Concurrent workers
+// share one helper run (it starts a browser), and a worker whose request still
+// carried a token another worker already replaced just adopts the new one.
+func (s *SpotiDownloader) refreshSessionToken(ctx context.Context) error {
+	if s.refreshToken != nil {
 		return s.refreshToken(ctx)
 	}
-	return s.refreshSessionTokenContext(ctx)
+	if current := getPreferredSessionToken(""); current != "" && current != s.sessionToken {
+		s.sessionToken = current
+		return nil
+	}
+	ch := sessionTokenRefresh.DoChan("session-token", func() (any, error) {
+		fmt.Println("Session token expired, fetching a fresh token...")
+		// Detached from this worker's cancellation because other workers wait
+		// on the same run; the helper has its own timeout.
+		token, err := fetchSessionToken(context.WithoutCancel(ctx), 15, 1)
+		if err == nil {
+			RememberSessionToken(token)
+		}
+		return token, err
+	})
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case res := <-ch:
+		if res.Err != nil {
+			return fmt.Errorf("failed to refresh session token: %w", res.Err)
+		}
+		s.sessionToken = res.Val.(string)
+		return nil
+	}
 }
 
-func withTokenRetry[T any](s *SpotiDownloader, fn func() (T, error)) (T, error) {
-	result, err := fn()
+// withSessionToken runs call and, if the API rejected the session token,
+// refreshes it once and runs call again.
+func withSessionToken[T any](ctx context.Context, s *SpotiDownloader, call func() (T, error)) (T, error) {
+	result, err := call()
 	if !isSessionTokenError(err) {
 		return result, err
 	}
-
-	if refreshErr := s.refreshSessionToken(); refreshErr != nil {
-		var zero T
+	var zero T
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return zero, ctxErr
+	}
+	if refreshErr := s.refreshSessionToken(ctx); refreshErr != nil {
 		return zero, refreshErr
 	}
-
-	return fn()
+	return call()
 }
 
-func (s *SpotiDownloader) IsFlacAvailable(trackID string) (bool, error) {
-	return withTokenRetry(s, func() (bool, error) {
-		return s.isFlacAvailableContext(context.Background(), trackID)
-	})
+func (s *SpotiDownloader) getDownloadLink(ctx context.Context, trackID string) (*DownloadResponse, error) {
+	return withSessionToken(ctx, s, func() (*DownloadResponse, error) { return s.requestDownloadLink(ctx, trackID) })
 }
 
-func (s *SpotiDownloader) isFlacAvailable(trackID string) (bool, error) {
-	return s.isFlacAvailableContext(context.Background(), trackID)
-}
-
-func (s *SpotiDownloader) IsFlacAvailableContext(ctx context.Context, trackID string) (bool, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	result, err := s.isFlacAvailableContext(ctx, trackID)
-	if !isSessionTokenError(err) {
-		return result, err
-	}
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	if refreshErr := s.refreshSessionTokenContext(ctx); refreshErr != nil {
-		return false, refreshErr
-	}
-	return s.isFlacAvailableContext(ctx, trackID)
-}
-
-func (s *SpotiDownloader) isFlacAvailableContext(ctx context.Context, trackID string) (bool, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	reqBody := FlacAvailableRequest{ID: trackID}
-	jsonData, err := json.Marshal(reqBody)
-	if err != nil {
-		return false, err
-	}
-
-	req, err := newHTTPRequestWithContext(ctx, "POST", spotidownloaderAPIBase+"/isFlacAvailable", bytes.NewBuffer(jsonData))
-	if err != nil {
-		return false, err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+s.sessionToken)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Origin", "https://spotidownloader.com")
-	req.Header.Set("Referer", "https://spotidownloader.com/")
-
-	resp, err := s.doRequestWithNetworkRetry(req)
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return false, statusError(resp.StatusCode, body)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return false, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	if len(body) == 0 {
-		return false, fmt.Errorf("API returned empty response")
-	}
-
-	var result FlacAvailableResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-
-		bodyStr := string(body)
-		if len(bodyStr) > 200 {
-			bodyStr = bodyStr[:200] + "..."
-		}
-		return false, fmt.Errorf("failed to decode response: %w (response: %s)", err, bodyStr)
-	}
-
-	return result.Available, nil
-}
-
-func (s *SpotiDownloader) GetDownloadLink(trackID string) (*DownloadResponse, error) {
-	return withTokenRetry(s, func() (*DownloadResponse, error) {
-		return s.getDownloadLinkContext(context.Background(), trackID)
-	})
-}
-
-func (s *SpotiDownloader) getDownloadLink(trackID string) (*DownloadResponse, error) {
-	return s.getDownloadLinkContext(context.Background(), trackID)
-}
-
-func (s *SpotiDownloader) GetDownloadLinkContext(ctx context.Context, trackID string) (*DownloadResponse, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	result, err := s.getDownloadLinkContext(ctx, trackID)
-	if !isSessionTokenError(err) {
-		return result, err
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if refreshErr := s.refreshSessionTokenContext(ctx); refreshErr != nil {
-		return nil, refreshErr
-	}
-	return s.getDownloadLinkContext(ctx, trackID)
-}
-
-func (s *SpotiDownloader) getDownloadLinkContextWithRetry(ctx context.Context, trackID string) (*DownloadResponse, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	result, err := s.getDownloadLinkContext(ctx, trackID)
-	if !isSessionTokenError(err) {
-		return result, err
-	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return nil, ctxErr
-	}
-	if refreshErr := s.refreshSessionTokenForPipeline(ctx); refreshErr != nil {
-		return nil, refreshErr
-	}
-	return s.getDownloadLinkContext(ctx, trackID)
-}
-
-func (s *SpotiDownloader) getDownloadLinkContext(ctx context.Context, trackID string) (*DownloadResponse, error) {
+func (s *SpotiDownloader) requestDownloadLink(ctx context.Context, trackID string) (*DownloadResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -969,42 +812,8 @@ func (s *SpotiDownloader) getDownloadLinkContext(ctx context.Context, trackID st
 	return &result, nil
 }
 
-func (s *SpotiDownloader) DownloadFile(downloadURL, outputBasePath, fallbackExt string) (string, error) {
-	return withTokenRetry(s, func() (string, error) {
-		return s.downloadFileContext(context.Background(), downloadURL, outputBasePath, fallbackExt)
-	})
-}
-
-func (s *SpotiDownloader) downloadFile(downloadURL, outputBasePath, fallbackExt string) (_ string, err error) {
-	return s.downloadFileContext(context.Background(), downloadURL, outputBasePath, fallbackExt)
-}
-
-func (s *SpotiDownloader) DownloadFileContext(ctx context.Context, downloadURL, outputBasePath, fallbackExt string) (string, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	result, err := s.downloadFileContext(ctx, downloadURL, outputBasePath, fallbackExt)
-	if !isSessionTokenError(err) {
-		return result, err
-	}
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-	if refreshErr := s.refreshSessionTokenContext(ctx); refreshErr != nil {
-		return "", refreshErr
-	}
-	return s.downloadFileContext(ctx, downloadURL, outputBasePath, fallbackExt)
-}
-
-func (s *SpotiDownloader) downloadFileContext(ctx context.Context, downloadURL, outputBasePath, fallbackExt string) (_ string, err error) {
-	return s.downloadFileContextWithItemID(ctx, downloadURL, outputBasePath, fallbackExt, "")
-}
-
-// downloadFileContextWithItemID is the track-scoped variant used by the
-// concurrent pipeline. Keeping the legacy wrapper above preserves the old
-// 25-argument DownloadTrack contract while allowing each pipeline to report
-// transfer progress against its own queue item.
-func (s *SpotiDownloader) downloadFileContextWithItemID(ctx context.Context, downloadURL, outputBasePath, fallbackExt, itemID string) (_ string, err error) {
+// fetchAudio streams one audio file, reporting progress against its queue item.
+func (s *SpotiDownloader) fetchAudio(ctx context.Context, downloadURL, outputBasePath, fallbackExt, itemID string) (_ string, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1089,250 +898,15 @@ func (s *SpotiDownloader) downloadFileContextWithItemID(ctx context.Context, dow
 	return outputPath, err
 }
 
-func (s *SpotiDownloader) downloadFileContextWithItemIDRetry(ctx context.Context, downloadURL, outputBasePath, fallbackExt, itemID string) (string, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	result, err := s.downloadFileContextWithItemID(ctx, downloadURL, outputBasePath, fallbackExt, itemID)
-	if !isSessionTokenError(err) {
-		return result, err
-	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return "", ctxErr
-	}
-	if refreshErr := s.refreshSessionTokenForPipeline(ctx); refreshErr != nil {
-		return "", refreshErr
-	}
-	return s.downloadFileContextWithItemID(ctx, downloadURL, outputBasePath, fallbackExt, itemID)
+func (s *SpotiDownloader) downloadAudio(ctx context.Context, downloadURL, outputBasePath, fallbackExt, itemID string) (string, error) {
+	return withSessionToken(ctx, s, func() (string, error) {
+		return s.fetchAudio(ctx, downloadURL, outputBasePath, fallbackExt, itemID)
+	})
 }
 
-func (s *SpotiDownloader) DownloadTrackContext(
-	ctx context.Context,
-	trackID string,
-	outputDir string,
-	audioFormat string,
-	filenameFormat string,
-	includeTrackNumber bool,
-	position int,
-	trackName string,
-	artistName string,
-	albumName string,
-	albumArtist string,
-	releaseDate string,
-	coverURL string,
-	actualTrackNumber int,
-	discNumber int,
-	totalTracks int,
-	useAlbumTrackNumber bool,
-	embedMaxQualityCover bool,
-	totalDiscs int,
-	copyright string,
-	publisher string,
-	playlistName string,
-	playlistOwner string,
-	useFirstArtistOnly bool,
-	useSingleGenre bool,
-	embedGenre bool,
-) (string, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-
-	outputDir = NormalizePath(outputDir)
-
-	metaChan := make(chan taggingMetadataResult, 1)
-	go func() {
-		result, warnings := fetchTaggingMetadata(ctx, s.metadataCache, TaggingMetadataRequest{
-			TrackID: trackID, TrackName: trackName, ArtistName: artistName, AlbumName: albumName,
-			ReleaseDate: releaseDate, UseSingleGenre: useSingleGenre, EmbedGenre: embedGenre,
-		})
-		for _, warning := range warnings {
-			fmt.Printf("Warning: %s\n", warning)
-		}
-		metaChan <- result
-	}()
-
-	filenameArtist := artistName
-	filenameAlbumArtist := albumArtist
-	if useFirstArtistOnly {
-		filenameArtist = GetFirstArtist(artistName)
-		filenameAlbumArtist = GetFirstArtist(albumArtist)
-	}
-
-	resolveDownloadTarget := func() (string, string, error) {
-		downloadResp, err := s.getDownloadLinkContext(ctx, trackID)
-		if err != nil {
-			return "", "", err
-		}
-
-		if audioFormat == "flac" && downloadResp.LinkFlac != "" {
-			return downloadResp.LinkFlac, ".flac", nil
-		}
-
-		if downloadResp.Link == "" {
-			return "", "", fmt.Errorf("no download link available")
-		}
-		return downloadResp.Link, ".mp3", nil
-	}
-
-	var outputPath string
-	var coverPath string
-	outputCommitted := false
-	defer func() {
-		if ctx.Err() != nil && !outputCommitted {
-			if outputPath != "" {
-				_ = os.Remove(outputPath)
-			}
-			if coverPath != "" {
-				_ = os.Remove(coverPath)
-			}
-		}
-	}()
-	var downloadCompleted bool
-	for attempt := 0; attempt < 2; attempt++ {
-		downloadURL, fileExt, err := resolveDownloadTarget()
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return "", ctxErr
-			}
-			if attempt == 0 && isSessionTokenError(err) {
-				if refreshErr := s.refreshSessionToken(); refreshErr != nil {
-					return "", fmt.Errorf("failed to get download link: %v", refreshErr)
-				}
-				continue
-			}
-			return "", fmt.Errorf("failed to get download link: %v", err)
-		}
-
-		filenameBase := BuildFilename(trackName, filenameArtist, albumName, filenameAlbumArtist, releaseDate, discNumber, filenameFormat, includeTrackNumber, position, useAlbumTrackNumber, playlistName, playlistOwner)
-		filenameBase = SanitizeFilename(filenameBase)
-		outputBasePath := filepath.Join(outputDir, filenameBase)
-
-		for _, ext := range PossibleAudioExtensions(audioFormat) {
-			candidatePath := outputBasePath + ext
-			if fileInfo, statErr := os.Stat(candidatePath); statErr == nil && fileInfo.Size() > 0 {
-				fmt.Printf("File already exists: %s (%.2f MB)\n", candidatePath, float64(fileInfo.Size())/(1024*1024))
-				return "EXISTS:" + candidatePath, nil
-			}
-		}
-
-		outputPath, err = s.downloadFileContext(ctx, downloadURL, outputBasePath, fileExt)
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return "", ctxErr
-			}
-			if attempt == 0 && isSessionTokenError(err) {
-				if refreshErr := s.refreshSessionToken(); refreshErr != nil {
-					return "", fmt.Errorf("failed to download file: %v", refreshErr)
-				}
-				continue
-			}
-			return "", fmt.Errorf("failed to download file: %v", err)
-		}
-
-		outputPath, err = convertDownloadedAudioContext(ctx, outputPath, outputBasePath, audioFormat)
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return "", ctxErr
-			}
-			return "", fmt.Errorf("failed to convert downloaded file: %v", err)
-		}
-
-		downloadCompleted = true
-		break
-	}
-
-	if !downloadCompleted {
-		return "", fmt.Errorf("failed to download file: retry limit reached")
-	}
-
-	if coverURL != "" {
-		var coverErr error
-		coverPath, coverErr = s.downloadCoverImageContext(ctx, coverURL, outputDir, embedMaxQualityCover)
-		if coverErr != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return "", ctxErr
-			}
-			fmt.Printf("Warning: Failed to download cover image: %v\n", coverErr)
-			coverPath = ""
-		}
-	}
-
-	var result taggingMetadataResult
-	select {
-	case result = <-metaChan:
-	case <-ctx.Done():
-		return "", ctx.Err()
-	}
-	isrc := strings.TrimSpace(result.ISRC)
-	resolvedReleaseDate := strings.TrimSpace(releaseDate)
-	if resolvedReleaseDate == "" {
-		resolvedReleaseDate = strings.TrimSpace(result.ReleaseDate)
-	}
-	resolvedGenre := strings.TrimSpace(result.Genre)
-
-	if isrc != "" {
-		fmt.Printf("Found ISRC: %s\n", isrc)
-	}
-
-	metadata := Metadata{
-		Title:       trackName,
-		Artist:      artistName,
-		Album:       albumName,
-		AlbumArtist: albumArtist,
-		Date:        resolvedReleaseDate,
-		TrackNumber: actualTrackNumber,
-		TotalTracks: totalTracks,
-		DiscNumber:  discNumber,
-		TotalDiscs:  totalDiscs,
-		URL:         fmt.Sprintf("https://open.spotify.com/track/%s", trackID),
-		Copyright:   copyright,
-		Publisher:   publisher,
-		Description: "https://github.com/afkarxyz/SpotiDownloader",
-		ISRC:        isrc,
-		Genre:       resolvedGenre,
-	}
-
-	if err := EmbedMetadataContext(ctx, outputPath, metadata, coverPath); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return "", ctxErr
-		}
-		fmt.Printf("Warning: Failed to embed metadata: %v\n", err)
-	}
-
-	if finalizeErr := finalizeTaggedAudioFileForDownload(outputPath); finalizeErr != nil {
-		fmt.Printf("Warning: Failed to finalize MP3 tag temp file: %v\n", finalizeErr)
-	} else {
-		outputCommitted = true
-	}
-
-	if coverPath != "" {
-		os.Remove(coverPath)
-	}
-
-	return outputPath, nil
-}
-
-func (s *SpotiDownloader) downloadCoverImage(coverURL, outputDir string, embedMaxQualityCover bool) (string, error) {
-	return s.downloadCoverImageContext(context.Background(), coverURL, outputDir, embedMaxQualityCover)
-}
-
-func (s *SpotiDownloader) downloadCoverImageContext(ctx context.Context, coverURL, outputDir string, embedMaxQualityCover bool) (coverPath string, err error) {
-	_ = outputDir
-	paths, pathErr := CurrentRuntimePaths()
-	if pathErr != nil {
-		return "", pathErr
-	}
-	return s.downloadCoverImageContextToDir(ctx, coverURL, paths.RunTempDir, embedMaxQualityCover, "")
-}
-
-// downloadCoverImageContextToDir stages artwork in outputDir. The pipeline
-// passes its per-item runtime directory here so a cover can never leak into a
-// process-wide or user-profile temp directory.
-func (s *SpotiDownloader) downloadCoverImageContextToDir(ctx context.Context, coverURL, outputDir string, embedMaxQualityCover bool, _ string) (coverPath string, err error) {
+// downloadCover stages artwork in outputDir. Callers pass a runtime temp
+// directory so a cover never leaks into the music folder.
+func (s *SpotiDownloader) downloadCover(ctx context.Context, coverURL, outputDir string, embedMaxQualityCover bool) (coverPath string, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}

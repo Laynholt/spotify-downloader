@@ -236,19 +236,6 @@ func (pw *ProgressWriter) GetTotal() int64 {
 	return pw.total
 }
 
-// GetCurrentItemID is retained for old bindings. It derives the first active
-// item from the queue snapshot and does not maintain process-global item state.
-func GetCurrentItemID() string {
-	downloadQueueLock.RLock()
-	defer downloadQueueLock.RUnlock()
-	for _, item := range downloadQueue {
-		if item.Status == StatusDownloading {
-			return item.ID
-		}
-	}
-	return ""
-}
-
 func AddQueueItem(queueID, id, trackName, artistName, albumName, spotifyID string) error {
 	downloadQueueLock.Lock()
 	if strings.TrimSpace(id) == "" {
@@ -332,29 +319,6 @@ func UpdateItemTransfer(id string, downloaded, total int64, speedMBps float64) {
 		downloadQueue[i].Progress = float64(downloaded) / float64(bytesPerMegabyte)
 		downloadQueue[i].TotalSize = float64(total) / float64(bytesPerMegabyte)
 		downloadQueue[i].Speed = speedMBps
-		return
-	}
-}
-
-// UpdateItemProgress is the pre-item-bytes compatibility API. New callers
-// should use UpdateItemTransfer so totals remain lossless.
-func UpdateItemProgress(id string, progress, speed float64) {
-	if progress < 0 {
-		progress = 0
-	}
-	downloaded := int64(progress * float64(bytesPerMegabyte))
-	downloadQueueLock.Lock()
-	defer downloadQueueLock.Unlock()
-	for i := range downloadQueue {
-		if downloadQueue[i].ID != id {
-			continue
-		}
-		if isTerminalStatus(downloadQueue[i].Status) {
-			return
-		}
-		downloadQueue[i].DownloadedBytes = downloaded
-		downloadQueue[i].Progress = progress
-		downloadQueue[i].Speed = speed
 		return
 	}
 }

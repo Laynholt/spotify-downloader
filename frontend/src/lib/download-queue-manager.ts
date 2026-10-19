@@ -65,6 +65,10 @@ export interface EnqueueDecision {
 
 export interface DynamicDownloadScheduler<TPayload, TResult> {
     enqueue(candidate: DownloadJobCandidate<TPayload>, policy: EnqueuePolicy): EnqueueDecision;
+    enqueueMany(candidates: DownloadJobCandidate<TPayload>[], policy: EnqueuePolicy): EnqueueDecision[];
+    waitForIdle(): Promise<void>;
+    clearCompleted(): void;
+    reset(): void;
     setBackendItemId(jobId: string, backendItemId: string): void;
     cancelQueue(queueId: string): Promise<number>;
     getSnapshot(): DownloadSchedulerSnapshot<TPayload, TResult>;
@@ -119,6 +123,8 @@ export function createDynamicDownloadScheduler<TPayload, TResult>(
     const listeners = new Set<() => void>();
     const usedJobIds = new Set<string>();
     const attemptsByKey = new Map<string, number>();
+    const latestByKey = new Map<string, MutableDownloadJob<TPayload, TResult>>();
+    const executions = new Set<Promise<void>>();
     let rotationCursor = 0;
     let activeCount = 0;
     let peakActive = 0;
@@ -247,7 +253,7 @@ export function createDynamicDownloadScheduler<TPayload, TResult>(
             catch (reason) {
                 execution = Promise.reject(reason);
             }
-            Promise.resolve(execution).then(
+            const completion = Promise.resolve(execution).then(
                 result => {
                     if (job.settled) {
                         return;
@@ -285,21 +291,20 @@ export function createDynamicDownloadScheduler<TPayload, TResult>(
                     pump();
                 },
             );
+            executions.add(completion);
+            void completion.then(() => executions.delete(completion));
         }
     };
 
-    const enqueue = (candidate: DownloadJobCandidate<TPayload>, policy: EnqueuePolicy): EnqueueDecision => {
+    const addJob = (candidate: DownloadJobCandidate<TPayload>, policy: EnqueuePolicy): EnqueueDecision => {
         if (disposed) {
             throw new Error("scheduler has been disposed");
         }
         const queue = queueFor(candidate);
-        const matchingJobs = queue.jobs.filter(job =>
-            job.trackKey === candidate.trackKey,
-        );
-        if (policy === "unseen-only" && matchingJobs.length > 0) {
+        const latest = latestByKey.get(matchingKey(candidate));
+        if (policy === "unseen-only" && latest) {
             return { added: false, reason: "already-represented" };
         }
-        const latest = matchingJobs[matchingJobs.length - 1];
         if (policy === "retry-terminal" && latest && !isTerminal(latest.status)) {
             return { added: false, reason: "already-in-flight" };
         }
@@ -314,17 +319,41 @@ export function createDynamicDownloadScheduler<TPayload, TResult>(
             ...candidate,
             id: jobId,
             status: unavailable ? "unavailable" : "queued",
-            force: policy === "retry-terminal" && matchingJobs.length > 0,
+            force: policy === "retry-terminal" && latest !== undefined,
             enqueuedAt: timestamp,
             ...(unavailable ? { error: candidate.unavailableReason, finishedAt: timestamp } : {}),
             settled: unavailable,
         };
         queue.jobs.push(job);
-        publish();
-        if (!job.settled) {
+        latestByKey.set(matchingKey(candidate), job);
+        return { added: true, jobId };
+    };
+
+    const enqueueMany = (candidates: DownloadJobCandidate<TPayload>[], policy: EnqueuePolicy): EnqueueDecision[] => {
+        const decisions = candidates.map(candidate => addJob(candidate, policy));
+        if (decisions.some(decision => decision.added)) {
+            publish();
             pump();
         }
-        return { added: true, jobId };
+        return decisions;
+    };
+    const enqueue = (candidate: DownloadJobCandidate<TPayload>, policy: EnqueuePolicy): EnqueueDecision =>
+        enqueueMany([candidate], policy)[0]!;
+
+    const clearCompleted = (): void => {
+        for (const queue of queues.values()) queue.jobs = queue.jobs.filter(job => !isTerminal(job.status));
+        publish();
+    };
+    const reset = (): void => {
+        if (activeCount > 0) throw new Error("Stop active downloads before starting a new session");
+        queues.clear();
+        queueOrder.length = 0;
+        latestByKey.clear();
+        usedJobIds.clear();
+        attemptsByKey.clear();
+        rotationCursor = 0;
+        peakActive = 0;
+        publish();
     };
 
     const setBackendItemId = (jobId: string, backendItemId: string): void => {
@@ -410,5 +439,6 @@ export function createDynamicDownloadScheduler<TPayload, TResult>(
         listeners.clear();
     };
 
-    return { enqueue, setBackendItemId, cancelQueue, getSnapshot, subscribe, dispose };
+    return { enqueue, enqueueMany, waitForIdle: async () => { await Promise.all(executions); }, clearCompleted, reset,
+        setBackendItemId, cancelQueue, getSnapshot, subscribe, dispose };
 }

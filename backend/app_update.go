@@ -33,6 +33,7 @@ type AppUpdateStatus struct {
 	AssetURL       string `json:"asset_url,omitempty"`
 	Platform       string `json:"platform"`
 	Error          string `json:"error,omitempty"`
+	assetSize      int64
 }
 
 type AppUpdateResult struct {
@@ -69,6 +70,7 @@ func CheckAppUpdate(currentVersion string) (AppUpdateStatus, error) {
 	}
 	status.AssetName = asset.Name
 	status.AssetURL = asset.BrowserDownloadURL
+	status.assetSize = asset.Size
 	return status, nil
 }
 
@@ -89,7 +91,7 @@ func DownloadAppUpdate(currentVersion string, progressCallback func(int)) (AppUp
 	if runtime.GOOS == "darwin" {
 		downloadPath = filepath.Join(filepath.Dir(targetPath), status.AssetName)
 	}
-	if err := downloadUpdateAsset(status.AssetURL, downloadPath, progressCallback); err != nil {
+	if err := downloadUpdateAsset(status.AssetURL, status.assetSize, downloadPath, progressCallback); err != nil {
 		return AppUpdateResult{Error: err.Error()}, err
 	}
 	scriptPath, err := scheduleAppUpdateScript(downloadPath, targetPath)
@@ -224,7 +226,9 @@ func fetchLatestAppRelease() (appRelease, error) {
 	return release, nil
 }
 
-func downloadUpdateAsset(assetURL, downloadPath string, progressCallback func(int)) error {
+// expectedSize is the size GitHub lists for the asset (0 = unknown); a
+// truncated download must never replace the running application.
+func downloadUpdateAsset(assetURL string, expectedSize int64, downloadPath string, progressCallback func(int)) error {
 	if err := validateGitHubReleaseDownloadURL(assetURL); err != nil {
 		return err
 	}
@@ -270,6 +274,9 @@ func downloadUpdateAsset(assetURL, downloadPath string, progressCallback func(in
 	}
 	if err := out.Close(); err != nil {
 		return err
+	}
+	if expectedSize > 0 && downloaded != expectedSize {
+		return fmt.Errorf("update download is incomplete: got %d of %d bytes", downloaded, expectedSize)
 	}
 	if progressCallback != nil {
 		progressCallback(100)
@@ -399,9 +406,20 @@ if [ -z "$NEW_APP" ]; then
   hdiutil detach "$MOUNT" -quiet
   exit 1
 fi
-rm -rf "$APP"
-ditto "$NEW_APP" "$APP"
+# Copy beside the old app first so a failed copy leaves it untouched.
+rm -rf "$APP.new" "$APP.old"
+if ! ditto "$NEW_APP" "$APP.new"; then
+  rm -rf "$APP.new"
+  hdiutil detach "$MOUNT" -quiet
+  exit 1
+fi
 hdiutil detach "$MOUNT" -quiet
+if ! mv "$APP" "$APP.old" || ! mv "$APP.new" "$APP"; then
+  [ -d "$APP" ] || mv "$APP.old" "$APP"
+  rm -rf "$APP.new"
+  exit 1
+fi
+rm -rf "$APP.old"
 rmdir "$MOUNT" 2>/dev/null || true
 open "$APP"
 rm -f "$DMG"

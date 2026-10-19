@@ -121,6 +121,8 @@ func (a *App) GetDownloadQueue() backend.DownloadQueueInfo {
 }
 
 func (a *App) ClearAllDownloads() {
+	a.CancelActiveDownloads()
+	a.activeWG.Wait()
 	backend.ClearAllDownloads()
 }
 

@@ -54,62 +54,46 @@ type TrackPipelineResult struct {
 	Timings         PipelineTimings
 }
 
-// trackPipelineDeps is deliberately unexported: production callers use the
-// real context-aware helpers, while backend tests can replace individual
-// operations with deterministic fakes. Fields are any so focused tests can use
-// either the full production signature or a smaller function shape; the call
-// adapters below accept both without widening the public API.
+// trackPipelineDeps holds every side effect of RunTrackPipeline so backend
+// tests can replace them (see installPipelineDepsForTest).
 type trackPipelineDeps struct {
-	resolveTarget          any
-	resolveDownloadTarget  any
-	resolve                any
-	downloadAudio          any
-	audioDownload          any
-	download               any
-	convertAudio           any
-	convert                any
-	convertDownloadedAudio any
-	downloadCover          any
-	cover                  any
-	metadata               any
-	fetchMetadata          any
-	taggingMetadata        any
-	fetchTaggingMetadata   any
-	lyrics                 any
-	fetchLyrics            any
-	probeDuration          any
-	duration               any
-	durationProbe          any
-	finalizeMedia          any
-	finalizer              any
-	finalize               any
-	publish                any
-	now                    any
-	clock                  any
-	newTimer               any
-	withTimeout            any
-	withDeadline           any
+	resolveTarget func(ctx context.Context, s *SpotiDownloader, req TrackPipelineRequest) (url, ext string, err error)
+	downloadAudio func(ctx context.Context, s *SpotiDownloader, url, base, ext, itemID string) (string, error)
+	convertAudio  func(ctx context.Context, path, base, format string) (string, error)
+	downloadCover func(ctx context.Context, s *SpotiDownloader, url, dir string, maxQuality bool) (string, error)
+	metadata      func(ctx context.Context, cache *MetadataCache, req TaggingMetadataRequest) (taggingMetadataResult, []string, map[string]CacheOutcome)
+	lyrics        func(ctx context.Context, req TrackPipelineRequest, expectedDurationMS int) (string, error)
+	probeDuration func(ctx context.Context, path string) (float64, error)
+	finalizeMedia func(ctx context.Context, path string, metadata Metadata, coverPath string) error
+	publish       func(ctx context.Context, src, dst string) error
+	now           func() time.Time
+	newTimer      func(time.Duration) (<-chan time.Time, func() bool)
+	withTimeout   func(context.Context, time.Duration) (context.Context, context.CancelFunc)
+	withDeadline  func(context.Context, time.Time) (context.Context, context.CancelFunc)
 }
 
-// pipelineDeps is the test seam used by the backend package tests. Keep the
-// default value separate so a test may overlay only one branch.
-var (
-	pipelineDeps              trackPipelineDeps
-	trackPipelineDepsForTest  trackPipelineDeps
-	trackPipelineDependencies trackPipelineDeps
-	defaultTrackPipelineDeps  = trackPipelineDeps{
-		resolveTarget: trackPipelineResolveTarget,
-		downloadAudio: trackPipelineDownloadAudio,
-		convertAudio:  trackPipelineConvertAudio,
-		downloadCover: trackPipelineDownloadCover,
-		metadata:      trackPipelineMetadataWithOutcomes,
-		lyrics:        trackPipelineLyrics,
-		probeDuration: trackPipelineProbeDuration,
-		finalizeMedia: trackPipelineFinalizeMedia,
-		publish:       publishTrackPipelineFile,
-		now:           time.Now,
-	}
-)
+var pipelineDeps = trackPipelineDeps{
+	resolveTarget: trackPipelineResolveTarget,
+	downloadAudio: func(ctx context.Context, s *SpotiDownloader, url, base, ext, itemID string) (string, error) {
+		return s.downloadAudio(ctx, url, base, ext, itemID)
+	},
+	convertAudio: convertDownloadedAudioContext,
+	downloadCover: func(ctx context.Context, s *SpotiDownloader, url, dir string, maxQuality bool) (string, error) {
+		return s.downloadCover(ctx, url, dir, maxQuality)
+	},
+	metadata:      fetchTaggingMetadataWithOutcomes,
+	lyrics:        trackPipelineLyrics,
+	probeDuration: GetAudioDurationContext,
+	finalizeMedia: FinalizeMedia,
+	publish:       publishTrackPipelineFile,
+	now:           time.Now,
+	newTimer: func(d time.Duration) (<-chan time.Time, func() bool) {
+		timer := time.NewTimer(d)
+		return timer.C, timer.Stop
+	},
+	withTimeout:  context.WithTimeout,
+	withDeadline: context.WithDeadline,
+}
 
 type trackPipelineAudioResult struct {
 	path         string
@@ -126,7 +110,6 @@ type trackPipelineCoverResult struct {
 
 type trackPipelineMetadataResult struct {
 	tagging       taggingMetadataResult
-	metadata      Metadata
 	warnings      []string
 	cacheOutcomes map[string]CacheOutcome
 	elapsed       int64
@@ -140,11 +123,6 @@ type trackPipelineLyricsResult struct {
 	completedAt time.Time
 }
 
-type trackPipelineTimer struct {
-	C    <-chan time.Time
-	Stop func() bool
-}
-
 func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelineRequest) (result TrackPipelineResult, err error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -153,8 +131,8 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 		return result, err
 	}
 
-	deps := trackPipelineCurrentDeps(s)
-	now := trackPipelineNow(deps)
+	deps := pipelineDeps
+	now := deps.now
 	pipelineStarted := now()
 	warnings := make([]string, 0, 6)
 	cacheOutcomes := make(map[string]CacheOutcome)
@@ -169,7 +147,7 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 		s = NewSpotiDownloader("")
 	}
 	itemID := sanitizeTrackPipelineID(req.ItemID)
-	if itemID != "" {
+	if req.ItemID != "" {
 		StartDownloadItem(req.ItemID)
 		UpdateItemPhase(req.ItemID, PhasePreparing, "resolving download target")
 	}
@@ -214,14 +192,14 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 		return trackPipelineFailure(&result, req, err, warnings)
 	}
 	lyricsDeadline := pipelineStarted.Add(trackPipelineLyricsBudget)
-	downloadURL, fallbackExt, resolveErr := trackPipelineResolveTargetCall(deps, ctx, s, req)
+	downloadURL, fallbackExt, resolveErr := deps.resolveTarget(ctx, s, req)
 	if resolveErr != nil {
 		return trackPipelineFailure(&result, req, fmt.Errorf("failed to get download link: %w", resolveErr), warnings)
 	}
 	if strings.TrimSpace(downloadURL) == "" {
 		return trackPipelineFailure(&result, req, errors.New("no download link available"), warnings)
 	}
-	if itemID != "" {
+	if req.ItemID != "" {
 		UpdateItemPhase(req.ItemID, PhaseDownloading, "audio and optional branches running")
 	}
 	result.Timings.PreparationMS = trackPipelineElapsedMS(now, pipelineStarted)
@@ -261,11 +239,11 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 	coverStartedAt := now()
 	metadataStartedAt := now()
 	lyricsStartedAt := now()
-	coverCtx, cancelCover := trackPipelineWithTimeout(deps, branchCtx, trackPipelineBranchBudget)
+	coverCtx, cancelCover := deps.withTimeout(branchCtx, trackPipelineBranchBudget)
 	defer cancelCover()
-	metadataCtx, cancelMetadata := trackPipelineWithTimeout(deps, branchCtx, trackPipelineBranchBudget)
+	metadataCtx, cancelMetadata := deps.withTimeout(branchCtx, trackPipelineBranchBudget)
 	defer cancelMetadata()
-	lyricsCtx, cancelLyrics := trackPipelineWithDeadline(deps, branchCtx, lyricsDeadline)
+	lyricsCtx, cancelLyrics := deps.withDeadline(branchCtx, lyricsDeadline)
 	defer cancelLyrics()
 
 	audioBasePath := filepath.Join(trackDir, filenameBase)
@@ -273,17 +251,17 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 	go func() {
 		defer branchWG.Done()
 		started := now()
-		path, audioErr := trackPipelineDownloadAudioCall(deps, branchCtx, s, downloadURL, audioBasePath, fallbackExt, req.ItemID)
+		path, audioErr := deps.downloadAudio(branchCtx, s, downloadURL, audioBasePath, fallbackExt, req.ItemID)
 		downloadMS := trackPipelineElapsedMS(now, started)
 		if audioErr != nil {
 			audioCh <- trackPipelineAudioResult{err: audioErr, downloadMS: downloadMS}
 			return
 		}
-		if itemID != "" {
+		if req.ItemID != "" {
 			UpdateItemPhase(req.ItemID, PhaseConverting, "audio conversion")
 		}
 		conversionStarted := now()
-		converted, conversionErr := trackPipelineConvertAudioCall(deps, branchCtx, path, audioBasePath, req.AudioFormat)
+		converted, conversionErr := deps.convertAudio(branchCtx, path, audioBasePath, req.AudioFormat)
 		audioCh <- trackPipelineAudioResult{path: converted, downloadMS: downloadMS, conversionMS: trackPipelineElapsedMS(now, conversionStarted), err: conversionErr}
 	}()
 
@@ -291,7 +269,7 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 		branchWG.Add(1)
 		go func() {
 			defer branchWG.Done()
-			path, coverErr := trackPipelineDownloadCoverCall(deps, coverCtx, s, req.CoverURL, trackDir, req.EmbedMaxQualityCover)
+			path, coverErr := deps.downloadCover(coverCtx, s, req.CoverURL, trackDir, req.EmbedMaxQualityCover)
 			coverCh <- trackPipelineCoverResult{path: path, err: coverErr, elapsed: trackPipelineElapsedBetween(coverStartedAt, now())}
 		}()
 	} else {
@@ -303,9 +281,13 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 		branchWG.Add(1)
 		go func() {
 			defer branchWG.Done()
-			metadata := trackPipelineMetadataCall(deps, metadataCtx, s, req)
-			metadata.elapsed = trackPipelineElapsedBetween(metadataStartedAt, now())
-			metadataCh <- metadata
+			tagging, metadataWarnings, outcomes := deps.metadata(metadataCtx, s.metadataCache, TaggingMetadataRequest{
+				TrackID: req.TrackID, TrackName: req.BaseMetadata.Title, ArtistName: req.BaseMetadata.Artist,
+				AlbumName: req.BaseMetadata.Album, ReleaseDate: req.BaseMetadata.Date,
+				UseSingleGenre: req.UseSingleGenre, EmbedGenre: req.EmbedGenre,
+			})
+			metadataCh <- trackPipelineMetadataResult{tagging: tagging, warnings: metadataWarnings, cacheOutcomes: outcomes,
+				elapsed: trackPipelineElapsedBetween(metadataStartedAt, now())}
 		}()
 	} else {
 		metadataCh <- trackPipelineMetadataResult{}
@@ -316,10 +298,10 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 		branchWG.Add(1)
 		go func() {
 			defer branchWG.Done()
-			lyrics := trackPipelineLyricsCall(deps, lyricsCtx, req)
-			lyrics.completedAt = now()
-			lyrics.elapsed = trackPipelineElapsedBetween(lyricsStartedAt, lyrics.completedAt)
-			lyricsCh <- lyrics
+			lyrics, lyricsErr := deps.lyrics(lyricsCtx, req, req.ExpectedDurationMS)
+			completedAt := now()
+			lyricsCh <- trackPipelineLyricsResult{lyrics: lyrics, err: lyricsErr, completedAt: completedAt,
+				elapsed: trackPipelineElapsedBetween(lyricsStartedAt, completedAt)}
 		}()
 	} else {
 		if req.EmbedLyrics {
@@ -351,9 +333,17 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 	}
 
 	probeStarted := now()
-	duration, durationErr := trackPipelineProbeDurationCall(deps, branchCtx, audioOutcome.path)
+	duration, durationErr := deps.probeDuration(branchCtx, audioOutcome.path)
 	result.Timings.DurationProbeMS = trackPipelineElapsedMS(now, probeStarted)
 	if durationErr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return trackPipelineFailure(&result, req, ctxErr, warnings)
+		}
+		// A file FFprobe cannot read is not audio (empty body, HTML error page);
+		// publishing it would make every later run skip it as "already exists".
+		if !errors.Is(durationErr, ErrFFmpegUnavailable) {
+			return trackPipelineFailure(&result, req, fmt.Errorf("downloaded file is not readable audio: %w", durationErr), warnings)
+		}
 		warnings = append(warnings, fmt.Sprintf("duration probe failed: %v", durationErr))
 		duration = 0
 	}
@@ -363,16 +353,7 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 	if lyricsStarted {
 		remaining := lyricsDeadline.Sub(now())
 		if remaining > 0 {
-			timer := trackPipelineNewTimer(deps, remaining)
-			stopTimer := func() {
-				if timer.Stop == nil || timer.Stop() || timer.C == nil {
-					return
-				}
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
+			timerC, stopTimer := deps.newTimer(remaining)
 			select {
 			case candidate := <-lyricsCh:
 				stopTimer()
@@ -383,7 +364,7 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 					result.Timings.LyricsMS = candidate.elapsed
 					lyricsOutcome = trackPipelineLyricsResult{}
 				}
-			case <-timer.C:
+			case <-timerC:
 				cancelLyrics()
 				warnings = append(warnings, "lyrics deadline exceeded; finalized without lyrics")
 				result.Timings.LyricsMS = trackPipelineElapsedMS(now, lyricsStartedAt)
@@ -465,11 +446,11 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 		}
 	}
 
-	if itemID != "" {
+	if req.ItemID != "" {
 		UpdateItemPhase(req.ItemID, PhaseFinalizing, "writing metadata, cover, and lyrics")
 	}
 	finalizeStarted := now()
-	if err = trackPipelineFinalizeMediaCall(deps, branchCtx, audioOutcome.path, metadata, coverOutcome.path); err != nil {
+	if err = deps.finalizeMedia(branchCtx, audioOutcome.path, metadata, coverOutcome.path); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return trackPipelineFailure(&result, req, ctxErr, warnings)
 		}
@@ -478,10 +459,10 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 	result.Timings.FinalizationMS = trackPipelineElapsedMS(now, finalizeStarted)
 
 	finalPath := audioOutputPath(outputBasePath, audioOutcome.path, req.AudioFormat)
-	if itemID != "" {
+	if req.ItemID != "" {
 		UpdateItemPhase(req.ItemID, PhaseFinalizing, "publishing finalized media")
 	}
-	if err = trackPipelinePublishCall(deps, ctx, audioOutcome.path, finalPath); err != nil {
+	if err = deps.publish(ctx, audioOutcome.path, finalPath); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return trackPipelineFailure(&result, req, ctxErr, warnings)
 		}
@@ -507,146 +488,6 @@ func trackPipelineFailure(result *TrackPipelineResult, req TrackPipelineRequest,
 		}
 	}
 	return *result, err
-}
-
-func trackPipelineCurrentDeps(s *SpotiDownloader) trackPipelineDeps {
-	deps := defaultTrackPipelineDeps
-	deps = overlayTrackPipelineDeps(deps, pipelineDeps)
-	deps = overlayTrackPipelineDeps(deps, trackPipelineDepsForTest)
-	deps = overlayTrackPipelineDeps(deps, trackPipelineDependencies)
-	if s != nil {
-		deps = overlayTrackPipelineDeps(deps, s.pipelineDeps)
-		deps = overlayTrackPipelineDeps(deps, s.trackPipelineDeps)
-		deps = overlayTrackPipelineDeps(deps, s.trackDeps)
-	}
-	return deps
-}
-
-func overlayTrackPipelineDeps(dst, src trackPipelineDeps) trackPipelineDeps {
-	if src.resolveTarget != nil {
-		dst.resolveTarget = src.resolveTarget
-	}
-	if src.resolveDownloadTarget != nil {
-		dst.resolveDownloadTarget = src.resolveDownloadTarget
-	}
-	if src.resolve != nil {
-		dst.resolveTarget = src.resolve
-	}
-	if src.downloadAudio != nil {
-		dst.downloadAudio = src.downloadAudio
-	}
-	if src.audioDownload != nil {
-		dst.downloadAudio = src.audioDownload
-	}
-	if src.download != nil {
-		dst.downloadAudio = src.download
-	}
-	if src.convertAudio != nil {
-		dst.convertAudio = src.convertAudio
-	}
-	if src.convert != nil {
-		dst.convertAudio = src.convert
-	}
-	if src.convertDownloadedAudio != nil {
-		dst.convertAudio = src.convertDownloadedAudio
-	}
-	if src.downloadCover != nil {
-		dst.downloadCover = src.downloadCover
-	}
-	if src.cover != nil {
-		dst.downloadCover = src.cover
-	}
-	if src.metadata != nil {
-		dst.metadata = src.metadata
-	}
-	if src.fetchMetadata != nil {
-		dst.metadata = src.fetchMetadata
-	}
-	if src.taggingMetadata != nil {
-		dst.metadata = src.taggingMetadata
-	}
-	if src.fetchTaggingMetadata != nil {
-		dst.metadata = src.fetchTaggingMetadata
-	}
-	if src.lyrics != nil {
-		dst.lyrics = src.lyrics
-	}
-	if src.fetchLyrics != nil {
-		dst.lyrics = src.fetchLyrics
-	}
-	if src.probeDuration != nil {
-		dst.probeDuration = src.probeDuration
-	}
-	if src.duration != nil {
-		dst.probeDuration = src.duration
-	}
-	if src.durationProbe != nil {
-		dst.probeDuration = src.durationProbe
-	}
-	if src.finalizeMedia != nil {
-		dst.finalizeMedia = src.finalizeMedia
-	}
-	if src.finalizer != nil {
-		dst.finalizeMedia = src.finalizer
-	}
-	if src.finalize != nil {
-		dst.finalizeMedia = src.finalize
-	}
-	if src.publish != nil {
-		dst.publish = src.publish
-	}
-	if src.now != nil {
-		dst.now = src.now
-	}
-	if src.clock != nil {
-		dst.now = src.clock
-	}
-	if src.newTimer != nil {
-		dst.newTimer = src.newTimer
-	}
-	if src.withTimeout != nil {
-		dst.withTimeout = src.withTimeout
-	}
-	if src.withDeadline != nil {
-		dst.withDeadline = src.withDeadline
-	}
-	return dst
-}
-
-func trackPipelineNow(deps trackPipelineDeps) func() time.Time {
-	switch value := deps.now.(type) {
-	case func() time.Time:
-		return value
-	default:
-		return time.Now
-	}
-}
-
-func trackPipelineNewTimer(deps trackPipelineDeps, duration time.Duration) trackPipelineTimer {
-	switch f := deps.newTimer.(type) {
-	case func(time.Duration) <-chan time.Time:
-		return trackPipelineTimer{C: f(duration)}
-	case func(time.Duration) *time.Timer:
-		timer := f(duration)
-		return trackPipelineTimer{C: timer.C, Stop: timer.Stop}
-	default:
-		timer := time.NewTimer(duration)
-		return trackPipelineTimer{C: timer.C, Stop: timer.Stop}
-	}
-}
-
-func trackPipelineWithTimeout(deps trackPipelineDeps, parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
-	if f, ok := deps.withTimeout.(func(context.Context, time.Duration) (context.Context, context.CancelFunc)); ok {
-		return f(parent, timeout)
-	}
-	return context.WithTimeout(parent, timeout)
-}
-
-func trackPipelineWithDeadline(deps trackPipelineDeps, parent context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
-	if f, ok := deps.withDeadline.(func(context.Context, time.Time) (context.Context, context.CancelFunc)); ok {
-		return f(parent, deadline)
-	}
-	return context.WithDeadline(parent, deadline)
 }
 
 func trackPipelineElapsedMS(now func() time.Time, started time.Time) int64 {
@@ -689,20 +530,10 @@ func audioOutputPath(outputBasePath, stagedPath, audioFormat string) string {
 	return outputBasePath + ext
 }
 
+// mergeTrackPipelineMetadata fills tags the request left empty from the
+// tagging lookup.
 func mergeTrackPipelineMetadata(base Metadata, optional trackPipelineMetadataResult) Metadata {
 	metadata := base
-	if strings.TrimSpace(optional.metadata.Title) != "" {
-		metadata.Title = optional.metadata.Title
-	}
-	if strings.TrimSpace(optional.metadata.Artist) != "" {
-		metadata.Artist = optional.metadata.Artist
-	}
-	if strings.TrimSpace(optional.metadata.Album) != "" {
-		metadata.Album = optional.metadata.Album
-	}
-	if strings.TrimSpace(optional.metadata.AlbumArtist) != "" {
-		metadata.AlbumArtist = optional.metadata.AlbumArtist
-	}
 	tagging := optional.tagging
 	if strings.TrimSpace(metadata.Date) == "" {
 		metadata.Date = strings.TrimSpace(tagging.ReleaseDate)
@@ -716,20 +547,11 @@ func mergeTrackPipelineMetadata(base Metadata, optional trackPipelineMetadataRes
 	if strings.TrimSpace(metadata.Genre) == "" {
 		metadata.Genre = strings.TrimSpace(tagging.Genre)
 	}
-	if strings.TrimSpace(optional.metadata.Date) != "" {
-		metadata.Date = optional.metadata.Date
-	}
-	if strings.TrimSpace(optional.metadata.ISRC) != "" {
-		metadata.ISRC = optional.metadata.ISRC
-	}
-	if strings.TrimSpace(optional.metadata.Genre) != "" {
-		metadata.Genre = optional.metadata.Genre
-	}
 	return metadata
 }
 
 func trackPipelineResolveTarget(ctx context.Context, s *SpotiDownloader, req TrackPipelineRequest) (string, string, error) {
-	resp, err := s.getDownloadLinkContextWithRetry(ctx, req.TrackID)
+	resp, err := s.getDownloadLink(ctx, req.TrackID)
 	if err != nil {
 		return "", "", err
 	}
@@ -742,27 +564,6 @@ func trackPipelineResolveTarget(ctx context.Context, s *SpotiDownloader, req Tra
 	return resp.Link, ".mp3", nil
 }
 
-func trackPipelineDownloadAudio(ctx context.Context, s *SpotiDownloader, url, base, ext, itemID string) (string, error) {
-	return s.downloadFileContextWithItemIDRetry(ctx, url, base, ext, itemID)
-}
-
-func trackPipelineConvertAudio(ctx context.Context, path, base, format string) (string, error) {
-	return convertDownloadedAudioContext(ctx, path, base, format)
-}
-
-func trackPipelineDownloadCover(ctx context.Context, s *SpotiDownloader, url, dir string, maxQuality bool) (string, error) {
-	return s.downloadCoverImageContextToDir(ctx, url, dir, maxQuality, "")
-}
-
-func trackPipelineMetadata(ctx context.Context, cache *MetadataCache, req TaggingMetadataRequest) (taggingMetadataResult, []string) {
-	result, warnings := fetchTaggingMetadata(ctx, cache, req)
-	return result, warnings
-}
-
-func trackPipelineMetadataWithOutcomes(ctx context.Context, cache *MetadataCache, req TaggingMetadataRequest) (taggingMetadataResult, []string, map[string]CacheOutcome) {
-	return fetchTaggingMetadataWithOutcomes(ctx, cache, req)
-}
-
 func trackPipelineLyrics(ctx context.Context, req TrackPipelineRequest, _ int) (string, error) {
 	client := NewLyricsClient()
 	duration := req.ExpectedDurationMS / 1000
@@ -771,235 +572,6 @@ func trackPipelineLyrics(ctx context.Context, req TrackPipelineRequest, _ int) (
 		return "", err
 	}
 	return client.ConvertToLRC(resp, req.BaseMetadata.Title, req.BaseMetadata.Artist), nil
-}
-
-func trackPipelineProbeDuration(ctx context.Context, path string) (float64, error) {
-	return GetAudioDurationContext(ctx, path)
-}
-
-func trackPipelineFinalizeMedia(ctx context.Context, path string, metadata Metadata, cover string) error {
-	return FinalizeMedia(ctx, path, metadata, cover)
-}
-
-func trackPipelineResolveTargetCall(deps trackPipelineDeps, ctx context.Context, s *SpotiDownloader, req TrackPipelineRequest) (string, string, error) {
-	fn := deps.resolveTarget
-	if fn == nil {
-		fn = deps.resolveDownloadTarget
-	}
-	switch f := fn.(type) {
-	case func(context.Context, *SpotiDownloader, TrackPipelineRequest) (string, string, error):
-		return f(ctx, s, req)
-	case func(context.Context, TrackPipelineRequest) (string, string, error):
-		return f(ctx, req)
-	case func(context.Context, *SpotiDownloader, TrackPipelineRequest) (string, error):
-		url, err := f(ctx, s, req)
-		return url, preferredAudioExtension(req.AudioFormat), err
-	case func(context.Context, TrackPipelineRequest) (string, error):
-		url, err := f(ctx, req)
-		return url, preferredAudioExtension(req.AudioFormat), err
-	case func(context.Context, *SpotiDownloader, string) (string, error):
-		url, err := f(ctx, s, req.TrackID)
-		return url, preferredAudioExtension(req.AudioFormat), err
-	case func(context.Context, string) (string, error):
-		url, err := f(ctx, req.TrackID)
-		return url, preferredAudioExtension(req.AudioFormat), err
-	case func(context.Context, *SpotiDownloader, string) (string, string, error):
-		return f(ctx, s, req.TrackID)
-	case func(context.Context, string) (string, string, error):
-		return f(ctx, req.TrackID)
-	case func(TrackPipelineRequest) (string, string, error):
-		return f(req)
-	default:
-		return "", "", errors.New("track pipeline source resolver is unavailable")
-	}
-}
-
-func trackPipelineDownloadAudioCall(deps trackPipelineDeps, ctx context.Context, s *SpotiDownloader, url, base, ext, itemID string) (string, error) {
-	switch f := deps.downloadAudio.(type) {
-	case func(context.Context, *SpotiDownloader, string, string, string, string) error:
-		return base, f(ctx, s, url, base, ext, itemID)
-	case func(context.Context, string, string, string, string) error:
-		return base, f(ctx, url, base, ext, itemID)
-	case func(context.Context, *SpotiDownloader, string, string, string) error:
-		return base, f(ctx, s, url, base, ext)
-	case func(context.Context, string, string, string) error:
-		return base, f(ctx, url, base, ext)
-	case func(context.Context, *SpotiDownloader, string, string, string, string) (string, error):
-		return f(ctx, s, url, base, ext, itemID)
-	case func(context.Context, string, string, string, string) (string, error):
-		return f(ctx, url, base, ext, itemID)
-	case func(context.Context, *SpotiDownloader, string, string, string) (string, error):
-		return f(ctx, s, url, base, ext)
-	case func(context.Context, string, string, string) (string, error):
-		return f(ctx, url, base, ext)
-	case func(context.Context, *SpotiDownloader, string, string) error:
-		return base, f(ctx, s, url, base)
-	case func(context.Context, string, string) error:
-		return base, f(ctx, url, base)
-	case func(context.Context, string) (string, error):
-		return f(ctx, base)
-	default:
-		return "", errors.New("track pipeline audio downloader is unavailable")
-	}
-}
-
-func trackPipelineConvertAudioCall(deps trackPipelineDeps, ctx context.Context, path, base, format string) (string, error) {
-	fn := deps.convertAudio
-	if fn == nil {
-		fn = deps.convert
-	}
-	switch f := fn.(type) {
-	case func(context.Context, string, string, string) (string, error):
-		return f(ctx, path, base, format)
-	case func(string, string, string) (string, error):
-		return f(path, base, format)
-	case func(context.Context, string, string) (string, error):
-		return f(ctx, path, format)
-	case func(context.Context, string) (string, error):
-		return f(ctx, path)
-	default:
-		return "", errors.New("track pipeline audio converter is unavailable")
-	}
-}
-
-func trackPipelineDownloadCoverCall(deps trackPipelineDeps, ctx context.Context, s *SpotiDownloader, url, dir string, maxQuality bool) (string, error) {
-	fn := deps.downloadCover
-	if fn == nil {
-		fn = deps.cover
-	}
-	switch f := fn.(type) {
-	case func(context.Context, *SpotiDownloader, string, string, bool, string) (string, error):
-		return f(ctx, s, url, dir, maxQuality, "")
-	case func(context.Context, *SpotiDownloader, string, string, bool) (string, error):
-		return f(ctx, s, url, dir, maxQuality)
-	case func(context.Context, string, string, bool) (string, error):
-		return f(ctx, url, dir, maxQuality)
-	case func(context.Context, string, string) (string, error):
-		return f(ctx, url, dir)
-	case func(context.Context, string) (string, error):
-		return f(ctx, url)
-	default:
-		return "", errors.New("track pipeline cover downloader is unavailable")
-	}
-}
-
-func trackPipelineMetadataCall(deps trackPipelineDeps, ctx context.Context, s *SpotiDownloader, req TrackPipelineRequest) trackPipelineMetadataResult {
-	fn := deps.metadata
-	if fn == nil {
-		fn = deps.fetchMetadata
-	}
-	if fn == nil {
-		fn = deps.taggingMetadata
-	}
-	tagReq := TaggingMetadataRequest{
-		TrackID: req.TrackID, TrackName: req.BaseMetadata.Title, ArtistName: req.BaseMetadata.Artist,
-		AlbumName: req.BaseMetadata.Album, ReleaseDate: req.BaseMetadata.Date,
-		UseSingleGenre: req.UseSingleGenre, EmbedGenre: req.EmbedGenre,
-	}
-	switch f := fn.(type) {
-	case func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string, map[string]CacheOutcome):
-		tagging, warnings, outcomes := f(ctx, s.metadataCache, tagReq)
-		return trackPipelineMetadataResult{tagging: tagging, warnings: warnings, cacheOutcomes: outcomes}
-	case func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string):
-		tagging, warnings := f(ctx, s.metadataCache, tagReq)
-		return trackPipelineMetadataResult{tagging: tagging, warnings: warnings}
-	case func(context.Context, TaggingMetadataRequest) (taggingMetadataResult, []string):
-		tagging, warnings := f(ctx, tagReq)
-		return trackPipelineMetadataResult{tagging: tagging, warnings: warnings}
-	case func(context.Context, TrackPipelineRequest) (taggingMetadataResult, []string):
-		tagging, warnings := f(ctx, req)
-		return trackPipelineMetadataResult{tagging: tagging, warnings: warnings}
-	case func(context.Context, *SpotiDownloader, TrackPipelineRequest) (taggingMetadataResult, []string):
-		tagging, warnings := f(ctx, s, req)
-		return trackPipelineMetadataResult{tagging: tagging, warnings: warnings}
-	case func(context.Context, *SpotiDownloader, TrackPipelineRequest) (Metadata, error):
-		metadata, err := f(ctx, s, req)
-		return trackPipelineMetadataResult{metadata: metadata, err: err}
-	case func(context.Context, *SpotiDownloader, TrackPipelineRequest) (Metadata, []string, map[string]CacheOutcome):
-		metadata, warnings, outcomes := f(ctx, s, req)
-		return trackPipelineMetadataResult{metadata: metadata, warnings: warnings, cacheOutcomes: outcomes}
-	case func(context.Context, TrackPipelineRequest) (Metadata, []string, map[string]CacheOutcome):
-		metadata, warnings, outcomes := f(ctx, req)
-		return trackPipelineMetadataResult{metadata: metadata, warnings: warnings, cacheOutcomes: outcomes}
-	case func(context.Context, TrackPipelineRequest) (Metadata, error):
-		metadata, err := f(ctx, req)
-		return trackPipelineMetadataResult{metadata: metadata, err: err}
-	case func(context.Context, TrackPipelineRequest) (taggingMetadataResult, []string, map[string]CacheOutcome):
-		tagging, warnings, outcomes := f(ctx, req)
-		return trackPipelineMetadataResult{tagging: tagging, warnings: warnings, cacheOutcomes: outcomes}
-	default:
-		return trackPipelineMetadataResult{err: errors.New("track pipeline metadata loader is unavailable")}
-	}
-}
-
-func trackPipelineLyricsCall(deps trackPipelineDeps, ctx context.Context, req TrackPipelineRequest) trackPipelineLyricsResult {
-	fn := deps.lyrics
-	if fn == nil {
-		fn = deps.fetchLyrics
-	}
-	if fn == nil {
-		return trackPipelineLyricsResult{err: errors.New("track pipeline lyrics loader is unavailable")}
-	}
-	switch f := fn.(type) {
-	case func(context.Context, TrackPipelineRequest, int) (string, error):
-		return trackPipelineLyricsResultFrom(f(ctx, req, req.ExpectedDurationMS))
-	case func(context.Context, TrackPipelineRequest) (string, error):
-		return trackPipelineLyricsResultFrom(f(ctx, req))
-	case func(context.Context, string, string, string, int) (string, error):
-		return trackPipelineLyricsResultFrom(f(ctx, req.TrackID, req.BaseMetadata.Title, req.BaseMetadata.Artist, req.ExpectedDurationMS/1000))
-	case func(context.Context, string, string, string) (string, error):
-		return trackPipelineLyricsResultFrom(f(ctx, req.TrackID, req.BaseMetadata.Title, req.BaseMetadata.Artist))
-	default:
-		return trackPipelineLyricsResult{err: errors.New("track pipeline lyrics loader has unsupported signature")}
-	}
-}
-
-func trackPipelineLyricsResultFrom(lyrics string, err error) trackPipelineLyricsResult {
-	return trackPipelineLyricsResult{lyrics: lyrics, err: err}
-}
-
-func trackPipelineProbeDurationCall(deps trackPipelineDeps, ctx context.Context, path string) (float64, error) {
-	fn := deps.probeDuration
-	if fn == nil {
-		fn = deps.duration
-	}
-	switch f := fn.(type) {
-	case func(context.Context, string) (float64, error):
-		return f(ctx, path)
-	case func(string) (float64, error):
-		return f(path)
-	default:
-		return 0, errors.New("track pipeline duration probe is unavailable")
-	}
-}
-
-func trackPipelineFinalizeMediaCall(deps trackPipelineDeps, ctx context.Context, path string, metadata Metadata, cover string) error {
-	fn := deps.finalizeMedia
-	if fn == nil {
-		fn = deps.finalizer
-	}
-	switch f := fn.(type) {
-	case func(context.Context, string, Metadata, string) error:
-		return f(ctx, path, metadata, cover)
-	case func(string, Metadata, string) error:
-		return f(path, metadata, cover)
-	case func(context.Context, string, Metadata) error:
-		return f(ctx, path, metadata)
-	default:
-		return errors.New("track pipeline finalizer is unavailable")
-	}
-}
-
-func trackPipelinePublishCall(deps trackPipelineDeps, ctx context.Context, src, dst string) error {
-	if fn := deps.publish; fn != nil {
-		switch f := fn.(type) {
-		case func(context.Context, string, string) error:
-			return f(ctx, src, dst)
-		case func(string, string) error:
-			return f(src, dst)
-		}
-	}
-	return publishTrackPipelineFile(ctx, src, dst)
 }
 
 func publishTrackPipelineFile(ctx context.Context, srcPath, dstPath string) error {

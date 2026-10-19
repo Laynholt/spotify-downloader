@@ -87,6 +87,10 @@ func (a *App) CheckFFmpegInstalled() (bool, error) {
 	return backend.IsFFmpegInstalled()
 }
 
+func (a *App) GetFFmpegStatus() backend.FFmpegStatus {
+	return backend.GetFFmpegStatus()
+}
+
 func (a *App) IsFFprobeInstalled() (bool, error) {
 	return backend.IsFFprobeInstalled()
 }

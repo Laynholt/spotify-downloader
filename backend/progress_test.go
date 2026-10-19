@@ -246,7 +246,6 @@ func TestTerminalItemsIgnoreLateProgressPhaseAndFailure(t *testing.T) {
 				t.Fatal(err)
 			}
 			UpdateItemTransfer(id, 900, 1000, 99)
-			UpdateItemProgress(id, 33, 88)
 			UpdateItemPhase(id, PhaseDownloading, "late phase")
 			AddItemWarning(id, "late warning")
 			FailDownloadItem(id, "late failure")

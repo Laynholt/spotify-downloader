@@ -46,6 +46,12 @@ func main() {
 		BackgroundColour: &options.RGBA{R: 0, G: 0, B: 0, A: 255},
 		OnStartup:        app.startup,
 		OnShutdown:       app.shutdown,
+		// A second instance would fight over history.db, the metadata cache and
+		// the same output files; focus the running window instead.
+		SingleInstanceLock: &options.SingleInstanceLock{
+			UniqueId:               "com.afkarxyz.spotidownloader",
+			OnSecondInstanceLaunch: app.onSecondInstanceLaunch,
+		},
 		DragAndDrop: &options.DragAndDrop{
 			EnableFileDrop:     true,
 			DisableWebViewDrop: false,

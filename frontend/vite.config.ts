@@ -16,4 +16,16 @@ export default defineConfig({
     define: {
         __APP_VERSION__: JSON.stringify(appVersion),
     },
+    build: {
+        rollupOptions: {
+            output: {
+                manualChunks(id) {
+                    if (!id.includes("node_modules")) return;
+                    if (/\/node_modules\/(react|react-dom|scheduler)\//.test(id)) return "react";
+                    if (/\/node_modules\/(motion|motion-dom|motion-utils|framer-motion)\//.test(id)) return "motion";
+                    if (id.includes("/@radix-ui/") || id.includes("/lucide-react/")) return "ui";
+                },
+            },
+        },
+    },
 });

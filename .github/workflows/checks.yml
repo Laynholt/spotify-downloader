@@ -1,0 +1,50 @@
+name: Project checks
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '10.30.2'
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+      - name: Prepare embedded assets for binding generation
+        run: |
+          New-Item -ItemType Directory -Force frontend/dist | Out-Null
+          Set-Content -Path frontend/dist/index.html -Value '<!doctype html>'
+      - name: Generate Wails bindings
+        run: go run github.com/wailsapp/wails/v2/cmd/wails@v2.11.0 generate module
+      - name: Frontend tests
+        working-directory: frontend
+        run: pnpm test
+      - name: Frontend lint
+        working-directory: frontend
+        run: pnpm exec eslint . --max-warnings 0
+      - name: Frontend production build
+        working-directory: frontend
+        run: pnpm run build
+      - name: Go tests
+        run: go test ./... -count=1
+      - name: Go vet
+        run: go vet ./...
+      - name: Windows application build
+        run: go build -tags 'desktop,production' -ldflags '-H windowsgui' -o build/bin/SpotiDownloader.exe .

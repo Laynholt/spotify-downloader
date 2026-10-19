@@ -9,11 +9,7 @@ import (
 // Production break caught: helper binaries and update markers remain in the
 // legacy profile, while history is accidentally moved beside the executable.
 func TestHelperPathsUsePortableBinButHistoryRemainsInUserData(t *testing.T) {
-	paths, _ := ResolveRuntimePaths(filepath.Join(t.TempDir(), "SpotiDownloader.exe"), "test")
-	if err := paths.Prepare(); err != nil {
-		t.Fatal(err)
-	}
-	installRuntimePathsForTest(t, paths)
+	paths := installFakeFFmpegRuntime(t)
 
 	ffmpeg, err := GetFFmpegPath()
 	if err != nil {

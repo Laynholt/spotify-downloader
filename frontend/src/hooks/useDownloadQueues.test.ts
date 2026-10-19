@@ -52,6 +52,52 @@ const playlistA = { id: "playlist:a", title: "Playlist A", kind: "playlist" as c
 const playlistB = { id: "playlist:b", title: "Playlist B", kind: "playlist" as const };
 const args: CollectionDownloadArgs = { settings: {} as Settings };
 
+it("force retry bypasses an existing file and downloads using the retry attempt id", async () => {
+    const downloadTrack = vi.fn(async (): Promise<DownloadResponse> => ({ success: true, message: "Downloaded", file: "replacement.mp3" }));
+    const skipDownloadItem = vi.fn(async () => {});
+    const harness = createDownloadQueueHarness({ api: {
+        addDownloadJob: async (_queueId, jobId) => jobId,
+        skipDownloadItem,
+        downloadTrack,
+        ensureValidToken: async () => "token",
+        cancelDownloadQueue: async () => 0,
+    } });
+    const existingArgs = { ...args, existingFileFor: () => "existing.mp3" };
+    await harness.enqueueAll(playlistA, [track("one")], existingArgs);
+    await flushPromises();
+    expect(harness.snapshot().queues[playlistA.id]!.jobs[0]!.status).toBe("skipped");
+    const retry = await harness.retryTrack(playlistA, track("one"), existingArgs);
+    await flushPromises();
+    expect(downloadTrack).toHaveBeenCalledWith(expect.objectContaining({ force: true, item_id: retry.jobId }));
+    expect(skipDownloadItem).toHaveBeenCalledTimes(1);
+    expect(harness.snapshot().queues[playlistA.id]!.jobs[1]!.status).toBe("completed");
+    await harness.dispose();
+});
+
+it("new session waits for aborted preflight before clearing backend and allows the track again", async () => {
+    const registration = deferred<string>();
+    const events: string[] = [];
+    const harness = createDownloadQueueHarness({ api: {
+        addDownloadJob: async () => await registration.promise,
+        cancelDownloadQueue: async () => { events.push("cancel-queue"); return 1; },
+        cancelActiveDownloads: async () => {},
+        cancelDownloadItem: async () => { events.push("cancel-item"); },
+        clearAllDownloads: async () => { events.push("clear"); },
+        ensureValidToken: async () => "token",
+        downloadTrack: async () => ({ success: true, message: "Downloaded" }),
+    } });
+    await harness.enqueueAll(playlistA, [track("one")], args);
+    const reset = harness.startNewSession();
+    await flushPromises();
+    expect(events).not.toContain("clear");
+    registration.resolve("late-item");
+    await reset;
+    expect(events.indexOf("cancel-item")).toBeLessThan(events.indexOf("clear"));
+    expect(harness.snapshot().queues).toEqual({});
+    expect((await harness.enqueueAll(playlistA, [track("one")], args))[0]!.added).toBe(true);
+    await harness.dispose();
+});
+
 function youtubeRequest(id: string): SuspiciousRedownloadRequest {
     return {
         original_file_path: `${id}.mp3`,
@@ -220,6 +266,9 @@ it("maps metadata summary retries onto the established ad-hoc scheduler queue", 
 
 function backendApi(overrides: Partial<DownloadQueueApi> = {}): DownloadQueueApi {
     return {
+        cancelActiveDownloads: async () => {},
+        clearAllDownloads: async () => {},
+        clearCompletedDownloads: async () => {},
         addDownloadJob: async (_queueId, jobId) => `backend:${jobId}`,
         cancelDownloadItem: async () => undefined,
         cancelDownloadQueue: async () => 0,
@@ -233,6 +282,29 @@ function backendApi(overrides: Partial<DownloadQueueApi> = {}): DownloadQueueApi
 }
 
 describe("createDownloadQueueHarness", () => {
+    it("stop all also cancels backend work outside the frontend scheduler", async () => {
+        const cancelActiveDownloads = vi.fn(async () => {});
+        const harness = createDownloadQueueHarness({ api: backendApi({ cancelActiveDownloads }) });
+        await harness.stopAllQueues();
+        expect(cancelActiveDownloads).toHaveBeenCalledOnce();
+        await harness.dispose();
+    });
+    it("publishes selected YouTube retries as one batch before workers register backend items", async () => {
+        const harness = createDownloadQueueHarness({
+            api: backendApi({ redownloadTrackFromYouTube: async () => await new Promise(() => {}) }),
+            youtubeRequestFor: (_queueId, id) => youtubeRequest(id),
+        });
+        const summary: BatchDownloadSummary = { ...createEmptyBatchSummary("bulk"), results: Array.from({ length: 500 }, (_, index) => ({
+            id: `retry-${index}`, name: "Track", artists: "Artist", status: "failed", youtubeRetryable: true,
+        })) };
+        const listener = vi.fn();
+        harness.subscribe(listener);
+        const decisions = await harness.enqueueYouTubeRetries(playlistA, summary.results.map(result => result.id), summary);
+        expect(decisions.filter(decision => decision.added)).toHaveLength(500);
+        expect(listener.mock.calls.length).toBeLessThanOrEqual(7);
+        expect(harness.snapshot().queues[playlistA.id]!.counts).toMatchObject({ total: 500, active: 3, queued: 497 });
+        await harness.dispose();
+    });
     it("shows preserved YouTube stage and diagnostics in the summary details", () => {
         expect(batchResultDetailText({
             id: "failed-1",

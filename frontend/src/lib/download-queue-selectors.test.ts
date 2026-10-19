@@ -13,6 +13,7 @@ import {
     selectCollectionQueueSnapshot,
     selectLatestTrackAttempt,
     selectQueueStatus,
+    mergeDownloadQueueInfo,
     type LoadedSpotifyMetadata,
 } from "./download-queue-selectors";
 
@@ -83,6 +84,22 @@ function playlistMetadata(title: string): SpotifyMetadataResponse {
 }
 
 describe("download queue selectors", () => {
+    it("merges waiting frontend jobs with backend details by attempt identity without duplicate rows", () => {
+        const active = job("active-job", "spotify:active", "active", { backendItemId: "registered-id" });
+        const waiting = job("waiting-job", "spotify:waiting", "queued");
+        const info = { queue: [backendItem({ id: "registered-id", queue_id: queueId, phase: "encoding", speed: 1 })] } as backend.DownloadQueueInfo;
+        const merged = mergeDownloadQueueInfo({ queues: { [queueId]: queue([active, waiting]) }, activeCount: 1, peakActive: 1 }, info);
+        expect(merged.queue).toHaveLength(2);
+        expect(merged.queue[0]).toMatchObject({ id: "active-job", status: "downloading", phase: "encoding" });
+        expect(merged.queue[1]).toMatchObject({ id: "waiting-job", status: "queued", track_name: "spotify:waiting" });
+        expect(merged).toMatchObject({ active_count: 1, queued_count: 1, is_downloading: true });
+    });
+    it("preserves suspicious and unavailable outcome labels in the aggregate queue", () => {
+        const merged = mergeDownloadQueueInfo({ queues: { [queueId]: queue([
+            job("suspicious", "spotify:one", "suspicious"), job("missing", "source:1", "unavailable"),
+        ]) }, activeCount: 0, peakActive: 1 }, { queue: [] } as unknown as backend.DownloadQueueInfo);
+        expect(merged.queue.map(row => row.attempt_status)).toEqual(["suspicious", "unavailable"]);
+    });
     it("creates collection scope before its first scheduler queue exists", () => {
         const scheduler: DownloadSchedulerSnapshot<MediaJobPayload, MediaJobResult> = {
             queues: {},

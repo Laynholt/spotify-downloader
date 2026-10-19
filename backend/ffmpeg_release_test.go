@@ -94,17 +94,10 @@ func TestDownloadFFmpegContextFirstInstallCancellation(t *testing.T) {
 	}
 }
 
-// Production break caught: FFmpeg helper getters consult the host PATH or the
-// legacy user profile instead of returning portable runtime locations.
+// Production break caught: a working portable pair loses precedence to PATH
+// or installation targets leave the portable runtime directory.
 func TestHelperPathsUsePortableFFmpegBin(t *testing.T) {
-	paths, err := ResolveRuntimePaths(filepath.Join(t.TempDir(), "SpotiDownloader.exe"), "test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := paths.Prepare(); err != nil {
-		t.Fatal(err)
-	}
-	installRuntimePathsForTest(t, paths)
+	paths := installFakeFFmpegRuntime(t)
 
 	dir, err := GetFFmpegDir()
 	if err != nil {

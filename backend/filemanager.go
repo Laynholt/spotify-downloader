@@ -2,6 +2,7 @@ package backend
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -357,12 +358,12 @@ func GenerateFilename(metadata *AudioMetadata, format string, ext string) string
 		year = year[:4]
 	}
 
-	result = strings.ReplaceAll(result, "{title}", sanitizeFilename(metadata.Title))
-	result = strings.ReplaceAll(result, "{artist}", sanitizeFilename(metadata.Artist))
-	result = strings.ReplaceAll(result, "{album}", sanitizeFilename(metadata.Album))
-	result = strings.ReplaceAll(result, "{album_artist}", sanitizeFilename(metadata.AlbumArtist))
-	result = strings.ReplaceAll(result, "{year}", sanitizeFilename(year))
-	result = strings.ReplaceAll(result, "{date}", sanitizeFilename(metadata.Year))
+	result = strings.ReplaceAll(result, "{title}", renameField(metadata.Title))
+	result = strings.ReplaceAll(result, "{artist}", renameField(metadata.Artist))
+	result = strings.ReplaceAll(result, "{album}", renameField(metadata.Album))
+	result = strings.ReplaceAll(result, "{album_artist}", renameField(metadata.AlbumArtist))
+	result = strings.ReplaceAll(result, "{year}", renameField(year))
+	result = strings.ReplaceAll(result, "{date}", renameField(metadata.Year))
 
 	if metadata.TrackNumber > 0 {
 		result = strings.ReplaceAll(result, "{track}", fmt.Sprintf("%02d", metadata.TrackNumber))
@@ -388,14 +389,13 @@ func GenerateFilename(metadata *AudioMetadata, format string, ext string) string
 	return result + ext
 }
 
-func sanitizeFilename(name string) string {
-
-	invalid := []string{"<", ">", ":", "\"", "/", "\\", "|", "?", "*"}
-	result := name
-	for _, char := range invalid {
-		result = strings.ReplaceAll(result, char, "")
+// renameField sanitizes one tag for a rename template; an empty tag stays empty
+// instead of becoming "Unknown".
+func renameField(name string) string {
+	if strings.TrimSpace(name) == "" {
+		return ""
 	}
-	return strings.TrimSpace(result)
+	return SanitizeFilename(name)
 }
 
 func PreviewRename(files []string, format string) []RenamePreview {
@@ -474,17 +474,11 @@ func RenameFiles(files []string, format string) []RenameResult {
 		newPath := filepath.Join(filepath.Dir(filePath), newName)
 		result.NewPath = newPath
 
-		if newPath != filePath {
-			if _, err := os.Stat(newPath); err == nil {
-				result.Error = "File already exists"
-				result.Success = false
-				results = append(results, result)
-				continue
-			}
-		}
-
-		if err := MoveFileWithFallback(filePath, newPath); err != nil {
+		if err := RenameNoReplace(filePath, newPath); err != nil {
 			result.Error = err.Error()
+			if errors.Is(err, ErrFileExists) {
+				result.Error = "File already exists"
+			}
 			result.Success = false
 			results = append(results, result)
 			continue

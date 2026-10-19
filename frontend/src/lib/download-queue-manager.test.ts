@@ -62,6 +62,48 @@ async function flushPromises() {
 }
 
 describe("createDynamicDownloadScheduler", () => {
+    it("clears terminal history without stopping waiting jobs or forgetting represented tracks", async () => {
+        const first = deferred<Result>();
+        const second = deferred<Result>();
+        const scheduler = createDynamicDownloadScheduler<JobPayload, Result>({
+            concurrency: 1,
+            execute: job => job.id === "first" ? first.promise : second.promise,
+            classifyResult: result => result.status,
+            cancelBackendQueue: async () => 0,
+        });
+        scheduler.enqueue(candidate("queue", "first"), "unseen-only");
+        scheduler.enqueue(candidate("queue", "second"), "unseen-only");
+        first.resolve({ status: "completed" });
+        await flushPromises();
+        scheduler.clearCompleted();
+        expect(scheduler.getSnapshot().queues.queue!.jobs.map(job => job.id)).toEqual(["second"]);
+        expect(scheduler.enqueue(candidate("queue", "first"), "unseen-only").added).toBe(false);
+        const retry = scheduler.enqueue(candidate("queue", "first"), "retry-terminal");
+        expect(retry.added).toBe(true);
+        expect(scheduler.getSnapshot().queues.queue!.jobs.find(job => job.id === retry.jobId)?.force).toBe(true);
+        second.resolve({ status: "completed" });
+        await flushPromises();
+        await scheduler.dispose();
+    });
+    it("publishes a bounded number of snapshots for a collection while preserving dedupe and FIFO", async () => {
+        const started: string[] = [];
+        const scheduler = createDynamicDownloadScheduler<JobPayload, Result>({
+            concurrency: 3,
+            execute: (job) => { started.push(job.id); return new Promise(() => {}); },
+            classifyResult: result => result.status,
+            cancelBackendQueue: async () => 0,
+        });
+        const listener = vi.fn();
+        scheduler.subscribe(listener);
+        const jobs = Array.from({ length: 2000 }, (_, index) => candidate("bulk", `job-${index}`));
+        const decisions = scheduler.enqueueMany([...jobs, jobs[0]!], "unseen-only");
+        expect(decisions.filter(decision => decision.added)).toHaveLength(2000);
+        expect(started).toEqual(["job-0", "job-1", "job-2"]);
+        expect(listener.mock.calls.length).toBeLessThanOrEqual(4);
+        expect(scheduler.getSnapshot().queues.bulk!.counts).toMatchObject({ total: 2000, active: 3, queued: 1997 });
+        await scheduler.dispose();
+    });
+
     it("round-robins dynamically appended queues with a global peak of three", async () => {
         const started: string[] = [];
         const gates = new Map<string, ReturnType<typeof deferred<Result>>>();

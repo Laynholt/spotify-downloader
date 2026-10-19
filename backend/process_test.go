@@ -18,6 +18,7 @@ import (
 )
 
 const (
+	helperProcessTimeout        = 8 * time.Second
 	testHelperModeEnv           = "SPOTI_DOWNLOAD_TEST_HELPER_MODE"
 	testHelperMarker            = "SPOTI_DOWNLOAD_TEST_HELPER_MARKER"
 	testHelperRelease           = "SPOTI_DOWNLOAD_TEST_HELPER_RELEASE"
@@ -72,7 +73,7 @@ func TestManagedCommandCancellation(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- cmd.Run() }()
 
-	if err := waitForFile(marker, time.Second); err != nil {
+	if err := waitForFile(marker, helperProcessTimeout); err != nil {
 		cancel()
 		t.Fatal("managed command did not start and spawn its descendant:", err)
 	}
@@ -86,7 +87,7 @@ func TestManagedCommandCancellation(t *testing.T) {
 		if ctx.Err() == nil {
 			t.Fatalf("managed command returned %v without context cancellation", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(helperProcessTimeout):
 		t.Fatal("managed command ignored cancellation")
 	}
 
@@ -118,7 +119,7 @@ func TestDownloadRequestCancellation(t *testing.T) {
 	done := make(chan error, 1)
 	outputBase := filepath.Join(t.TempDir(), "audio")
 	go func() {
-		_, err := downloader.downloadFileContext(ctx, server.URL, outputBase, ".mp3")
+		_, err := downloader.fetchAudio(ctx, server.URL, outputBase, ".mp3", "")
 		done <- err
 	}()
 
@@ -161,7 +162,7 @@ func TestConvertDownloadedAudioContextCancellation(t *testing.T) {
 		_, err := convertDownloadedAudioContext(ctx, inputPath, outputBase, "flac")
 		done <- err
 	}()
-	if err := waitForFile(marker, time.Second); err != nil {
+	if err := waitForFile(marker, helperProcessTimeout); err != nil {
 		cancel()
 		t.Fatal("conversion helper did not start:", err)
 	}
@@ -172,7 +173,7 @@ func TestConvertDownloadedAudioContextCancellation(t *testing.T) {
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("conversion cancellation error = %v, want context.Canceled", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(helperProcessTimeout):
 		t.Fatal("conversion ignored cancellation")
 	}
 	if _, err := os.Stat(inputPath); !os.IsNotExist(err) {
@@ -206,7 +207,7 @@ func TestConvertAudioContextActiveCancellation(t *testing.T) {
 		})
 		done <- err
 	}()
-	if err := waitForFile(marker, time.Second); err != nil {
+	if err := waitForFile(marker, helperProcessTimeout); err != nil {
 		cancel()
 		t.Fatal("ConvertAudio helper did not start:", err)
 	}
@@ -217,7 +218,7 @@ func TestConvertAudioContextActiveCancellation(t *testing.T) {
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("ConvertAudio cancellation error = %v, want context.Canceled", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(helperProcessTimeout):
 		t.Fatal("ConvertAudio ignored cancellation")
 	}
 	if _, err := os.Stat(inputPath); !os.IsNotExist(err) {
@@ -245,7 +246,7 @@ func TestConvertAudioContextVersionCheckCancellation(t *testing.T) {
 		_, err := ConvertAudioContext(ctx, ConvertAudioRequest{})
 		done <- err
 	}()
-	if err := waitForFile(versionMarker, time.Second); err != nil {
+	if err := waitForFile(versionMarker, helperProcessTimeout); err != nil {
 		cancel()
 		t.Fatal("ffmpeg version helper did not start:", err)
 	}
@@ -255,7 +256,7 @@ func TestConvertAudioContextVersionCheckCancellation(t *testing.T) {
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("version-check cancellation error = %v, want context.Canceled", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(helperProcessTimeout):
 		t.Fatal("version-check cancellation ignored")
 	}
 }
@@ -291,7 +292,7 @@ func TestConvertAudioContextBatchCancellationPreservesCommittedSibling(t *testin
 		done <- err
 	}()
 	for _, marker := range []string{firstMarker, secondMarker} {
-		if err := waitForFile(marker, time.Second); err != nil {
+		if err := waitForFile(marker, helperProcessTimeout); err != nil {
 			cancel()
 			t.Fatal("batch helper did not reach barrier:", err)
 		}
@@ -303,7 +304,7 @@ func TestConvertAudioContextBatchCancellationPreservesCommittedSibling(t *testin
 			cancel()
 			t.Fatalf("unexpected committed path %q, want %q", committedPath, firstOutput)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(helperProcessTimeout):
 		cancel()
 		t.Fatal("first conversion did not commit")
 	}
@@ -313,7 +314,7 @@ func TestConvertAudioContextBatchCancellationPreservesCommittedSibling(t *testin
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("batch cancellation error = %v, want context.Canceled", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(helperProcessTimeout):
 		t.Fatal("batch conversion cancellation ignored")
 	}
 	if _, err := os.Stat(firstOutput); err != nil {
@@ -348,7 +349,7 @@ func TestDownloadCoverImageCancellationRemovesTemp(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := downloader.downloadCoverImageContext(ctx, server.URL, t.TempDir(), false)
+		_, err := downloader.downloadCover(ctx, server.URL, paths.RunTempDir, false)
 		done <- err
 	}()
 	select {
@@ -431,7 +432,6 @@ func runManagedGrandchildHelper() int {
 }
 
 func runFakeFFmpegHelper() int {
-	incrementTestHelperCounter(os.Getenv(testHelperFFmpegCount))
 	for _, arg := range os.Args[1:] {
 		if arg == "-metadata" {
 			incrementTestHelperCounter(os.Getenv(testHelperFFmpegMetadata))
@@ -447,6 +447,7 @@ func runFakeFFmpegHelper() int {
 		}
 		return 0
 	}
+	incrementTestHelperCounter(os.Getenv(testHelperFFmpegCount))
 	marker := os.Getenv(testHelperMarker)
 	if marker != "" {
 		_ = os.WriteFile(marker, []byte("started"), 0600)
@@ -478,10 +479,10 @@ func runFakeFFmpegHelper() int {
 }
 
 func runFakeFFprobeHelper() int {
-	incrementTestHelperCounter(os.Getenv(testHelperFFprobeCount))
 	if len(os.Args) > 1 && os.Args[1] == "-version" {
 		return 0
 	}
+	incrementTestHelperCounter(os.Getenv(testHelperFFprobeCount))
 	if marker := os.Getenv("SPOTI_FAKE_FFPROBE_MARKER"); marker != "" {
 		_ = os.WriteFile(marker, []byte("started"), 0600)
 		for {

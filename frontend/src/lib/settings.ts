@@ -257,6 +257,11 @@ export function getSettings(): Settings {
         return cachedSettings;
     return getSettingsFromLocalStorage();
 }
+let settingsLoadError: unknown = null;
+/** The last error reading config.json; null once it was read or never failed. */
+export function getSettingsLoadError(): unknown {
+    return settingsLoadError;
+}
 export async function loadSettings(): Promise<Settings> {
     if (hasLoadedSettings && cachedSettings) {
         return cachedSettings;
@@ -265,16 +270,22 @@ export async function loadSettings(): Promise<Settings> {
         return loadSettingsPromise;
     }
     loadSettingsPromise = (async () => {
+        let backendSettings: Awaited<ReturnType<typeof LoadSettings>>;
         try {
-            const backendSettings = await LoadSettings();
-            if (backendSettings) {
-                cachedSettings = normalizeSettingsData(backendSettings);
-                hasLoadedSettings = true;
-                return cachedSettings;
-            }
+            backendSettings = await LoadSettings();
         }
         catch (error) {
+            // An unreadable config.json must not be overwritten: the user may fix it.
+            // Use the local copy for this session and leave hasLoadedSettings false so the next load retries.
             console.error("Failed to load settings from backend:", error);
+            settingsLoadError = error;
+            return getSettingsFromLocalStorage();
+        }
+        settingsLoadError = null;
+        if (backendSettings) {
+            cachedSettings = normalizeSettingsData(backendSettings);
+            hasLoadedSettings = true;
+            return cachedSettings;
         }
         const local = getSettingsFromLocalStorage();
         try {
@@ -323,23 +334,22 @@ export function parseTemplate(template: string, data: TemplateData): string {
 export async function getSettingsWithDefaults(): Promise<Settings> {
     const settings = await loadSettings();
     if (!settings.downloadPath) {
-        settings.downloadPath = await fetchDefaultPath();
-        await saveSettings(settings);
+        return { ...settings, downloadPath: await fetchDefaultPath() };
     }
     return settings;
 }
 export async function saveSettings(settings: Settings): Promise<void> {
+    const safeSettings = normalizeSettingsData(toBackendSettingsPayload(settings) as LegacySettings);
+    await SaveToBackend(toBackendSettingsPayload(safeSettings));
+    cachedSettings = safeSettings;
+    hasLoadedSettings = true;
     try {
-        const safeSettings = normalizeSettingsData(toBackendSettingsPayload(settings) as LegacySettings);
-        cachedSettings = safeSettings;
-        hasLoadedSettings = true;
         localStorage.setItem(SETTINGS_KEY, JSON.stringify(toBackendSettingsPayload(safeSettings)));
-        await SaveToBackend(toBackendSettingsPayload(safeSettings));
-        window.dispatchEvent(new CustomEvent('settingsUpdated', { detail: safeSettings }));
     }
     catch (error) {
-        console.error("Failed to save settings:", error);
+        console.error("Failed to cache saved settings:", error);
     }
+    window.dispatchEvent(new CustomEvent('settingsUpdated', { detail: safeSettings }));
 }
 export async function updateSettings(partial: Partial<Settings>): Promise<Settings> {
     const current = await loadSettings();

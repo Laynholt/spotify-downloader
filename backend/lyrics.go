@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 )
@@ -452,64 +451,13 @@ func msToLRCTimestamp(msStr string) string {
 }
 
 func buildLyricsFilename(trackName, artistName, albumName, albumArtist, releaseDate, filenameFormat string, includeTrackNumber bool, position, discNumber int) string {
-	safeTitle := SanitizeFilename(trackName)
-	safeArtist := SanitizeFilename(artistName)
-	safeAlbum := SanitizeFilename(albumName)
-	safeAlbumArtist := SanitizeFilename(albumArtist)
-
-	year := ""
-	if len(releaseDate) >= 4 {
-		year = releaseDate[:4]
-	}
-
-	var filename string
-
-	if strings.Contains(filenameFormat, "{") {
-		filename = filenameFormat
-		filename = strings.ReplaceAll(filename, "{title}", safeTitle)
-		filename = strings.ReplaceAll(filename, "{artist}", safeArtist)
-		filename = strings.ReplaceAll(filename, "{album}", safeAlbum)
-		filename = strings.ReplaceAll(filename, "{album_artist}", safeAlbumArtist)
-		filename = strings.ReplaceAll(filename, "{year}", year)
-		filename = strings.ReplaceAll(filename, "{date}", SanitizeFilename(releaseDate))
-
-		if discNumber > 0 {
-			filename = strings.ReplaceAll(filename, "{disc}", fmt.Sprintf("%d", discNumber))
-		} else {
-			filename = strings.ReplaceAll(filename, "{disc}", "")
-		}
-
-		if position > 0 {
-			filename = strings.ReplaceAll(filename, "{track}", fmt.Sprintf("%02d", position))
-		} else {
-
-			filename = regexp.MustCompile(`\{track\}\.\s*`).ReplaceAllString(filename, "")
-			filename = regexp.MustCompile(`\{track\}\s*-\s*`).ReplaceAllString(filename, "")
-			filename = regexp.MustCompile(`\{track\}\s*`).ReplaceAllString(filename, "")
-		}
-	} else {
-
-		switch filenameFormat {
-		case "artist-title":
-			filename = fmt.Sprintf("%s - %s", safeArtist, safeTitle)
-		case "title":
-			filename = safeTitle
-		default:
-			filename = fmt.Sprintf("%s - %s", safeTitle, safeArtist)
-		}
-
-		if includeTrackNumber && position > 0 {
-			filename = fmt.Sprintf("%02d. %s", position, filename)
-		}
-	}
-
-	return filename + ".lrc"
+	return SanitizeFilename(BuildFilename(trackName, artistName, albumName, albumArtist, releaseDate, discNumber, filenameFormat, includeTrackNumber, position, false, "", "")) + ".lrc"
 }
 
 func findAudioFileForLyrics(dir, trackName, artistName string) string {
 
-	safeTitle := sanitizeFilename(trackName)
-	safeArtist := sanitizeFilename(artistName)
+	safeTitle := SanitizeFilename(trackName)
+	safeArtist := SanitizeFilename(artistName)
 
 	audioExts := []string{".flac", ".mp3", ".m4a", ".FLAC", ".MP3", ".M4A"}
 
@@ -572,13 +520,13 @@ func (c *LyricsClient) DownloadLyricsContext(ctx context.Context, req LyricsDown
 		outputDir = NormalizePath(outputDir)
 	}
 
-	safeArtist := sanitizeFilename(req.AlbumArtist)
-	if safeArtist == "" {
-		safeArtist = sanitizeFilename(req.ArtistName)
+	folderArtist := req.AlbumArtist
+	if folderArtist == "" {
+		folderArtist = req.ArtistName
 	}
-	safeAlbum := sanitizeFilename(req.AlbumName)
 
-	if safeArtist != "" && safeAlbum != "" {
+	if folderArtist != "" && req.AlbumName != "" {
+		safeArtist, safeAlbum := SanitizeFilename(folderArtist), SanitizeFilename(req.AlbumName)
 		artistAlbumPath := filepath.Join(outputDir, safeArtist, safeAlbum)
 		if info, err := os.Stat(artistAlbumPath); err == nil && info.IsDir() {
 			outputDir = artistAlbumPath

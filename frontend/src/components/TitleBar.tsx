@@ -3,6 +3,7 @@ import { WindowMinimise, WindowToggleMaximise, Quit } from "../../wailsjs/runtim
 import { Menubar, MenubarContent, MenubarMenu, MenubarRadioGroup, MenubarRadioItem, MenubarSub, MenubarSubContent, MenubarSubTrigger, MenubarTrigger, MenubarLabel, MenubarSeparator } from "@/components/ui/menubar";
 import { getSettings, MIN_TOKEN_TIMEOUT, updateSettings } from "@/lib/settings";
 import { useState, useEffect } from "react";
+import { toastWithSound as toast } from "@/lib/toast-with-sound";
 const TIMEOUT_OPTIONS = [MIN_TOKEN_TIMEOUT, 180, 240, 300];
 const RETRY_OPTIONS = [0, 1, 2, 3, 4, 5];
 type SettingsUpdatedEvent = CustomEvent<{
@@ -27,13 +28,11 @@ export function TitleBar() {
     }, []);
     const handleTimeoutChange = (value: string) => {
         const timeout = parseInt(value, 10);
-        setTokenTimeout(timeout);
-        updateSettings({ tokenTimeout: timeout });
+        void updateSettings({ tokenTimeout: timeout }).catch((error) => toast.error(`Failed to save token timeout: ${error}`));
     };
     const handleRetryChange = (value: string) => {
         const retry = parseInt(value, 10);
-        setTokenRetry(retry);
-        updateSettings({ tokenRetry: retry });
+        void updateSettings({ tokenRetry: retry }).catch((error) => toast.error(`Failed to save token retries: ${error}`));
     };
     const handleMinimize = () => {
         WindowMinimise();

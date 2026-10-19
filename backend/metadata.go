@@ -467,7 +467,7 @@ func embedMetadataToMP3WithFFmpegContext(ctx context.Context, filePath string, m
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	ffmpegPath, err := GetFFmpegPath()
+	ffmpegPath, err := GetFFmpegPathContext(ctx)
 	if err != nil {
 		return fmt.Errorf("ffmpeg not found: %w", err)
 	}
@@ -724,7 +724,7 @@ func embedLyricsToM4AContext(ctx context.Context, filepath string, lyrics string
 		return err
 	}
 
-	ffmpegPath, err := GetFFmpegPath()
+	ffmpegPath, err := GetFFmpegPathContext(ctx)
 	if err != nil {
 		return fmt.Errorf("ffmpeg not found: %w", err)
 	}
@@ -990,7 +990,7 @@ func getDurationWithFFprobeContext(ctx context.Context, filepath string) (float6
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	ffprobePath, err := GetFFprobePath()
+	ffprobePath, err := GetFFprobePathContext(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -1147,7 +1147,7 @@ func ExtractFullMetadataFromFileContext(ctx context.Context, filePath string) (M
 		return metadata, err
 	}
 
-	ffprobePath, err := GetFFprobePath()
+	ffprobePath, err := GetFFprobePathContext(ctx)
 	if err != nil {
 		return metadata, err
 	}
@@ -1390,7 +1390,7 @@ func embedMetadataToM4AContext(ctx context.Context, filePath string, metadata Me
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	ffmpegPath, err := GetFFmpegPath()
+	ffmpegPath, err := GetFFmpegPathContext(ctx)
 	if err != nil {
 		return fmt.Errorf("ffmpeg not found: %w", err)
 	}

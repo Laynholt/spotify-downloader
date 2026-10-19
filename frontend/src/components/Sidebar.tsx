@@ -20,7 +20,7 @@ export function Sidebar({ currentPage, onPageChange }: SidebarProps) {
 
       <Tooltip delayDuration={0}>
         <TooltipTrigger asChild>
-          <Button variant={currentPage === "main" ? "secondary" : "ghost"} size="icon" className={`h-10 w-10 ${currentPage === "main" ? "bg-primary/10 text-primary hover:bg-primary/20" : "hover:bg-primary/10 hover:text-primary"}`} onClick={() => onPageChange("main")}>
+          <Button aria-label="Home" aria-current={currentPage === "main" ? "page" : undefined} variant={currentPage === "main" ? "secondary" : "ghost"} size="icon" className={`h-10 w-10 ${currentPage === "main" ? "bg-primary/10 text-primary hover:bg-primary/20" : "hover:bg-primary/10 hover:text-primary"}`} onClick={() => onPageChange("main")}>
             <HomeIcon size={20}/>
           </Button>
         </TooltipTrigger>
@@ -31,7 +31,7 @@ export function Sidebar({ currentPage, onPageChange }: SidebarProps) {
 
       <Tooltip delayDuration={0}>
         <TooltipTrigger asChild>
-          <Button variant={currentPage === "history" ? "secondary" : "ghost"} size="icon" className={`h-10 w-10 ${currentPage === "history" ? "bg-primary/10 text-primary hover:bg-primary/20" : "hover:bg-primary/10 hover:text-primary"}`} onClick={() => onPageChange("history")}>
+          <Button aria-label="History" aria-current={currentPage === "history" ? "page" : undefined} variant={currentPage === "history" ? "secondary" : "ghost"} size="icon" className={`h-10 w-10 ${currentPage === "history" ? "bg-primary/10 text-primary hover:bg-primary/20" : "hover:bg-primary/10 hover:text-primary"}`} onClick={() => onPageChange("history")}>
             <HistoryIcon size={20}/>
           </Button>
         </TooltipTrigger>
@@ -42,7 +42,7 @@ export function Sidebar({ currentPage, onPageChange }: SidebarProps) {
 
       <Tooltip delayDuration={0}>
         <TooltipTrigger asChild>
-          <Button variant={currentPage === "audio-analysis" ? "secondary" : "ghost"} size="icon" className={`h-10 w-10 ${currentPage === "audio-analysis" ? "bg-primary/10 text-primary hover:bg-primary/20" : "hover:bg-primary/10 hover:text-primary"}`} onClick={() => onPageChange("audio-analysis")}>
+          <Button aria-label="Audio Quality Analyzer" aria-current={currentPage === "audio-analysis" ? "page" : undefined} variant={currentPage === "audio-analysis" ? "secondary" : "ghost"} size="icon" className={`h-10 w-10 ${currentPage === "audio-analysis" ? "bg-primary/10 text-primary hover:bg-primary/20" : "hover:bg-primary/10 hover:text-primary"}`} onClick={() => onPageChange("audio-analysis")}>
             <ActivityIcon size={20}/>
           </Button>
         </TooltipTrigger>
@@ -53,7 +53,7 @@ export function Sidebar({ currentPage, onPageChange }: SidebarProps) {
 
       <Tooltip delayDuration={0}>
         <TooltipTrigger asChild>
-          <Button variant={currentPage === "audio-converter" ? "secondary" : "ghost"} size="icon" className={`h-10 w-10 ${currentPage === "audio-converter" ? "bg-primary/10 text-primary hover:bg-primary/20" : "hover:bg-primary/10 hover:text-primary"}`} onClick={() => onPageChange("audio-converter")}>
+          <Button aria-label="Audio Converter" aria-current={currentPage === "audio-converter" ? "page" : undefined} variant={currentPage === "audio-converter" ? "secondary" : "ghost"} size="icon" className={`h-10 w-10 ${currentPage === "audio-converter" ? "bg-primary/10 text-primary hover:bg-primary/20" : "hover:bg-primary/10 hover:text-primary"}`} onClick={() => onPageChange("audio-converter")}>
             <FileMusicIcon size={20}/>
           </Button>
         </TooltipTrigger>
@@ -64,7 +64,7 @@ export function Sidebar({ currentPage, onPageChange }: SidebarProps) {
 
       <Tooltip delayDuration={0}>
         <TooltipTrigger asChild>
-          <Button variant={currentPage === "file-manager" ? "secondary" : "ghost"} size="icon" className={`h-10 w-10 ${currentPage === "file-manager" ? "bg-primary/10 text-primary hover:bg-primary/20" : "hover:bg-primary/10 hover:text-primary"}`} onClick={() => onPageChange("file-manager")}>
+          <Button aria-label="File Manager" aria-current={currentPage === "file-manager" ? "page" : undefined} variant={currentPage === "file-manager" ? "secondary" : "ghost"} size="icon" className={`h-10 w-10 ${currentPage === "file-manager" ? "bg-primary/10 text-primary hover:bg-primary/20" : "hover:bg-primary/10 hover:text-primary"}`} onClick={() => onPageChange("file-manager")}>
             <FilePenIcon size={20}/>
           </Button>
         </TooltipTrigger>
@@ -75,7 +75,7 @@ export function Sidebar({ currentPage, onPageChange }: SidebarProps) {
 
       <Tooltip delayDuration={0}>
         <TooltipTrigger asChild>
-          <Button variant={currentPage === "debug" ? "secondary" : "ghost"} size="icon" className={`h-10 w-10 ${currentPage === "debug" ? "bg-primary/10 text-primary hover:bg-primary/20" : "hover:bg-primary/10 hover:text-primary"}`} onClick={() => onPageChange("debug")}>
+          <Button aria-label="Debug Logs" aria-current={currentPage === "debug" ? "page" : undefined} variant={currentPage === "debug" ? "secondary" : "ghost"} size="icon" className={`h-10 w-10 ${currentPage === "debug" ? "bg-primary/10 text-primary hover:bg-primary/20" : "hover:bg-primary/10 hover:text-primary"}`} onClick={() => onPageChange("debug")}>
             <TerminalIcon size={20} loop={true}/>
           </Button>
         </TooltipTrigger>
@@ -86,7 +86,7 @@ export function Sidebar({ currentPage, onPageChange }: SidebarProps) {
 
       <Tooltip delayDuration={0}>
         <TooltipTrigger asChild>
-          <Button variant={currentPage === "settings" ? "secondary" : "ghost"} size="icon" className={`h-10 w-10 ${currentPage === "settings" ? "bg-primary/10 text-primary hover:bg-primary/20" : "hover:bg-primary/10 hover:text-primary"}`} onClick={() => onPageChange("settings")}>
+          <Button aria-label="Settings" aria-current={currentPage === "settings" ? "page" : undefined} variant={currentPage === "settings" ? "secondary" : "ghost"} size="icon" className={`h-10 w-10 ${currentPage === "settings" ? "bg-primary/10 text-primary hover:bg-primary/20" : "hover:bg-primary/10 hover:text-primary"}`} onClick={() => onPageChange("settings")}>
             <SettingsIcon size={20}/>
           </Button>
         </TooltipTrigger>
@@ -100,7 +100,7 @@ export function Sidebar({ currentPage, onPageChange }: SidebarProps) {
     <div className="mt-auto flex flex-col gap-2">
       <Tooltip delayDuration={0}>
         <TooltipTrigger asChild>
-          <Button variant={currentPage === "about" ? "secondary" : "ghost"} size="icon" className={`h-10 w-10 ${currentPage === "about" ? "bg-primary/10 text-primary hover:bg-primary/20" : "hover:bg-primary/10 hover:text-primary"}`} onClick={() => onPageChange("about")}>
+          <Button aria-label="About" aria-current={currentPage === "about" ? "page" : undefined} variant={currentPage === "about" ? "secondary" : "ghost"} size="icon" className={`h-10 w-10 ${currentPage === "about" ? "bg-primary/10 text-primary hover:bg-primary/20" : "hover:bg-primary/10 hover:text-primary"}`} onClick={() => onPageChange("about")}>
             <BadgeAlertIcon size={20}/>
           </Button>
         </TooltipTrigger>

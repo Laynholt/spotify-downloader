@@ -126,8 +126,12 @@ func completeDownloadTracking(itemID, filename string, timings backend.PipelineT
 	backend.CompleteDownloadItem(itemID, filename, 0, timings)
 }
 
-func addHistoryItemAsync(req DownloadRequest, filename string) {
+// addHistoryItemAsync runs inside a tracked download, so shutdown waits for
+// the write before it closes the history database.
+func (a *App) addHistoryItemAsync(req DownloadRequest, filename string) {
+	a.activeWG.Add(1)
 	go func() {
+		defer a.activeWG.Done()
 		if err := backend.AddHistoryItemFromFile(filename, req.TrackName, req.ArtistName, req.AlbumName, req.SpotifyID, req.CoverURL, "SpotiDownloader"); err != nil {
 			fmt.Printf("[History] Failed to add history item for %s: %v\n", filename, err)
 		}

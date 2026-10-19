@@ -1,4 +1,5 @@
 import { useEffect, useRef, useSyncExternalStore } from "react";
+import { CancelActiveDownloads, ClearAllDownloads, ClearCompletedDownloads } from "../../wailsjs/go/main/App";
 import { addDownloadJob, cancelDownloadItem, cancelDownloadQueue, downloadTrack, markDownloadItemFailed, redownloadTrackFromYouTube, skipDownloadItem } from "@/lib/api";
 import { isUnauthorizedDownloadError, runWithUnauthorizedRetry } from "@/lib/batch-download";
 import { replaceBatchResult, type BatchDownloadSummary, type BatchTrackResult } from "@/lib/batch-summary";
@@ -14,6 +15,7 @@ import {
 import {
     createDynamicDownloadScheduler,
     type DownloadJob,
+    type DownloadJobCandidate,
     type DownloadQueueSnapshot,
     type DownloadSchedulerSnapshot,
     type EnqueueDecision,
@@ -40,6 +42,9 @@ export interface TrackDownloadArgs extends CollectionDownloadArgs {
 }
 
 export interface DownloadQueueApi {
+    cancelActiveDownloads(): Promise<unknown>;
+    clearAllDownloads(): Promise<void>;
+    clearCompletedDownloads(): Promise<void>;
     addDownloadJob(queueId: string, jobId: string, spotifyId: string, trackName: string, artistName: string, albumName: string): Promise<string>;
     cancelDownloadItem(itemId: string): Promise<void>;
     cancelDownloadQueue(queueId: string): Promise<number>;
@@ -57,6 +62,9 @@ export interface UseDownloadQueuesResult {
     enqueueYouTubeRetries(queue: DownloadQueueContext, selectedResultIds: string[], summary: BatchDownloadSummary): Promise<EnqueueDecision[]>;
     retryTrack(queue: DownloadQueueContext, track: TrackMetadata, args: TrackDownloadArgs): Promise<EnqueueDecision>;
     stopQueue(queueId: string): Promise<number>;
+    stopAllQueues(): Promise<void>;
+    clearCompletedQueues(): Promise<void>;
+    startNewSession(): Promise<void>;
 }
 
 type ExecuteSpotify = (job: DownloadJob<SpotifyDownloadPayload, MediaJobResult>, signal: AbortSignal) => Promise<MediaJobResult>;
@@ -86,12 +94,18 @@ export interface DownloadQueueHarness {
     enqueueYouTubeRetries: UseDownloadQueuesResult["enqueueYouTubeRetries"];
     retryTrack: UseDownloadQueuesResult["retryTrack"];
     stopQueue: UseDownloadQueuesResult["stopQueue"];
+    stopAllQueues: UseDownloadQueuesResult["stopAllQueues"];
+    clearCompletedQueues: UseDownloadQueuesResult["clearCompletedQueues"];
+    startNewSession: UseDownloadQueuesResult["startNewSession"];
     pendingYouTubeSummaryCount(): number;
     subscribe(listener: () => void): () => void;
     dispose(): Promise<void>;
 }
 
 const defaultApi: DownloadQueueApi = {
+    cancelActiveDownloads: CancelActiveDownloads,
+    clearAllDownloads: ClearAllDownloads,
+    clearCompletedDownloads: ClearCompletedDownloads,
     addDownloadJob,
     cancelDownloadItem,
     cancelDownloadQueue,
@@ -223,6 +237,7 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
     const busyQueueIds = new Set<string>();
     const idleWorkByQueueId = new Map<string, Promise<void>>();
     const youtubeSummaryByJobId = new Map<string, BatchDownloadSummary>();
+    let resetting = false;
     const executeSpotify: ExecuteSpotify = async (job, signal) => {
         let backendItemId = "";
         let downloadStarted = false;
@@ -279,7 +294,7 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
                 throw new Error("Download cancelled");
             }
             const existingFilePath = existingPathByJobId.get(job.id);
-            if (existingFilePath) {
+            if (existingFilePath && !job.force) {
                 if (args?.settings.updateMetadataForExistingFiles && args.updateExistingFile) {
                     const metadataResult = await args.updateExistingFile(track, job.sourceIndex, existingFilePath);
                     if (signal.aborted) {
@@ -458,13 +473,13 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
         }
     });
 
-    const enqueue = (
+    const prepareCandidate = (
         queue: DownloadQueueContext,
         track: TrackMetadata,
         sourceIndex: number,
         args: CollectionDownloadArgs,
-        policy: "unseen-only" | "retry-terminal",
-    ): EnqueueDecision => {
+    ) => {
+        if (resetting) throw new Error("Download session is being reset");
         const candidate = buildSpotifyCandidate({
             queue,
             track,
@@ -481,20 +496,27 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
         if (existingFilePath) {
             existingPathByJobId.set(candidate.id, existingFilePath);
         }
-        const decision = scheduler.enqueue(candidate, policy);
-        if (!decision.added) {
-            requestByJobId.delete(candidate.id);
-            existingPathByJobId.delete(candidate.id);
-        }
-        else if (decision.jobId && decision.jobId !== candidate.id) {
-            const request = requestByJobId.get(candidate.id);
-            requestByJobId.delete(candidate.id);
-            if (request) requestByJobId.set(decision.jobId, request);
-            const existingPath = existingPathByJobId.get(candidate.id);
-            existingPathByJobId.delete(candidate.id);
-            if (existingPath) existingPathByJobId.set(decision.jobId, existingPath);
-        }
-        return decision;
+        return candidate;
+    };
+
+    const enqueueTracks = (queue: DownloadQueueContext, tracks: TrackMetadata[], args: TrackDownloadArgs,
+        policy: "unseen-only" | "retry-terminal", selected?: Set<string>): EnqueueDecision[] => {
+        const candidates = tracks.flatMap((track, index) => !selected || selected.has(track.spotify_id || "")
+            ? [prepareCandidate(queue, track, args.sourceIndexFor?.(track, index) ?? args.sourceIndex ?? index, args)] : []);
+        const decisions = scheduler.enqueueMany(candidates, policy);
+        decisions.forEach((decision, index) => {
+            if (!decision.added) {
+                requestByJobId.delete(candidates[index]!.id);
+                existingPathByJobId.delete(candidates[index]!.id);
+            }
+        });
+        return decisions;
+    };
+
+    const stopAllQueues = async (): Promise<void> => {
+        await Promise.all(Object.keys(scheduler.getSnapshot().queues).map(queueId => scheduler.cancelQueue(queueId)));
+        await api.cancelActiveDownloads();
+        await scheduler.waitForIdle();
     };
 
     const notifyQueueIdleIfSettled = (queueId: string): void => {
@@ -508,22 +530,20 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
     return {
         snapshot: () => scheduler.getSnapshot(),
         enqueueAll: async (queue, tracks, args) => {
-            const decisions = tracks.map((track, arrayIndex) =>
-                enqueue(queue, track, args.sourceIndexFor?.(track, arrayIndex) ?? arrayIndex, args, "unseen-only"));
+            const decisions = enqueueTracks(queue, tracks, args, "unseen-only");
             notifyQueueIdleIfSettled(queue.id);
             return decisions;
         },
         enqueueSelected: async (queue, tracks, selectedIds, args) => {
             const selected = new Set(selectedIds);
-            const decisions = tracks.flatMap((track, arrayIndex) => selected.has(track.spotify_id || "")
-                ? [enqueue(queue, track, args.sourceIndexFor?.(track, arrayIndex) ?? arrayIndex, args, "unseen-only")]
-                : []);
+            const decisions = enqueueTracks(queue, tracks, args, "unseen-only", selected);
             notifyQueueIdleIfSettled(queue.id);
             return decisions;
         },
         enqueueYouTubeRetries: async (queue, selectedResultIds, summary) => {
+            if (resetting) throw new Error("Download session is being reset");
             const selected = new Set(selectedResultIds);
-            const decisions: EnqueueDecision[] = [];
+            const candidates: DownloadJobCandidate<YouTubeRedownloadPayload>[] = [];
             for (const [sourceIndex, result] of summary.results.entries()) {
                 if (!selected.has(result.id) || !result.youtubeRetryable || (result.status !== "failed" && result.status !== "suspicious")) {
                     continue;
@@ -532,33 +552,55 @@ export function createDownloadQueueHarness(options: DownloadQueueHarnessOptions 
                 if (!request) continue;
                 const candidate = buildYouTubeCandidate(queue, result.id, request, sourceIndex);
                 youtubeSummaryByJobId.set(candidate.id, summary);
-                const decision = scheduler.enqueue(candidate, "retry-terminal");
-                if (!decision.added) youtubeSummaryByJobId.delete(candidate.id);
-                else if (decision.jobId && decision.jobId !== candidate.id) {
-                    youtubeSummaryByJobId.set(decision.jobId, summary);
-                    youtubeSummaryByJobId.delete(candidate.id);
-                }
-                decisions.push(decision);
+                candidates.push(candidate);
             }
+            const decisions = scheduler.enqueueMany(candidates, "retry-terminal");
+            decisions.forEach((decision, index) => {
+                if (!decision.added) youtubeSummaryByJobId.delete(candidates[index]!.id);
+            });
             notifyQueueIdleIfSettled(queue.id);
             return decisions;
         },
         retryTrack: async (queue, track, args) => {
-            const decision = enqueue(queue, track, args.sourceIndex ?? args.sourceIndexFor?.(track, 0) ?? 0, args, "retry-terminal");
+            const decision = enqueueTracks(queue, [track], args, "retry-terminal")[0]!;
             notifyQueueIdleIfSettled(queue.id);
             return decision;
         },
         stopQueue: async (queueId) => await scheduler.cancelQueue(queueId),
+        stopAllQueues,
+        clearCompletedQueues: async () => {
+            await api.clearCompletedDownloads();
+            scheduler.clearCompleted();
+        },
+        startNewSession: async () => {
+            resetting = true;
+            try {
+                await stopAllQueues();
+                await Promise.all(idleWorkByQueueId.values());
+                await api.clearAllDownloads();
+                requestByJobId.clear();
+                existingPathByJobId.clear();
+                youtubeSummaryByJobId.clear();
+                argsByQueueId.clear();
+                busyQueueIds.clear();
+                scheduler.reset();
+            }
+            finally { resetting = false; }
+        },
         pendingYouTubeSummaryCount: () => youtubeSummaryByJobId.size,
         subscribe: (listener) => scheduler.subscribe(listener),
         dispose: async () => {
             unsubscribeIdleWatcher();
+            const cancellation = Promise.allSettled(Object.values(scheduler.getSnapshot().queues)
+                .filter(queue => queue.counts.active > 0 || queue.counts.queued > 0)
+                .map(queue => scheduler.cancelQueue(queue.id)));
             requestByJobId.clear();
             existingPathByJobId.clear();
             youtubeSummaryByJobId.clear();
             argsByQueueId.clear();
             idleWorkByQueueId.clear();
             await scheduler.dispose();
+            await cancellation;
         },
     };
 }
@@ -570,8 +612,14 @@ export function useDownloadQueues(options: DownloadQueueHarnessOptions = {}): Us
         harnessRef.current = createDownloadQueueHarness(options);
     }
     const harness = harnessRef.current;
-    useEffect(() => () => {
-        void harness.dispose();
+    const lifecycle = useRef({ generation: 0 });
+    useEffect(() => {
+        const lifetime = lifecycle.current;
+        const generation = ++lifetime.generation;
+        return () => {
+            // StrictMode replays setup before this microtask; real unmount still disposes.
+            queueMicrotask(() => { if (lifetime.generation === generation) void harness.dispose(); });
+        };
     }, [harness]);
     const snapshot = useSyncExternalStore(harness.subscribe, harness.snapshot, harness.snapshot);
     return {
@@ -581,6 +629,9 @@ export function useDownloadQueues(options: DownloadQueueHarnessOptions = {}): Us
         enqueueYouTubeRetries: harness.enqueueYouTubeRetries,
         retryTrack: harness.retryTrack,
         stopQueue: harness.stopQueue,
+        stopAllQueues: harness.stopAllQueues,
+        clearCompletedQueues: harness.clearCompletedQueues,
+        startNewSession: harness.startNewSession,
     };
 }
 /* eslint-enable react-hooks/refs */

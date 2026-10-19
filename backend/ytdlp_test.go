@@ -521,7 +521,7 @@ func TestDownloadWithYtDlpDenoCancellationKillsHelperTree(t *testing.T) {
 			OutputBase: filepath.Join(t.TempDir(), "track"),
 		})
 	}()
-	if err := waitForFile(marker, time.Second); err != nil {
+	if err := waitForFile(marker, helperProcessTimeout); err != nil {
 		cancel()
 		t.Fatal("yt-dlp helper did not start its descendant:", err)
 	}
@@ -531,7 +531,7 @@ func TestDownloadWithYtDlpDenoCancellationKillsHelperTree(t *testing.T) {
 		if result.Error != context.Canceled.Error() || result.Stage != YtDlpStageSearch {
 			t.Fatalf("cancellation result = %#v", result)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(helperProcessTimeout):
 		t.Fatal("yt-dlp command ignored cancellation")
 	}
 	if err := os.WriteFile(release, []byte("release"), 0600); err != nil {
@@ -599,7 +599,7 @@ func installYtDlpDownloadHooks(
 	previousFFmpeg := ytDlpGetFFmpegPath
 	ytDlpEnsureInstalledOrUpdatedContext = ensureYtDlp
 	ytDlpEnsureDenoInstalledOrUpdatedContext = ensureDeno
-	ytDlpGetFFmpegPath = getFFmpegPath
+	ytDlpGetFFmpegPath = func(context.Context) (string, error) { return getFFmpegPath() }
 	t.Cleanup(func() {
 		ytDlpEnsureInstalledOrUpdatedContext = previousYtDlp
 		ytDlpEnsureDenoInstalledOrUpdatedContext = previousDeno

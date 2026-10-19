@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/afkarxyz/SpotiDownloader/backend"
+	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
@@ -98,6 +99,14 @@ func (a *App) shutdown(ctx context.Context) {
 			fmt.Printf("Runtime cleanup warning: %v\n", err)
 		}
 	}
+}
+
+func (a *App) onSecondInstanceLaunch(options.SecondInstanceData) {
+	if a.ctx == nil {
+		return
+	}
+	runtime.WindowUnminimise(a.ctx)
+	runtime.Show(a.ctx)
 }
 
 type SpotifyMetadataRequest struct {
@@ -338,7 +347,7 @@ func (a *App) DownloadTrack(req DownloadRequest) (DownloadResponse, error) {
 		backend.SkipDownloadItem(itemID, filename)
 	} else {
 		completeDownloadTracking(itemID, filename, result.Timings)
-		addHistoryItemAsync(req, filename)
+		a.addHistoryItemAsync(req, filename)
 	}
 
 	warnings := append([]string(nil), result.Warnings...)
@@ -443,7 +452,7 @@ func (a *App) RenameFileTo(oldPath, newName string) error {
 	if err != nil {
 		return err
 	}
-	return backend.MoveFileWithFallback(oldPath, newPath)
+	return backend.RenameNoReplace(oldPath, newPath)
 }
 
 func (a *App) ReadImageAsBase64(filePath string) (string, error) {
@@ -492,7 +501,7 @@ func (a *App) SaveSettings(settings map[string]interface{}) error {
 		return err
 	}
 
-	return os.WriteFile(configPath, data, 0600)
+	return backend.AtomicWriteFile(configPath, data, 0600)
 }
 
 func (a *App) LoadSettings() (map[string]interface{}, error) {

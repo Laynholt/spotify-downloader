@@ -131,7 +131,7 @@ export function selectLatestTrackAttempt(
         return undefined;
     }
 
-    const backendItem = backendByJobId?.get(latest.id);
+    const backendItem = backendByJobId?.get(latest.backendItemId || latest.id);
     const progress = backendItem?.queue_id === queue.id ? backendItem : undefined;
     const warning = progress?.warning || latest.result?.validation_warning || latest.result?.warnings?.[0];
     const error = latest.error || latest.result?.error || progress?.error_message;
@@ -147,4 +147,43 @@ export function selectLatestTrackAttempt(
         ...(warning ? { warning } : {}),
         ...(error ? { error } : {}),
     };
+}
+
+type QueueDisplayRow = backend.DownloadItem & { attempt_status?: DownloadJobStatus };
+type QueueDisplayInfo = Omit<backend.DownloadQueueInfo, "convertValues" | "queue"> & { queue: QueueDisplayRow[] };
+
+export function mergeDownloadQueueInfo(
+    snapshot: DownloadSchedulerSnapshot<MediaJobPayload, MediaJobResult>,
+    info: Omit<backend.DownloadQueueInfo, "convertValues">,
+): QueueDisplayInfo {
+    const backendById = new Map(info.queue.map(item => [item.id, item]));
+    const represented = new Set<string>();
+    const rows: QueueDisplayRow[] = [];
+    for (const queue of Object.values(snapshot.queues)) {
+        for (const job of queue.jobs) {
+            const detail = backendById.get(job.backendItemId || job.id);
+            const progress = detail?.queue_id === queue.id ? detail : undefined;
+            if (progress) represented.add(progress.id);
+            const status = job.status === "active" ? "downloading" : job.status === "unavailable" ? "failed" :
+                job.status === "suspicious" ? "completed" : job.status;
+            rows.push({
+                progress: 0, total_size: 0, speed: 0, start_time: 0, end_time: 0,
+                phase: "", detail: "", downloaded_bytes: 0, total_bytes: 0,
+                ...progress,
+                id: job.id, queue_id: queue.id, status, attempt_status: job.status,
+                spotify_id: job.payload.track.spotify_id || "", track_name: job.payload.track.name,
+                artist_name: job.payload.track.artists, album_name: job.payload.track.album_name,
+                error_message: job.error || job.result?.error || progress?.error_message || "",
+                warning: progress?.warning || job.result?.validation_warning || job.result?.warnings?.[0] || "",
+                file_path: (job.result && "file" in job.result ? job.result.file : undefined) || progress?.file_path || "",
+            } as QueueDisplayRow);
+        }
+    }
+    rows.push(...info.queue.filter(item => !represented.has(item.id)));
+    const count = (status: string) => rows.filter(item => item.status === status).length;
+    const active = count("downloading");
+    const queued = count("queued");
+    return { ...info, queue: rows, queued_count: queued, active_count: active, completed_count: count("completed"),
+        failed_count: count("failed"), skipped_count: count("skipped"), cancelled_count: count("cancelled"),
+        is_downloading: active > 0 || queued > 0 };
 }

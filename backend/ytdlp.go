@@ -29,7 +29,7 @@ var (
 	ytDlpHTTPClientFactory                   = newHTTPClient
 	ytDlpEnsureInstalledOrUpdatedContext     = EnsureYtDlpInstalledOrUpdatedContext
 	ytDlpEnsureDenoInstalledOrUpdatedContext = EnsureDenoInstalledOrUpdatedContext
-	ytDlpGetFFmpegPath                       = GetFFmpegPath
+	ytDlpGetFFmpegPath                       = GetFFmpegPathContext
 	ytDlpDebugLogf                           = log.Printf
 	ytDlpInstallGate                         = func() chan struct{} {
 		gate := make(chan struct{}, 1)
@@ -41,6 +41,7 @@ var (
 type GitHubReleaseAsset struct {
 	Name               string `json:"name"`
 	BrowserDownloadURL string `json:"browser_download_url"`
+	Size               int64  `json:"size"`
 }
 
 type ytDlpRelease struct {
@@ -348,7 +349,7 @@ func DownloadWithYtDlpContext(ctx context.Context, req YtDlpDownloadRequest) YtD
 	if err != nil {
 		return ytDlpFailure(ctx, stage, err, nil)
 	}
-	ffmpegPath, err := ytDlpGetFFmpegPath()
+	ffmpegPath, err := ytDlpGetFFmpegPath(ctx)
 	if err != nil {
 		return ytDlpFailure(ctx, stage, err, nil)
 	}

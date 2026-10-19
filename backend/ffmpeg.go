@@ -82,85 +82,41 @@ func GetFFmpegDir() (string, error) {
 }
 
 func GetFFmpegPath() (string, error) {
-	paths, err := CurrentRuntimePaths()
-	if err != nil {
-		return "", err
-	}
+	return GetFFmpegPathContext(context.Background())
+}
 
-	ffmpegName := "ffmpeg"
-	if runtime.GOOS == "windows" {
-		ffmpegName = "ffmpeg.exe"
+func GetFFmpegPathContext(ctx context.Context) (string, error) {
+	status := installedFFmpegStatus(ctx)
+	if !status.Installed {
+		return "", ffmpegStatusError(ctx, status)
 	}
-
-	return filepath.Join(paths.BinDir, ffmpegName), nil
+	return status.FFmpegPath, nil
 }
 
 func GetFFprobePath() (string, error) {
-	paths, err := CurrentRuntimePaths()
-	if err != nil {
-		return "", err
-	}
-
-	ffprobeName := "ffprobe"
-	if runtime.GOOS == "windows" {
-		ffprobeName = "ffprobe.exe"
-	}
-
-	return filepath.Join(paths.BinDir, ffprobeName), nil
+	return GetFFprobePathContext(context.Background())
 }
 
-func IsFFprobeInstalled() (bool, error) {
-	return IsFFprobeInstalledContext(context.Background())
+func GetFFprobePathContext(ctx context.Context) (string, error) {
+	status := installedFFmpegStatus(ctx)
+	if !status.Installed {
+		return "", ffmpegStatusError(ctx, status)
+	}
+	return status.FFprobePath, nil
 }
 
+func IsFFprobeInstalled() (bool, error) { return IsFFprobeInstalledContext(context.Background()) }
+func IsFFmpegInstalled() (bool, error)  { return IsFFmpegInstalledContext(context.Background()) }
 func IsFFprobeInstalledContext(ctx context.Context) (bool, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	ffprobePath, err := GetFFprobePath()
-	if err != nil {
-		return false, err
-	}
-
-	cmd := newManagedCommand(ctx, ffprobePath, "-version")
-	err = cmd.Run()
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return false, ctxErr
-	}
-	return err == nil, nil
+	return IsFFmpegInstalledContext(ctx)
 }
-
-func IsFFmpegInstalled() (bool, error) {
-	return IsFFmpegInstalledContext(context.Background())
-}
-
 func IsFFmpegInstalledContext(ctx context.Context) (bool, error) {
-	if ctx == nil {
-		ctx = context.Background()
+	status := installedFFmpegStatus(ctx)
+	if ctx != nil && ctx.Err() != nil {
+		return false, ctx.Err()
 	}
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	ffmpegPath, err := GetFFmpegPath()
-	if err != nil {
-		return false, err
-	}
-
-	if err := ValidateExecutable(ffmpegPath); err != nil {
-		return false, nil
-	}
-
-	cmd := newManagedCommand(ctx, ffmpegPath, "-version")
-	err = cmd.Run()
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return false, ctxErr
-	}
-	return err == nil, nil
+	return status.Installed, nil
 }
-
 func DownloadFFmpeg(progressCallback func(int)) error {
 	return DownloadFFmpegContext(context.Background(), progressCallback)
 }
@@ -188,34 +144,11 @@ func DownloadFFmpegContext(ctx context.Context, progressCallback func(int)) erro
 	}
 
 	if runtime.GOOS == "darwin" {
-		ffmpegInstalled, err := IsFFmpegInstalledContext(ctx)
-		if err != nil {
+		if err := downloadAndExtractContext(ctx, evermeetFFmpegReleaseURL, ffmpegDir, progressCallback, 0, 50); err != nil {
 			return err
 		}
-		ffprobeInstalled, err := IsFFprobeInstalledContext(ctx)
-		if err != nil {
-			return err
-		}
-
-		if !ffmpegInstalled && !ffprobeInstalled {
-			if err := downloadAndExtractContext(ctx, evermeetFFmpegReleaseURL, ffmpegDir, progressCallback, 0, 50); err != nil {
-				return err
-			}
-			if err := downloadAndExtractContext(ctx, evermeetFFprobeReleaseURL, ffmpegDir, progressCallback, 50, 100); err != nil {
-				return err
-			}
-		} else if !ffmpegInstalled {
-			if err := downloadAndExtractContext(ctx, evermeetFFmpegReleaseURL, ffmpegDir, progressCallback, 0, 100); err != nil {
-				return err
-			}
-		} else if !ffprobeInstalled {
-			if err := downloadAndExtractContext(ctx, evermeetFFprobeReleaseURL, ffmpegDir, progressCallback, 0, 100); err != nil {
-				return err
-			}
-		}
-		return nil
+		return downloadAndExtractContext(ctx, evermeetFFprobeReleaseURL, ffmpegDir, progressCallback, 50, 100)
 	}
-
 	release, err := fetchLatestFFmpegReleaseContext(ctx)
 	if err != nil {
 		return err
@@ -238,7 +171,8 @@ func DownloadFFmpegContext(ctx context.Context, progressCallback func(int)) erro
 	if err := downloadAndExtractVerifiedContext(ctx, asset.BrowserDownloadURL, expectedHash, ffmpegDir, progressCallback, 0, 100); err != nil {
 		return err
 	}
-
+	// A fresh portable install must win over a cached PATH installation.
+	verifiedFFmpeg.Store(nil)
 	return nil
 }
 
@@ -745,17 +679,9 @@ func ConvertAudioContext(ctx context.Context, req ConvertAudioRequest) ([]Conver
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	ffmpegPath, err := GetFFmpegPath()
+	ffmpegPath, err := GetFFmpegPathContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get ffmpeg path: %w", err)
-	}
-
-	installed, err := IsFFmpegInstalledContext(ctx)
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return nil, ctxErr
-	}
-	if err != nil || !installed {
-		return nil, fmt.Errorf("ffmpeg is not installed")
 	}
 
 	results := make([]ConvertAudioResult, len(req.InputFiles))

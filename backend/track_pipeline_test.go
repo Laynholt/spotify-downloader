@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -67,10 +68,31 @@ func testTrackPipelineRequest(t *testing.T) (TrackPipelineRequest, RuntimePaths)
 	}, paths
 }
 
+// installPipelineDepsForTest swaps in the non-nil fakes of deps for the rest
+// of the test; every other dependency keeps its production implementation.
 func installPipelineDepsForTest(t *testing.T, deps trackPipelineDeps) {
 	t.Helper()
 	previous := pipelineDeps
-	pipelineDeps = deps
+	merged := previous
+	setIf := func(dst any, src any) {
+		if v := reflect.ValueOf(src); !v.IsNil() {
+			reflect.ValueOf(dst).Elem().Set(v)
+		}
+	}
+	setIf(&merged.resolveTarget, deps.resolveTarget)
+	setIf(&merged.downloadAudio, deps.downloadAudio)
+	setIf(&merged.convertAudio, deps.convertAudio)
+	setIf(&merged.downloadCover, deps.downloadCover)
+	setIf(&merged.metadata, deps.metadata)
+	setIf(&merged.lyrics, deps.lyrics)
+	setIf(&merged.probeDuration, deps.probeDuration)
+	setIf(&merged.finalizeMedia, deps.finalizeMedia)
+	setIf(&merged.publish, deps.publish)
+	setIf(&merged.now, deps.now)
+	setIf(&merged.newTimer, deps.newTimer)
+	setIf(&merged.withTimeout, deps.withTimeout)
+	setIf(&merged.withDeadline, deps.withDeadline)
+	pipelineDeps = merged
 	t.Cleanup(func() { pipelineDeps = previous })
 }
 
@@ -114,9 +136,9 @@ func TestTrackPipelineBranchesOverlapBeforeAudioRelease(t *testing.T) {
 			markStarted("cover")
 			return "", nil
 		},
-		metadata: func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string) {
+		metadata: func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string, map[string]CacheOutcome) {
 			markStarted("metadata")
-			return taggingMetadataResult{}, nil
+			return taggingMetadataResult{}, nil, nil
 		},
 		lyrics: func(context.Context, TrackPipelineRequest, int) (string, error) {
 			markStarted("lyrics")
@@ -176,8 +198,8 @@ func TestTrackPipelineLeavesTerminalQueueStateToCaller(t *testing.T) {
 		downloadCover: func(context.Context, *SpotiDownloader, string, string, bool) (string, error) {
 			return "", nil
 		},
-		metadata: func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string) {
-			return taggingMetadataResult{}, nil
+		metadata: func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string, map[string]CacheOutcome) {
+			return taggingMetadataResult{}, nil, nil
 		},
 		lyrics:        func(context.Context, TrackPipelineRequest, int) (string, error) { return "", nil },
 		probeDuration: func(context.Context, string) (float64, error) { return 1, nil },
@@ -258,6 +280,46 @@ func TestTrackPipelineLeavesFailureAndCancellationToCaller(t *testing.T) {
 	})
 }
 
+func TestTrackPipelineRejectsUnreadableAudio(t *testing.T) {
+	req, _ := testTrackPipelineRequest(t)
+	finalized := false
+	installPipelineDepsForTest(t, trackPipelineDeps{
+		resolveTarget: func(context.Context, *SpotiDownloader, TrackPipelineRequest) (string, string, error) {
+			return "source", ".mp3", nil
+		},
+		downloadAudio: func(_ context.Context, _ *SpotiDownloader, _ string, base, ext, _ string) (string, error) {
+			path := base + ext
+			return path, os.WriteFile(path, []byte("<html>rate limited</html>"), 0600)
+		},
+		convertAudio: func(_ context.Context, path, _, _ string) (string, error) { return path, nil },
+		downloadCover: func(context.Context, *SpotiDownloader, string, string, bool) (string, error) {
+			return "", nil
+		},
+		metadata: func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string, map[string]CacheOutcome) {
+			return taggingMetadataResult{}, nil, nil
+		},
+		lyrics: func(context.Context, TrackPipelineRequest, int) (string, error) { return "", nil },
+		probeDuration: func(context.Context, string) (float64, error) {
+			return 0, errors.New("invalid data found when processing input")
+		},
+		finalizeMedia: func(context.Context, string, Metadata, string) error {
+			finalized = true
+			return nil
+		},
+	})
+
+	_, err := (&SpotiDownloader{}).RunTrackPipeline(context.Background(), req)
+	if err == nil || !strings.Contains(err.Error(), "not readable audio") {
+		t.Fatalf("error = %v, want unreadable audio failure", err)
+	}
+	if finalized {
+		t.Fatal("unreadable audio must not be finalized")
+	}
+	if _, statErr := os.Stat(filepath.Join(req.OutputDir, "Track - Artist.mp3")); !os.IsNotExist(statErr) {
+		t.Fatalf("unreadable audio was published: %v", statErr)
+	}
+}
+
 func TestTrackPipelineProbesDurationAndFinalizesOnce(t *testing.T) {
 	req, _ := testTrackPipelineRequest(t)
 	var probes atomic.Int32
@@ -274,8 +336,8 @@ func TestTrackPipelineProbesDurationAndFinalizesOnce(t *testing.T) {
 		downloadCover: func(context.Context, *SpotiDownloader, string, string, bool) (string, error) {
 			return "", nil
 		},
-		metadata: func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string) {
-			return taggingMetadataResult{}, nil
+		metadata: func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string, map[string]CacheOutcome) {
+			return taggingMetadataResult{}, nil, nil
 		},
 		lyrics: func(context.Context, TrackPipelineRequest, int) (string, error) {
 			return "[00:00.00]ok\n[99:00.00]late\n", nil
@@ -326,8 +388,8 @@ func TestTrackPipelineLateLyricsAreDiscardedAtAbsoluteDeadline(t *testing.T) {
 		downloadCover: func(context.Context, *SpotiDownloader, string, string, bool) (string, error) {
 			return "", nil
 		},
-		metadata: func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string) {
-			return taggingMetadataResult{}, nil
+		metadata: func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string, map[string]CacheOutcome) {
+			return taggingMetadataResult{}, nil, nil
 		},
 		lyrics: func(ctx context.Context, _ TrackPipelineRequest, _ int) (string, error) {
 			select {
@@ -395,8 +457,8 @@ func TestTrackPipelineCleansTrackTempOnFailureAndCancellation(t *testing.T) {
 			downloadCover: func(context.Context, *SpotiDownloader, string, string, bool) (string, error) {
 				return "", nil
 			},
-			metadata: func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string) {
-				return taggingMetadataResult{}, nil
+			metadata: func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string, map[string]CacheOutcome) {
+				return taggingMetadataResult{}, nil, nil
 			},
 			lyrics: func(context.Context, TrackPipelineRequest, int) (string, error) {
 				return "", nil
@@ -424,8 +486,8 @@ func TestTrackPipelineCleansTrackTempOnFailureAndCancellation(t *testing.T) {
 			downloadCover: func(context.Context, *SpotiDownloader, string, string, bool) (string, error) {
 				return "", nil
 			},
-			metadata: func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string) {
-				return taggingMetadataResult{}, nil
+			metadata: func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string, map[string]CacheOutcome) {
+				return taggingMetadataResult{}, nil, nil
 			},
 			lyrics:        func(context.Context, TrackPipelineRequest, int) (string, error) { return "", nil },
 			probeDuration: func(context.Context, string) (float64, error) { return 1, nil },
@@ -459,8 +521,8 @@ func TestTrackPipelineCleansTrackTempOnFailureAndCancellation(t *testing.T) {
 			downloadCover: func(context.Context, *SpotiDownloader, string, string, bool) (string, error) {
 				return "", nil
 			},
-			metadata: func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string) {
-				return taggingMetadataResult{}, nil
+			metadata: func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string, map[string]CacheOutcome) {
+				return taggingMetadataResult{}, nil, nil
 			},
 			lyrics:        func(context.Context, TrackPipelineRequest, int) (string, error) { return "", nil },
 			probeDuration: func(context.Context, string) (float64, error) { return 1, nil },
@@ -505,9 +567,9 @@ func TestTrackPipelineCleansTrackTempOnFailureAndCancellation(t *testing.T) {
 				close(coverDone)
 				return "", ctx.Err()
 			},
-			metadata: func(ctx context.Context, _ *MetadataCache, _ TaggingMetadataRequest) (taggingMetadataResult, []string) {
+			metadata: func(ctx context.Context, _ *MetadataCache, _ TaggingMetadataRequest) (taggingMetadataResult, []string, map[string]CacheOutcome) {
 				<-ctx.Done()
-				return taggingMetadataResult{}, nil
+				return taggingMetadataResult{}, nil, nil
 			},
 			lyrics: func(ctx context.Context, _ TrackPipelineRequest, _ int) (string, error) {
 				<-ctx.Done()
@@ -603,8 +665,8 @@ func TestTrackPipelineForceBypassesExistingOutput(t *testing.T) {
 		},
 		convertAudio:  func(_ context.Context, path, _, _ string) (string, error) { return path, nil },
 		downloadCover: func(context.Context, *SpotiDownloader, string, string, bool) (string, error) { return "", nil },
-		metadata: func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string) {
-			return taggingMetadataResult{}, nil
+		metadata: func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string, map[string]CacheOutcome) {
+			return taggingMetadataResult{}, nil, nil
 		},
 		lyrics:        func(context.Context, TrackPipelineRequest, int) (string, error) { return "", nil },
 		probeDuration: func(context.Context, string) (float64, error) { return 0, nil },
@@ -654,19 +716,13 @@ func TestTrackPipelineDefaultMetadataPropagatesCacheOutcomes(t *testing.T) {
 	seed(chosicTrackCacheKey(trackID), "artist-1", trackMetadataTTL)
 	seed(artistGenreCacheKey("artist-1"), []string{"ambient"}, artistGenreTTL)
 
-	s := &SpotiDownloader{metadataCache: cache}
-	result := trackPipelineMetadataCall(defaultTrackPipelineDeps, context.Background(), s, TrackPipelineRequest{
-		TrackID:        trackID,
-		EmbedGenre:     true,
-		UseSingleGenre: true,
-		BaseMetadata:   Metadata{Title: "Track", Artist: "Artist", Album: "Album", Date: "2024-01-01"},
+	_, _, outcomes := pipelineDeps.metadata(context.Background(), cache, TaggingMetadataRequest{
+		TrackID: trackID, TrackName: "Track", ArtistName: "Artist", AlbumName: "Album", ReleaseDate: "2024-01-01",
+		EmbedGenre: true, UseSingleGenre: true,
 	})
-	if result.err != nil {
-		t.Fatalf("metadata error = %v", result.err)
-	}
 	for _, key := range []string{isrcCacheKey(trackID), chosicTrackCacheKey(trackID), artistGenreCacheKey("artist-1")} {
-		if got := result.cacheOutcomes[key]; got != CacheHit {
-			t.Fatalf("cache outcome[%q] = %q, want %q (all=%v)", key, got, CacheHit, result.cacheOutcomes)
+		if got := outcomes[key]; got != CacheHit {
+			t.Fatalf("cache outcome[%q] = %q, want %q (all=%v)", key, got, CacheHit, outcomes)
 		}
 	}
 }
@@ -707,30 +763,19 @@ func TestTrackPipelineDefaultMetadataSpotifyCacheOutcomeMissThenHit(t *testing.T
 		t.Fatalf("cache warnings = %v", warnings)
 	}
 	defer cache.Close()
-	s := &SpotiDownloader{metadataCache: cache}
-	req := TrackPipelineRequest{
-		TrackID:      "spotify-outcome-track",
-		BaseMetadata: Metadata{Title: "Track", Artist: "Artist", Album: "Album"},
-		EmbedGenre:   false,
+	req := TaggingMetadataRequest{TrackID: "spotify-outcome-track", TrackName: "Track", ArtistName: "Artist", AlbumName: "Album"}
+
+	first, firstWarnings, firstOutcomes := pipelineDeps.metadata(context.Background(), cache, req)
+	if got := first.ReleaseDate; got != "2024-01-02" {
+		t.Fatalf("first release date = %q, want 2024-01-02 (warnings=%v)", got, firstWarnings)
+	}
+	if got := firstOutcomes[spotifyCacheKey(req.TrackID)]; got != CacheMiss {
+		t.Fatalf("first spotify outcome = %q, want %q (all=%v)", got, CacheMiss, firstOutcomes)
 	}
 
-	first := trackPipelineMetadataCall(defaultTrackPipelineDeps, context.Background(), s, req)
-	if first.err != nil {
-		t.Fatalf("first metadata error = %v (warnings=%v)", first.err, first.warnings)
-	}
-	if got := first.tagging.ReleaseDate; got != "2024-01-02" {
-		t.Fatalf("first release date = %q, want 2024-01-02", got)
-	}
-	if got := first.cacheOutcomes[spotifyCacheKey(req.TrackID)]; got != CacheMiss {
-		t.Fatalf("first spotify outcome = %q, want %q (all=%v)", got, CacheMiss, first.cacheOutcomes)
-	}
-
-	second := trackPipelineMetadataCall(defaultTrackPipelineDeps, context.Background(), s, req)
-	if second.err != nil {
-		t.Fatalf("second metadata error = %v (warnings=%v)", second.err, second.warnings)
-	}
-	if got := second.cacheOutcomes[spotifyCacheKey(req.TrackID)]; got != CacheHit {
-		t.Fatalf("second spotify outcome = %q, want %q (all=%v)", got, CacheHit, second.cacheOutcomes)
+	_, _, secondOutcomes := pipelineDeps.metadata(context.Background(), cache, req)
+	if got := secondOutcomes[spotifyCacheKey(req.TrackID)]; got != CacheHit {
+		t.Fatalf("second spotify outcome = %q, want %q (all=%v)", got, CacheHit, secondOutcomes)
 	}
 	if got := spotifyCalls.Load(); got != 1 {
 		t.Fatalf("spotify calls = %d, want one miss loader call", got)
@@ -759,8 +804,8 @@ func TestTrackPipelineRejectsLyricsCompletedAtAbsoluteDeadline(t *testing.T) {
 		},
 		convertAudio:  func(_ context.Context, path, _, _ string) (string, error) { return path, nil },
 		downloadCover: func(context.Context, *SpotiDownloader, string, string, bool) (string, error) { return "", nil },
-		metadata: func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string) {
-			return taggingMetadataResult{}, nil
+		metadata: func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string, map[string]CacheOutcome) {
+			return taggingMetadataResult{}, nil, nil
 		},
 		lyrics: func(ctx context.Context, _ TrackPipelineRequest, _ int) (string, error) {
 			select {
@@ -786,9 +831,9 @@ func TestTrackPipelineRejectsLyricsCompletedAtAbsoluteDeadline(t *testing.T) {
 			}
 			return startedAt
 		},
-		newTimer: func(time.Duration) <-chan time.Time {
+		newTimer: func(time.Duration) (<-chan time.Time, func() bool) {
 			close(timerCreated)
-			return timerReady
+			return timerReady, func() bool { return true }
 		},
 	})
 
@@ -847,9 +892,9 @@ func TestTrackPipelineSynthesizedTimeoutsRecordBranchTimings(t *testing.T) {
 			<-releaseBranches
 			return "", ctx.Err()
 		},
-		metadata: func(ctx context.Context, _ *MetadataCache, _ TaggingMetadataRequest) (taggingMetadataResult, []string) {
+		metadata: func(ctx context.Context, _ *MetadataCache, _ TaggingMetadataRequest) (taggingMetadataResult, []string, map[string]CacheOutcome) {
 			<-releaseBranches
-			return taggingMetadataResult{}, nil
+			return taggingMetadataResult{}, nil, nil
 		},
 		probeDuration: func(context.Context, string) (float64, error) { return 1, nil },
 		finalizeMedia: func(context.Context, string, Metadata, string) error {
@@ -935,9 +980,9 @@ func TestTrackPipelineLyricsDeadlineUsesInjectedContext(t *testing.T) {
 			return nil
 		},
 		now: func() time.Time { return startedAt },
-		newTimer: func(time.Duration) <-chan time.Time {
+		newTimer: func(time.Duration) (<-chan time.Time, func() bool) {
 			close(timerCreated)
-			return timerReady
+			return timerReady, func() bool { return true }
 		},
 		withDeadline: func(parent context.Context, gotDeadline time.Time) (context.Context, context.CancelFunc) {
 			if !gotDeadline.Equal(deadline) {
@@ -992,16 +1037,16 @@ func TestTrackPipelineLyricsDeadlineUsesInjectedContext(t *testing.T) {
 func TestTrackPipelineRefreshCancellationDuringResolverAndAudio(t *testing.T) {
 	tests := []struct {
 		name  string
-		setup func(*SpotiDownloader, *httptest.Server, TrackPipelineRequest)
+		setup func(*testing.T, *httptest.Server)
 	}{
-		{name: "resolver", setup: func(s *SpotiDownloader, server *httptest.Server, _ TrackPipelineRequest) {
-			s.pipelineDeps.resolveTarget = trackPipelineResolveTarget
-		}},
-		{name: "audio", setup: func(s *SpotiDownloader, server *httptest.Server, _ TrackPipelineRequest) {
-			s.pipelineDeps.resolveTarget = func(context.Context, *SpotiDownloader, TrackPipelineRequest) (string, string, error) {
-				return server.URL, ".mp3", nil
-			}
-			s.pipelineDeps.downloadAudio = trackPipelineDownloadAudio
+		// The production resolver and downloader both hit the 401 server.
+		{name: "resolver", setup: func(*testing.T, *httptest.Server) {}},
+		{name: "audio", setup: func(t *testing.T, server *httptest.Server) {
+			installPipelineDepsForTest(t, trackPipelineDeps{
+				resolveTarget: func(context.Context, *SpotiDownloader, TrackPipelineRequest) (string, string, error) {
+					return server.URL, ".mp3", nil
+				},
+			})
 		}},
 	}
 	for _, test := range tests {
@@ -1030,7 +1075,7 @@ func TestTrackPipelineRefreshCancellationDuringResolverAndAudio(t *testing.T) {
 				close(refreshStopped)
 				return refreshCtx.Err()
 			}
-			test.setup(s, server, req)
+			test.setup(t, server)
 
 			resultCh := make(chan error, 1)
 			started := time.Now()
@@ -1091,7 +1136,7 @@ func TestTrackPipelineDefaultResolverRetriesSessionToken(t *testing.T) {
 		s.sessionToken = "fresh"
 		return nil
 	}
-	_, _, err := trackPipelineResolveTargetCall(defaultTrackPipelineDeps, context.Background(), s, TrackPipelineRequest{TrackID: "track-1", AudioFormat: "mp3"})
+	_, _, err := trackPipelineResolveTarget(context.Background(), s, TrackPipelineRequest{TrackID: "track-1", AudioFormat: "mp3"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1122,7 +1167,7 @@ func TestTrackPipelineDefaultAudioRetriesSessionToken(t *testing.T) {
 		s.sessionToken = "fresh"
 		return nil
 	}
-	path, err := trackPipelineDownloadAudio(context.Background(), s, server.URL, filepath.Join(t.TempDir(), "track"), ".mp3", "item-1")
+	path, err := s.downloadAudio(context.Background(), server.URL, filepath.Join(t.TempDir(), "track"), ".mp3", "item-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1149,7 +1194,7 @@ func TestTrackPipelineResolverRetryStopsOnCancellation(t *testing.T) {
 		refreshes.Add(1)
 		return nil
 	}
-	_, _, err := trackPipelineResolveTargetCall(defaultTrackPipelineDeps, ctx, s, TrackPipelineRequest{TrackID: "track-1", AudioFormat: "mp3"})
+	_, _, err := trackPipelineResolveTarget(ctx, s, TrackPipelineRequest{TrackID: "track-1", AudioFormat: "mp3"})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want cancellation", err)
 	}

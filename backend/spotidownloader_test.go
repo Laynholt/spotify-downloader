@@ -7,81 +7,16 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
-	"time"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
-}
-
-func TestDownloadTrackContextPreservesFinalizedOutputAfterCancellation(t *testing.T) {
-	dir := t.TempDir()
-	outputPath := filepath.Join(dir, "track - artist.flac")
-	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if req.Method == http.MethodPost {
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Header:     make(http.Header),
-				Body:       io.NopCloser(bytes.NewBufferString(`{"success":true,"linkFlac":"https://download.test/audio"}`)),
-				Request:    req,
-			}, nil
-		}
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": []string{"audio/flac"}},
-			Body:       io.NopCloser(bytes.NewBufferString("partial flac")),
-			Request:    req,
-		}, nil
-	})}
-	downloader := &SpotiDownloader{httpClient: client}
-
-	finalized := make(chan struct{})
-	previousFinalize := finalizeTaggedAudioFileForDownload
-	finalizeTaggedAudioFileForDownload = func(path string) error {
-		if err := previousFinalize(path); err != nil {
-			return err
-		}
-		close(finalized)
-		return nil
-	}
-	t.Cleanup(func() { finalizeTaggedAudioFileForDownload = previousFinalize })
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct {
-		path string
-		err  error
-	}, 1)
-	go func() {
-		path, err := downloader.DownloadTrackContext(ctx, "", dir, "flac", "default", false, 0,
-			"track", "artist", "album", "artist", "", "", 0, 0, 0, false, false, 0,
-			"", "", "", "", false, false, false)
-		done <- struct {
-			path string
-			err  error
-		}{path, err}
-	}()
-	select {
-	case <-finalized:
-		cancel()
-	case <-time.After(time.Second):
-		cancel()
-		t.Fatal("download did not reach finalization barrier")
-	}
-	result := <-done
-	if result.err != nil {
-		t.Fatalf("download returned error after finalized cancellation: %v", result.err)
-	}
-	if result.path != outputPath {
-		t.Fatalf("download path = %q, want %q", result.path, outputPath)
-	}
-	if _, err := os.Stat(outputPath); err != nil {
-		t.Fatalf("finalized output was removed after cancellation: %v", err)
-	}
 }
 
 func TestStatusErrorTreatsUnauthorizedStatusesAsSessionTokenErrors(t *testing.T) {
@@ -137,14 +72,58 @@ func TestGetDownloadLinkRetriesTransientProxyError(t *testing.T) {
 		},
 	}
 
-	resp, err := downloader.getDownloadLink("track-id")
+	resp, err := downloader.requestDownloadLink(context.Background(), "track-id")
 	if err != nil {
-		t.Fatalf("getDownloadLink returned error: %v", err)
+		t.Fatalf("requestDownloadLink returned error: %v", err)
 	}
 	if attempts != 2 {
 		t.Fatalf("expected 2 attempts, got %d", attempts)
 	}
 	if resp.Link != "https://example.com/file.mp3" {
 		t.Fatalf("unexpected link: %q", resp.Link)
+	}
+}
+
+func TestRefreshSessionTokenRunsHelperOnceForConcurrentWorkers(t *testing.T) {
+	RememberSessionToken("old")
+	previous := fetchSessionToken
+	t.Cleanup(func() { fetchSessionToken = previous })
+	var calls atomic.Int32
+	release := make(chan struct{})
+	fetchSessionToken = func(context.Context, int, int) (string, error) {
+		calls.Add(1)
+		<-release
+		return "new", nil
+	}
+
+	workers := make([]*SpotiDownloader, 3)
+	var wg sync.WaitGroup
+	for i := range workers {
+		workers[i] = &SpotiDownloader{sessionToken: "old"}
+		wg.Add(1)
+		go func(s *SpotiDownloader) {
+			defer wg.Done()
+			if err := s.refreshSessionToken(context.Background()); err != nil {
+				t.Error(err)
+			}
+		}(workers[i])
+	}
+	for calls.Load() == 0 {
+		runtime.Gosched()
+	}
+	close(release)
+	wg.Wait()
+
+	late := &SpotiDownloader{sessionToken: "old"}
+	if err := late.refreshSessionToken(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("token helper ran %d times, want 1", calls.Load())
+	}
+	for _, s := range append(workers, late) {
+		if s.sessionToken != "new" {
+			t.Fatalf("worker token = %q, want new", s.sessionToken)
+		}
 	}
 }

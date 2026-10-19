@@ -308,7 +308,7 @@ func TestEmbedMetadataContextMP3VerificationCancellation(t *testing.T) {
 		doneErr := verifyEmbeddedMetadataContext(ctx, filePath, Metadata{Title: "title"})
 		done <- doneErr
 	}()
-	if err := waitForFile(marker, time.Second); err != nil {
+	if err := waitForFile(marker, helperProcessTimeout); err != nil {
 		cancel()
 		t.Fatal("metadata verification helper did not start:", err)
 	}
@@ -318,7 +318,7 @@ func TestEmbedMetadataContextMP3VerificationCancellation(t *testing.T) {
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("metadata verification cancellation error = %v, want context.Canceled", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(helperProcessTimeout):
 		t.Fatal("metadata verification ignored cancellation")
 	}
 }
@@ -338,7 +338,7 @@ func TestEmbedLyricsOnlyContextM4ACancellation(t *testing.T) {
 		err := EmbedLyricsOnlyContext(ctx, filePath, "[00:00.00]test")
 		done <- err
 	}()
-	if err := waitForFile(marker, time.Second); err != nil {
+	if err := waitForFile(marker, helperProcessTimeout); err != nil {
 		cancel()
 		t.Fatal("lyrics helper did not start:", err)
 	}
@@ -348,7 +348,7 @@ func TestEmbedLyricsOnlyContextM4ACancellation(t *testing.T) {
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("lyrics cancellation error = %v, want context.Canceled", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(helperProcessTimeout):
 		t.Fatal("lyrics embedding ignored cancellation")
 	}
 	if _, err := os.Stat(filePath + ".tmp.m4a"); !os.IsNotExist(err) {

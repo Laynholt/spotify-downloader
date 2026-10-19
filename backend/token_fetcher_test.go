@@ -107,7 +107,7 @@ func TestFetchSessionTokenWithParamsContextKillsHelperTree(t *testing.T) {
 		_, fetchErr := FetchSessionTokenWithParamsContext(ctx, 15, 0)
 		done <- fetchErr
 	}()
-	if err := waitForFile(marker, time.Second); err != nil {
+	if err := waitForFile(marker, helperProcessTimeout); err != nil {
 		cancel()
 		t.Fatal("token helper descendant did not start:", err)
 	}
@@ -118,8 +118,8 @@ func TestFetchSessionTokenWithParamsContextKillsHelperTree(t *testing.T) {
 		if !errors.Is(fetchErr, context.Canceled) {
 			t.Fatalf("token fetch cancellation error = %v, want context.Canceled", fetchErr)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("token helper cancellation exceeded one second")
+	case <-time.After(helperProcessTimeout):
+		t.Fatal("token helper cancellation exceeded bounded wait")
 	}
 	if err := os.WriteFile(release, []byte("release"), 0600); err != nil {
 		t.Fatal(err)

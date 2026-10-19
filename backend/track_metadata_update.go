@@ -194,10 +194,14 @@ func UpdateTrackMetadata(req TrackMetadataUpdateRequest) TrackMetadataUpdateResu
 
 	var coverPath string
 	if strings.TrimSpace(req.CoverURL) != "" {
-		downloader := NewSpotiDownloader("")
 		var coverErr error
-		coverPath, coverErr = downloader.downloadCoverImage(req.CoverURL, filepath.Dir(req.FilePath), req.EmbedMaxQualityCover)
-		downloader.CloseIdleConnections()
+		if paths, pathErr := CurrentRuntimePaths(); pathErr != nil {
+			coverErr = pathErr
+		} else {
+			downloader := NewSpotiDownloader("")
+			coverPath, coverErr = downloader.downloadCover(context.Background(), req.CoverURL, paths.RunTempDir, req.EmbedMaxQualityCover)
+			downloader.CloseIdleConnections()
+		}
 		if coverErr != nil {
 			fmt.Printf("Warning: Failed to download cover image for metadata update: %v\n", coverErr)
 			coverPath = ""
@@ -294,7 +298,7 @@ func prepareYouTubeRedownloadMetadata(ctx context.Context, req TrackMetadataUpda
 	if strings.TrimSpace(req.CoverURL) != "" {
 		downloader := NewSpotiDownloader("")
 		var err error
-		coverPath, err = downloader.downloadCoverImageContextToDir(ctx, req.CoverURL, tempDir, req.EmbedMaxQualityCover, "")
+		coverPath, err = downloader.downloadCover(ctx, req.CoverURL, tempDir, req.EmbedMaxQualityCover)
 		downloader.CloseIdleConnections()
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return Metadata{}, "", ctxErr

@@ -1,11 +1,31 @@
 package backend
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 )
+
+var ErrFileExists = errors.New("file already exists")
+
+// RenameNoReplace moves srcPath to dstPath but never replaces another file:
+// os.Rename on Windows silently overwrites an existing destination.
+func RenameNoReplace(srcPath, dstPath string) error {
+	dstInfo, err := os.Stat(dstPath)
+	if os.IsNotExist(err) {
+		return MoveFileWithFallback(srcPath, dstPath)
+	}
+	if err != nil {
+		return err
+	}
+	// A case-only rename on Windows finds the source itself at dstPath.
+	if srcInfo, srcErr := os.Stat(srcPath); srcErr != nil || !os.SameFile(srcInfo, dstInfo) {
+		return fmt.Errorf("%w: %s", ErrFileExists, filepath.Base(dstPath))
+	}
+	return MoveFileWithFallback(srcPath, dstPath)
+}
 
 func MoveFileWithFallback(srcPath, dstPath string) error {
 	srcPath = filepath.Clean(srcPath)

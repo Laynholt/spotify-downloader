@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useLayoutEffect, useRef, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { InputWithContext } from "@/components/ui/input-with-context";
 import { CloudDownload, XCircle, Link, Search, X, ChevronDown } from "lucide-react";
@@ -45,7 +45,10 @@ interface SearchBarProps {
 export function SearchBar({ url, loading, onUrlChange, onFetch, onFetchUrl, history, onHistorySelect, onHistoryRemove, hasResult, searchMode, onSearchModeChange, }: SearchBarProps) {
     const [searchQuery, setSearchQuery] = useState("");
     const [searchResults, setSearchResults] = useState<backend.SearchResponse | null>(null);
-    const [isSearching, setIsSearching] = useState(false);
+    const [searchStatus, setSearchStatus] = useState<"idle" | "debouncing" | "loading" | "success" | "empty" | "error">("idle");
+    const [searchError, setSearchError] = useState("");
+    const [loadMoreError, setLoadMoreError] = useState("");
+    const [retry, setRetry] = useState(0);
     const [isLoadingMore, setIsLoadingMore] = useState(false);
     const [lastSearchedQuery, setLastSearchedQuery] = useState("");
     const [activeTab, setActiveTab] = useState<ResultTab>("tracks");
@@ -58,7 +61,13 @@ export function SearchBar({ url, loading, onUrlChange, onFetch, onFetchUrl, hist
     });
     const [showInvalidUrlDialog, setShowInvalidUrlDialog] = useState(false);
     const [invalidUrl, setInvalidUrl] = useState("");
-    const searchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const searchGeneration = useRef(0);
+    const pageGeneration = useRef(0);
+    const invalidateRequests = useCallback(() => {
+        searchGeneration.current++;
+        pageGeneration.current++;
+    }, []);
+    const isSearching = searchStatus === "loading" || searchStatus === "debouncing";
     const placeholders = searchMode ? SEARCH_PLACEHOLDERS : FETCH_PLACEHOLDERS;
     const placeholderText = useTypingEffect(placeholders);
     useEffect(() => {
@@ -72,7 +81,7 @@ export function SearchBar({ url, loading, onUrlChange, onFetch, onFetchUrl, hist
             console.error("Failed to load recent searches:", error);
         }
     }, []);
-    const saveRecentSearch = (query: string) => {
+    const saveRecentSearch = useCallback((query: string) => {
         const trimmed = query.trim();
         if (!trimmed)
             return;
@@ -87,7 +96,7 @@ export function SearchBar({ url, loading, onUrlChange, onFetch, onFetchUrl, hist
             }
             return updated;
         });
-    };
+    }, []);
     const removeRecentSearch = (query: string) => {
         setRecentSearches((prev) => {
             const updated = prev.filter((s) => s !== query);
@@ -100,23 +109,50 @@ export function SearchBar({ url, loading, onUrlChange, onFetch, onFetchUrl, hist
             return updated;
         });
     };
-    useEffect(() => {
-        if (!searchMode || !searchQuery.trim()) {
-            return;
-        }
-        if (searchQuery.trim() === lastSearchedQuery) {
-            return;
-        }
-        if (searchTimeoutRef.current) {
-            clearTimeout(searchTimeoutRef.current);
-        }
-        searchTimeoutRef.current = setTimeout(async () => {
-            setIsSearching(true);
+    const invalidateSearch = () => {
+        invalidateRequests();
+        setSearchResults(null);
+        setLastSearchedQuery("");
+        setIsLoadingMore(false);
+        setLoadMoreError("");
+        setSearchError("");
+    };
+    const changeQuery = (query: string) => {
+        invalidateSearch();
+        setSearchStatus(query.trim() ? "debouncing" : "idle");
+        setSearchQuery(query);
+    };
+    const changeMode = (mode: boolean) => {
+        invalidateSearch();
+        onSearchModeChange(mode);
+    };
+    const changeTab = (tab: ResultTab) => {
+        pageGeneration.current++;
+        setIsLoadingMore(false);
+        setLoadMoreError("");
+        setActiveTab(tab);
+    };
+    useLayoutEffect(() => {
+        invalidateRequests();
+        const generation = searchGeneration.current;
+        setSearchResults(null);
+        setLastSearchedQuery("");
+        setIsLoadingMore(false);
+        setLoadMoreError("");
+        setSearchError("");
+        const query = searchQuery.trim();
+        setSearchStatus(searchMode && query ? "debouncing" : "idle");
+        if (!searchMode || !query) return;
+        const timeout = setTimeout(async () => {
+            if (generation !== searchGeneration.current) return;
+            setSearchStatus("loading");
             try {
-                const results = await SearchSpotify({ query: searchQuery, limit: SEARCH_LIMIT });
+                const results = await SearchSpotify({ query, limit: SEARCH_LIMIT });
+                if (generation !== searchGeneration.current) return;
                 setSearchResults(results);
-                setLastSearchedQuery(searchQuery.trim());
-                saveRecentSearch(searchQuery.trim());
+                setLastSearchedQuery(query);
+                saveRecentSearch(query);
+                setSearchStatus(results.tracks.length || results.albums.length || results.artists.length || results.playlists.length ? "success" : "empty");
                 setHasMore({
                     tracks: results.tracks.length === SEARCH_LIMIT,
                     albums: results.albums.length === SEARCH_LIMIT,
@@ -133,19 +169,16 @@ export function SearchBar({ url, loading, onUrlChange, onFetch, onFetchUrl, hist
                     setActiveTab("playlists");
             }
             catch (error) {
-                console.error("Search failed:", error);
-                setSearchResults(null);
-            }
-            finally {
-                setIsSearching(false);
+                if (generation !== searchGeneration.current) return;
+                setSearchError(String(error));
+                setSearchStatus("error");
             }
         }, 400);
         return () => {
-            if (searchTimeoutRef.current) {
-                clearTimeout(searchTimeoutRef.current);
-            }
+            clearTimeout(timeout);
+            invalidateRequests();
         };
-    }, [searchQuery, searchMode, lastSearchedQuery]);
+    }, [searchQuery, searchMode, retry, saveRecentSearch, invalidateRequests]);
     const handleLoadMore = async () => {
         if (!searchResults || !lastSearchedQuery || isLoadingMore)
             return;
@@ -156,7 +189,12 @@ export function SearchBar({ url, loading, onUrlChange, onFetch, onFetchUrl, hist
             playlists: "playlist",
         };
         const currentCount = getTabCount(activeTab);
+        const generation = searchGeneration.current;
+        const page = ++pageGeneration.current;
+        const tab = activeTab;
+        const isCurrent = () => generation === searchGeneration.current && page === pageGeneration.current;
         setIsLoadingMore(true);
+        setLoadMoreError("");
         try {
             const moreResults = await SearchSpotifyByType({
                 query: lastSearchedQuery,
@@ -164,29 +202,30 @@ export function SearchBar({ url, loading, onUrlChange, onFetch, onFetchUrl, hist
                 limit: SEARCH_LIMIT,
                 offset: currentCount,
             });
+            if (!isCurrent()) return;
             if (moreResults.length > 0) {
                 setSearchResults((prev) => {
-                    if (!prev)
+                    if (!prev || !isCurrent())
                         return prev;
                     const updated = new backend.SearchResponse({
-                        tracks: activeTab === "tracks" ? [...prev.tracks, ...moreResults] : prev.tracks,
-                        albums: activeTab === "albums" ? [...prev.albums, ...moreResults] : prev.albums,
-                        artists: activeTab === "artists" ? [...prev.artists, ...moreResults] : prev.artists,
-                        playlists: activeTab === "playlists" ? [...prev.playlists, ...moreResults] : prev.playlists,
+                        tracks: tab === "tracks" ? [...prev.tracks, ...moreResults] : prev.tracks,
+                        albums: tab === "albums" ? [...prev.albums, ...moreResults] : prev.albums,
+                        artists: tab === "artists" ? [...prev.artists, ...moreResults] : prev.artists,
+                        playlists: tab === "playlists" ? [...prev.playlists, ...moreResults] : prev.playlists,
                     });
                     return updated;
                 });
             }
             setHasMore((prev) => ({
                 ...prev,
-                [activeTab]: moreResults.length === SEARCH_LIMIT,
+                [tab]: moreResults.length === SEARCH_LIMIT,
             }));
         }
         catch (error) {
-            console.error("Load more failed:", error);
+            if (isCurrent()) setLoadMoreError(String(error));
         }
         finally {
-            setIsLoadingMore(false);
+            if (isCurrent()) setIsLoadingMore(false);
         }
     };
     const isSpotifyUrl = (text: string) => {
@@ -219,7 +258,7 @@ export function SearchBar({ url, loading, onUrlChange, onFetch, onFetchUrl, hist
         onFetch();
     };
     const handleResultClick = (externalUrl: string) => {
-        onSearchModeChange(false);
+        changeMode(false);
         onFetchUrl(externalUrl);
     };
     const formatDuration = (ms: number) => {
@@ -254,7 +293,7 @@ export function SearchBar({ url, loading, onUrlChange, onFetch, onFetchUrl, hist
             <div className="flex gap-2">
                 <Tooltip>
                     <TooltipTrigger asChild>
-                        <Button variant="outline" size="icon" className="shrink-0" onClick={() => onSearchModeChange(!searchMode)}>
+                        <Button variant="outline" size="icon" aria-label={searchMode ? "Switch to fetch mode" : "Switch to search mode"} className="shrink-0" onClick={() => changeMode(!searchMode)}>
                             {searchMode ? (<Link className="h-4 w-4"/>) : (<Search className="h-4 w-4"/>)}
                         </Button>
                     </TooltipTrigger>
@@ -270,12 +309,8 @@ export function SearchBar({ url, loading, onUrlChange, onFetch, onFetchUrl, hist
                                     <XCircle className="h-4 w-4"/>
                                 </button>)}
                         </>) : (<>
-                            <InputWithContext id="spotify-search" placeholder={placeholderText} value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} className="pr-8"/>
-                            {searchQuery && (<button type="button" className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors cursor-pointer" onClick={() => {
-                    setSearchQuery("");
-                    setSearchResults(null);
-                    setLastSearchedQuery("");
-                }}>
+                            <InputWithContext id="spotify-search" aria-label="Search Spotify" placeholder={placeholderText} value={searchQuery} onChange={(e) => changeQuery(e.target.value)} className="pr-8"/>
+                            {searchQuery && (<button type="button" aria-label="Clear search" className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors cursor-pointer" onClick={() => changeQuery("")}>
                                     <XCircle className="h-4 w-4"/>
                                 </button>)}
                         </>)}
@@ -298,7 +333,7 @@ export function SearchBar({ url, loading, onUrlChange, onFetch, onFetchUrl, hist
                     {!searchQuery && !searchResults && recentSearches.length > 0 && (<div className="space-y-2">
                             <p className="text-sm text-muted-foreground">Recent Searches</p>
                             <div className="flex flex-wrap gap-2">
-                                {recentSearches.map((query) => (<div key={query} className="group relative flex items-center px-3 py-1.5 bg-muted hover:bg-accent rounded-full text-sm cursor-pointer transition-colors" onClick={() => setSearchQuery(query)}>
+                                {recentSearches.map((query) => (<div key={query} className="group relative flex items-center px-3 py-1.5 bg-muted hover:bg-accent rounded-full text-sm cursor-pointer transition-colors" onClick={() => changeQuery(query)}>
                                         <span>{query}</span>
                                         <button type="button" className="absolute -top-1.5 -right-1.5 z-10 w-5 h-5 rounded-full bg-red-500 hover:bg-red-600 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all cursor-pointer shadow-sm" onClick={(e) => {
                         e.stopPropagation();
@@ -312,10 +347,14 @@ export function SearchBar({ url, loading, onUrlChange, onFetch, onFetchUrl, hist
 
                     {isSearching && (<div className="flex items-center justify-center py-8">
                             <Spinner />
-                            <span className="ml-2 text-muted-foreground">Searching...</span>
+                            <span className="ml-2 text-muted-foreground" role="status">{searchStatus === "debouncing" ? "Waiting to search..." : "Searching..."}</span>
                         </div>)}
 
-                    {!isSearching && searchQuery && !hasAnyResults && (<div className="text-center py-8 text-muted-foreground">
+                    {searchStatus === "error" && (<div className="text-center py-8 space-y-2">
+                            <p role="alert">Search failed: {searchError}</p>
+                            <Button variant="outline" onClick={() => { invalidateSearch(); setRetry((value) => value + 1); }}>Retry search</Button>
+                        </div>)}
+                    {searchStatus === "empty" && (<div className="text-center py-8 text-muted-foreground">
                             No results found for "{searchQuery}"
                         </div>)}
 
@@ -325,7 +364,7 @@ export function SearchBar({ url, loading, onUrlChange, onFetch, onFetchUrl, hist
                     const count = getTabCount(tab.key);
                     if (count === 0)
                         return null;
-                    return (<button key={tab.key} type="button" onClick={() => setActiveTab(tab.key)} className={cn("px-4 py-2 text-sm font-medium transition-colors cursor-pointer border-b-2 -mb-px", activeTab === tab.key
+                    return (<button key={tab.key} type="button" onClick={() => changeTab(tab.key)} className={cn("px-4 py-2 text-sm font-medium transition-colors cursor-pointer border-b-2 -mb-px", activeTab === tab.key
                             ? "border-primary text-foreground"
                             : "border-transparent text-muted-foreground hover:text-foreground")}>
                                             {tab.label} ({count})
@@ -388,6 +427,7 @@ export function SearchBar({ url, loading, onUrlChange, onFetch, onFetchUrl, hist
                                         </button>))}
                             </div>
 
+                            {loadMoreError && <p role="alert" className="text-center">Could not load more results: {loadMoreError}</p>}
                             {hasMore[activeTab] && (<div className="flex justify-center pt-2">
                                     <Button variant="outline" onClick={handleLoadMore} disabled={isLoadingMore}>
                                         {isLoadingMore ? (<>
@@ -395,7 +435,7 @@ export function SearchBar({ url, loading, onUrlChange, onFetch, onFetchUrl, hist
                                                 Loading...
                                             </>) : (<>
                                                 <ChevronDown className="h-4 w-4"/>
-                                                Load More
+                                                {loadMoreError ? "Retry loading more" : "Load More"}
                                             </>)}
                                     </Button>
                                 </div>)}
@@ -423,7 +463,7 @@ export function SearchBar({ url, loading, onUrlChange, onFetch, onFetchUrl, hist
                             Cancel
                         </Button>
                         <Button onClick={() => {
-            onSearchModeChange(true);
+            changeMode(true);
             setShowInvalidUrlDialog(false);
             setInvalidUrl("");
         }}>
