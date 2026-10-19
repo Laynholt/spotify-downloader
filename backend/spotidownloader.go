@@ -637,6 +637,22 @@ func (r *hlsProgressReporter) line(line string) {
 	}
 }
 
+// ffmpegHTTPProxy returns the proxy our own HTTP client uses for rawURL. A child
+// FFmpeg only reads proxy environment variables, which a GUI app started from
+// the desktop does not have, so it would bypass the Windows system proxy.
+// shortcut: FFmpeg tunnels only through HTTP proxies; a SOCKS-only proxy is skipped.
+func ffmpegHTTPProxy(rawURL string) string {
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return ""
+	}
+	proxyURL, err := proxyFromEnvironmentOrSystem(req)
+	if err != nil || proxyURL == nil || proxyURL.Scheme != "http" {
+		return ""
+	}
+	return proxyURL.String()
+}
+
 // fetchHLSAudio lets FFmpeg fetch every segment of an HLS stream and remux the
 // audio, without re-encoding, into one .m4a file.
 func fetchHLSAudio(ctx context.Context, playlistURL string, totalSeconds float64, outputBasePath, itemID string) (string, error) {
@@ -650,13 +666,17 @@ func fetchHLSAudio(ctx context.Context, playlistURL string, totalSeconds float64
 	outputPath := outputBasePath + ".m4a"
 	tempPath := outputBasePath + ".hls.m4a"
 	_ = os.Remove(tempPath)
-	cmd := newManagedCommand(ctx, ffmpegPath,
-		"-nostdin", "-v", "error", "-nostats", "-progress", "pipe:1", "-y",
-		"-i", playlistURL,
+	args := []string{"-nostdin", "-v", "error", "-nostats", "-progress", "pipe:1", "-y",
+		// Without it a stalled CDN connection blocks the track forever.
+		"-rw_timeout", "30000000"}
+	if proxy := ffmpegHTTPProxy(playlistURL); proxy != "" {
+		args = append(args, "-http_proxy", proxy)
+	}
+	args = append(args, "-i", playlistURL,
 		"-vn", "-map", "0:a:0", "-c:a", "copy",
 		"-movflags", "+faststart", "-f", "ipod",
-		tempPath,
-	)
+		tempPath)
+	cmd := newManagedCommand(ctx, ffmpegPath, args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	stdout, err := cmd.StdoutPipe()

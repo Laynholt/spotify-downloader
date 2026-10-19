@@ -559,7 +559,7 @@ function App() {
 
             <div className="flex-1 ml-14 mt-10 p-4 md:p-8">
                 <div className="max-w-4xl mx-auto space-y-6">
-                    <Suspense fallback={<div role="status" className="py-8 text-center text-muted-foreground">Loading pageвЂ¦</div>}>{renderPage()}</Suspense>
+                    <Suspense fallback={<div role="status" className="py-8 text-center text-muted-foreground">Loading page…</div>}>{renderPage()}</Suspense>
                 </div>
             </div>
 
@@ -660,7 +660,7 @@ function App() {
                         {!isInstallingFFmpeg && (<Button variant="outline" className="flex-1 h-11 text-sm font-bold transition-colors" onClick={() => Quit()}>
                                 Exit
                             </Button>)}
-                        {!isInstallingFFmpeg && <Button variant="outline" onClick={() => void checkFFmpeg()} disabled={isCheckingFFmpeg}>{isCheckingFFmpeg ? "CheckingвЂ¦" : "Check again"}</Button>}
+                        {!isInstallingFFmpeg && <Button variant="outline" onClick={() => void checkFFmpeg()} disabled={isCheckingFFmpeg}>{isCheckingFFmpeg ? "Checking…" : "Check again"}</Button>}
                         <Button className={`${isInstallingFFmpeg ? 'w-full' : 'flex-1'} h-11 text-sm font-bold shadow-lg shadow-primary/10`} onClick={handleInstallFFmpeg} disabled={isInstallingFFmpeg || isCheckingFFmpeg}>
                             {isInstallingFFmpeg ? "Installing..." : "Install now"}
                         </Button>

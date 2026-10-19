@@ -91,7 +91,7 @@ export function DownloadQueue({ isOpen, onClose, queueInfo: backendInfo, schedul
     const activeCount = queueInfo.active_count ?? queueInfo.queue.filter((item) => item.status === "downloading").length;
     const formatDuration = (startTimestamp: number) => {
         if (startTimestamp === 0)
-            return "вЂ”";
+            return "—";
         const durationSeconds = nowSeconds - startTimestamp;
         const hours = Math.floor(durationSeconds / 3600);
         const minutes = Math.floor((durationSeconds % 3600) / 60);
@@ -188,7 +188,7 @@ export function DownloadQueue({ isOpen, onClose, queueInfo: backendInfo, schedul
               <span className="font-semibold font-mono">
                 {queueInfo.current_speed > 0 && queueInfo.is_downloading
             ? `${queueInfo.current_speed.toFixed(2)} MB/s`
-            : "вЂ”"}
+            : "—"}
               </span>
             </div>
             <div className="flex items-center gap-1.5">
@@ -197,7 +197,7 @@ export function DownloadQueue({ isOpen, onClose, queueInfo: backendInfo, schedul
               <span className="font-semibold font-mono">
                 {queueInfo.session_start_time > 0
             ? formatDuration(queueInfo.session_start_time)
-            : "вЂ”"}
+            : "—"}
               </span>
             </div>
           </div>
@@ -229,9 +229,9 @@ export function DownloadQueue({ isOpen, onClose, queueInfo: backendInfo, schedul
                             {item.track_name}
                           </p>
                           <p className="text-sm text-muted-foreground truncate">
-                            {schedulerSnapshot.queues[item.queue_id]?.title && `${schedulerSnapshot.queues[item.queue_id]!.title} вЂў `}
+                            {schedulerSnapshot.queues[item.queue_id]?.title && `${schedulerSnapshot.queues[item.queue_id]!.title} • `}
                             {item.artist_name}
-                            {item.album_name && ` вЂў ${item.album_name}`}
+                            {item.album_name && ` • ${item.album_name}`}
                           </p>
                         </div>
                         {getStatusBadge(item.attempt_status === "suspicious" || item.attempt_status === "unavailable" ? item.attempt_status : item.status, item.phase)}
