@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-var AppVersion = "7.2.0"
+var AppVersion = "7.2.1"
 
 var musicBrainzHTTPClientFactory = func(timeout time.Duration) *http.Client {
 	return metadataHTTPClientFactory(timeout)

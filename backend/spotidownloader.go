@@ -111,6 +111,8 @@ type taggingMetadataResult struct {
 	ISRC        string
 	ReleaseDate string
 	Genre       string
+	TrackNumber int
+	TotalTracks int
 }
 
 type TaggingMetadataRequest struct {
@@ -119,6 +121,7 @@ type TaggingMetadataRequest struct {
 	ArtistName     string
 	AlbumName      string
 	ReleaseDate    string
+	TrackNumber    int
 	UseSingleGenre bool
 	EmbedGenre     bool
 }
@@ -206,12 +209,19 @@ func (s *SpotiDownloader) doRequestWithNetworkRetry(req *http.Request) (*http.Re
 
 		resp, err := s.httpClient.Do(req)
 		if err == nil {
-			return resp, nil
-		}
-		finalErr = err
-		if !isTransientNetworkError(err) || attempt == networkRetryAttempts {
+			switch resp.StatusCode {
+			case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+				if attempt == networkRetryAttempts || !canReplayRequest(req) {
+					return resp, nil
+				}
+				_ = resp.Body.Close()
+			default:
+				return resp, nil
+			}
+		} else if !isTransientNetworkError(err) || attempt == networkRetryAttempts || !canReplayRequest(req) {
 			return nil, err
 		}
+		finalErr = err
 
 		timer := time.NewTimer(delay)
 		select {
@@ -267,11 +277,11 @@ func fetchTaggingMetadataWithOutcomes(ctx context.Context, cache *MetadataCache,
 	var musicBrainzGenre string
 	var fallbackGenre string
 
-	if result.ReleaseDate == "" {
+	if result.ReleaseDate == "" || req.TrackNumber <= 0 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			releaseDate, outcome, err := fetchTrackTaggingMetadataContextWithOutcome(ctx, cache, req.TrackID)
+			track, outcome, err := fetchTrackTaggingMetadataContextWithOutcome(ctx, cache, req.TrackID)
 			resultMu.Lock()
 			outcomes[spotifyCacheKey(req.TrackID)] = outcome
 			resultMu.Unlock()
@@ -279,11 +289,13 @@ func fetchTaggingMetadataWithOutcomes(ctx context.Context, cache *MetadataCache,
 				addWarning("Spotify metadata lookup failed: %v", err)
 				return
 			}
-			if releaseDate != "" {
-				resultMu.Lock()
-				result.ReleaseDate = strings.TrimSpace(releaseDate)
-				resultMu.Unlock()
+			resultMu.Lock()
+			if result.ReleaseDate == "" {
+				result.ReleaseDate = strings.TrimSpace(track.ReleaseDate)
 			}
+			result.TrackNumber = track.TrackNumber
+			result.TotalTracks = track.TotalTracks
+			resultMu.Unlock()
 		}()
 	}
 
@@ -952,7 +964,7 @@ func (s *SpotiDownloader) requestDownloadLink(ctx context.Context, trackID strin
 	}
 
 	if !result.Success {
-		return nil, fmt.Errorf("download request failed")
+		return nil, fmt.Errorf("download request failed: %s", formatStatusBody(body))
 	}
 
 	return &result, nil
@@ -1147,31 +1159,31 @@ func fetchTrackTaggingMetadata(trackID string) (string, string, bool) {
 }
 
 func fetchTrackTaggingMetadataContext(ctx context.Context, cache *MetadataCache, trackID string) (string, error) {
-	releaseDate, _, err := fetchTrackTaggingMetadataContextWithOutcome(ctx, cache, trackID)
-	return releaseDate, err
+	track, _, err := fetchTrackTaggingMetadataContextWithOutcome(ctx, cache, trackID)
+	return strings.TrimSpace(track.ReleaseDate), err
 }
 
-func fetchTrackTaggingMetadataContextWithOutcome(ctx context.Context, cache *MetadataCache, trackID string) (string, CacheOutcome, error) {
+func fetchTrackTaggingMetadataContextWithOutcome(ctx context.Context, cache *MetadataCache, trackID string) (TrackMetadata, CacheOutcome, error) {
 	if strings.TrimSpace(trackID) == "" {
-		return "", CacheMiss, fmt.Errorf("empty track ID")
+		return TrackMetadata{}, CacheMiss, fmt.Errorf("empty track ID")
 	}
 
 	client := NewSpotifyMetadataClient()
 	data, outcome, err := client.GetFilteredDataWithCacheOutcome(ctx, cache, fmt.Sprintf("https://open.spotify.com/track/%s", trackID), false, 0)
 	if err != nil {
-		return "", outcome, err
+		return TrackMetadata{}, outcome, err
 	}
 
 	switch resp := data.(type) {
 	case TrackResponse:
-		return strings.TrimSpace(resp.Track.ReleaseDate), outcome, nil
+		return resp.Track, outcome, nil
 	case *TrackResponse:
 		if resp != nil {
-			return strings.TrimSpace(resp.Track.ReleaseDate), outcome, nil
+			return resp.Track, outcome, nil
 		}
 	}
 
-	return "", outcome, fmt.Errorf("Spotify metadata response did not contain track data")
+	return TrackMetadata{}, outcome, fmt.Errorf("Spotify metadata response did not contain track data")
 }
 
 func fetchGenreFromDeezer(trackID string) (string, error) {

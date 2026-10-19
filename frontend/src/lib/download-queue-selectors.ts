@@ -2,6 +2,7 @@ import type { backend } from "../../wailsjs/go/models";
 import type { SpotifyMetadataResponse } from "@/types/api";
 import {
     makeQueueId,
+    mediaResultWarnings,
     parseSpotifyCollectionURL,
     type DownloadQueueContext,
     type MediaJobPayload,
@@ -133,7 +134,7 @@ export function selectLatestTrackAttempt(
 
     const backendItem = backendByJobId?.get(latest.backendItemId || latest.id);
     const progress = backendItem?.queue_id === queue.id ? backendItem : undefined;
-    const warning = progress?.warning || latest.result?.validation_warning || latest.result?.warnings?.[0];
+    const warning = mediaResultWarnings(latest.result) || progress?.warning;
     const error = latest.error || latest.result?.error || progress?.error_message;
     return {
         jobId: latest.id,
@@ -174,7 +175,7 @@ export function mergeDownloadQueueInfo(
                 spotify_id: job.payload.track.spotify_id || "", track_name: job.payload.track.name,
                 artist_name: job.payload.track.artists, album_name: job.payload.track.album_name,
                 error_message: job.error || job.result?.error || progress?.error_message || "",
-                warning: progress?.warning || job.result?.validation_warning || job.result?.warnings?.[0] || "",
+                warning: mediaResultWarnings(job.result) || progress?.warning || "",
                 file_path: (job.result && "file" in job.result ? job.result.file : undefined) || progress?.file_path || "",
             } as QueueDisplayRow);
         }

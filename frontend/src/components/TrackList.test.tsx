@@ -91,6 +91,24 @@ function renderTrackList(
 }
 
 describe("TrackList media status", () => {
+    it.each(["suspicious", "failed", "cancelled", "unavailable"] as const)(
+        "renders the complete %s diagnostic in the row without opening a tooltip",
+        (status) => {
+            const diagnostic = `Download diagnostic: ${"provider details and retry context; ".repeat(30)}\nFinal reason: source is unavailable.`;
+            const snapshot = queue("active");
+            snapshot.jobs[0].status = status;
+            if (status === "suspicious") {
+                snapshot.jobs[0].result = { success: true, message: "Downloaded", validation_warning: diagnostic };
+            } else {
+                snapshot.jobs[0].error = diagnostic;
+            }
+
+            const markup = renderTrackList(snapshot);
+
+            expect(markup).toContain(`>${diagnostic}</span>`);
+        },
+    );
+
     it("names the disabled queued media button", () => {
         const markup = renderTrackList(queue("queued"));
 

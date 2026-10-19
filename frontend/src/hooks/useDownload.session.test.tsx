@@ -7,6 +7,7 @@ import type { DownloadQueueSnapshot } from "@/lib/download-queue-manager";
 import type { MediaJobPayload, MediaJobResult } from "@/lib/download-jobs";
 import type { Settings } from "@/lib/settings";
 import { useDownload } from "./useDownload";
+import { logger } from "@/lib/logger";
 
 const harness = vi.hoisted(() => ({ options: undefined as DownloadQueueHarnessOptions | undefined,
     snapshot: { queues: {}, activeCount: 0, peakActive: 0 }, clearCompletedQueues: vi.fn(async () => {}), startNewSession: vi.fn(async () => {}),
@@ -16,7 +17,6 @@ vi.mock("./useDownloadQueues", () => ({ useDownloadQueues: (options: DownloadQue
     return harness;
 }, applyYouTubeResultToSummary: vi.fn() }));
 vi.mock("../../wailsjs/go/main/App", () => ({ CreateM3U8File: harness.createM3u8 }));
-vi.mock("@/lib/logger", () => ({ logger: { info: vi.fn(), error: vi.fn(), warning: vi.fn() } }));
 vi.mock("@/lib/toast-with-sound", () => ({ toastWithSound: { success: vi.fn() } }));
 
 function completedQueue(id: string, sourceIndex: number, file: string): DownloadQueueSnapshot<MediaJobPayload, MediaJobResult> {
@@ -31,6 +31,35 @@ function completedQueue(id: string, sourceIndex: number, file: string): Download
         }],
     };
 }
+
+it("logs all diagnostics once as soon as a track completes while the queue is still busy", async () => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    logger.clear();
+    const queue = completedQueue("done", 0, "done.mp3");
+    const warnings = ["lyrics unavailable: Spotify returned 503; LRCLIB returned 404", "Chosic track lookup failed: request timed out"];
+    queue.jobs[0]!.result = { success: true, message: "Downloaded", warnings, validation_warning: "duration check unavailable" };
+    const active = { ...completedQueue("active", 1, "").jobs[0]!, status: "active" as const, result: undefined };
+    const busy = { ...queue, jobs: [...queue.jobs, active] };
+    harness.snapshot = { queues: { [queue.id]: busy }, activeCount: 1, peakActive: 1 };
+    function Probe() { useDownload(); return null; }
+    const root = createRoot(document.createElement("div"));
+    try {
+        await act(async () => root.render(<Probe />));
+        const entries = logger.getLogs().filter(log => log.message.startsWith("downloaded: done"));
+        expect(entries).toHaveLength(1);
+        expect(entries[0]!.level).toBe("warning");
+        for (const warning of [...warnings, "duration check unavailable"]) {
+            expect(entries[0]!.message).toContain(warning);
+        }
+        harness.snapshot = { ...harness.snapshot, queues: { [queue.id]: { ...busy } } };
+        await act(async () => root.render(<Probe />));
+        expect(logger.getLogs().filter(log => log.message.startsWith("downloaded: done"))).toHaveLength(1);
+    } finally {
+        await act(async () => root.unmount());
+        harness.snapshot = { queues: {}, activeCount: 0, peakActive: 0 };
+        vi.unstubAllGlobals();
+    }
+});
 
 it("keeps previous playlist paths after history clears, ordered with appended paths, until a new session", async () => {
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);

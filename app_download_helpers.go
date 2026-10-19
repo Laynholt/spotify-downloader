@@ -64,10 +64,6 @@ func primaryTrackID(req DownloadRequest) string {
 }
 
 func buildTrackPipelineRequest(req DownloadRequest, itemID string) backend.TrackPipelineRequest {
-	trackNumber := req.AlbumTrackNumber
-	if trackNumber == 0 {
-		trackNumber = 1
-	}
 	trackID := primaryTrackID(req)
 	return backend.TrackPipelineRequest{
 		ItemID:               itemID,
@@ -95,7 +91,7 @@ func buildTrackPipelineRequest(req DownloadRequest, itemID string) backend.Track
 			AlbumArtist: req.AlbumArtist,
 			Date:        req.ReleaseDate,
 			ReleaseDate: req.ReleaseDate,
-			TrackNumber: trackNumber,
+			TrackNumber: req.AlbumTrackNumber,
 			TotalTracks: req.TotalTracks,
 			DiscNumber:  req.DiscNumber,
 			TotalDiscs:  req.SpotifyTotalDiscs,

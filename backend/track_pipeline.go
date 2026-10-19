@@ -276,7 +276,7 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 		coverCh <- trackPipelineCoverResult{}
 	}
 
-	metadataNeeded := req.EmbedGenre || strings.TrimSpace(req.BaseMetadata.Date) == "" || strings.TrimSpace(req.BaseMetadata.ISRC) == ""
+	metadataNeeded := req.EmbedGenre || req.BaseMetadata.TrackNumber <= 0 || strings.TrimSpace(req.BaseMetadata.Date) == "" || strings.TrimSpace(req.BaseMetadata.ISRC) == ""
 	if metadataNeeded {
 		branchWG.Add(1)
 		go func() {
@@ -284,6 +284,7 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 			tagging, metadataWarnings, outcomes := deps.metadata(metadataCtx, s.metadataCache, TaggingMetadataRequest{
 				TrackID: req.TrackID, TrackName: req.BaseMetadata.Title, ArtistName: req.BaseMetadata.Artist,
 				AlbumName: req.BaseMetadata.Album, ReleaseDate: req.BaseMetadata.Date,
+				TrackNumber:    req.BaseMetadata.TrackNumber,
 				UseSingleGenre: req.UseSingleGenre, EmbedGenre: req.EmbedGenre,
 			})
 			metadataCh <- trackPipelineMetadataResult{tagging: tagging, warnings: metadataWarnings, cacheOutcomes: outcomes,
@@ -539,6 +540,12 @@ func audioOutputPath(outputBasePath, stagedPath, audioFormat string) string {
 func mergeTrackPipelineMetadata(base Metadata, optional trackPipelineMetadataResult) Metadata {
 	metadata := base
 	tagging := optional.tagging
+	if metadata.TrackNumber <= 0 {
+		metadata.TrackNumber = tagging.TrackNumber
+	}
+	if metadata.TotalTracks <= 0 {
+		metadata.TotalTracks = tagging.TotalTracks
+	}
 	if strings.TrimSpace(metadata.Date) == "" {
 		metadata.Date = strings.TrimSpace(tagging.ReleaseDate)
 	}

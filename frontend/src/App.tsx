@@ -558,7 +558,7 @@ function App() {
 
 
             <div className="flex-1 ml-14 mt-10 p-4 md:p-8">
-                <div className="max-w-4xl mx-auto space-y-6">
+                <div className={`mx-auto space-y-6 ${currentPage === "main" ? "w-full" : "max-w-4xl"}`}>
                     <Suspense fallback={<div role="status" className="py-8 text-center text-muted-foreground">Loading page…</div>}>{renderPage()}</Suspense>
                 </div>
             </div>

@@ -94,7 +94,7 @@ export function DebugLoggerPage() {
               <span className={`shrink-0 w-16 ${levelColors[log.level]}`}>
                 [{log.level}]
               </span>
-              <span className="break-all">{log.message}</span>
+              <span className="min-w-0 whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{log.message}</span>
             </div>)))}
       </div>
     </div>);

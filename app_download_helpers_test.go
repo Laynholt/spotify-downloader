@@ -362,7 +362,7 @@ func TestDownloadTrackReturnsPipelineDiagnosticsAndBuildsRequest(t *testing.T) {
 	if captured.ItemID == "" || captured.TrackID != "track-1" || captured.ExpectedDurationMS != 180000 {
 		t.Fatalf("captured request identity/duration = %#v", captured)
 	}
-	if captured.BaseMetadata.TrackNumber != 1 || captured.BaseMetadata.TotalTracks != 9 || captured.BaseMetadata.TotalDiscs != 3 {
+	if captured.BaseMetadata.TrackNumber != 0 || captured.BaseMetadata.TotalTracks != 9 || captured.BaseMetadata.TotalDiscs != 3 {
 		t.Fatalf("captured base metadata = %#v", captured.BaseMetadata)
 	}
 	queue := backend.GetDownloadQueue()

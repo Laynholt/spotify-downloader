@@ -5,6 +5,7 @@ import { getSettingsWithDefaults, parseTemplate, type Settings, type TemplateDat
 import { toastWithSound as toast } from "@/lib/toast-with-sound";
 import { joinPath, sanitizePath } from "@/lib/utils";
 import { logger } from "@/lib/logger";
+import { mediaResultWarnings } from "@/lib/download-jobs";
 import { logDuplicateTracks } from "@/lib/duplicate-tracks";
 import {
     addBatchResult,
@@ -345,16 +346,18 @@ export function queueTerminalLog(
 ): QueueCompatibilityLog {
     const track = trackForMediaJob(job);
     const identity = `${track.name || "Unknown track"} - ${track.artists || ""}`;
-    const detail = job.error || job.result?.error || "Download failed";
+    const warnings = mediaResultWarnings(job.result);
+    const warningSuffix = warnings ? `\n${warnings}` : "";
+    const detail = [job.error || job.result?.error, warnings].filter(Boolean).join("\n") || "Download failed";
     switch (job.status) {
         case "completed":
-            return { level: "info", message: `downloaded: ${identity}` };
+            return { level: warnings ? "warning" : "info", message: `downloaded: ${identity}${warningSuffix}` };
         case "skipped":
-            return { level: "info", message: `skipped: ${identity}` };
+            return { level: warnings ? "warning" : "info", message: `skipped: ${identity}${warningSuffix}` };
         case "suspicious":
             return { level: "warning", message: `suspicious: ${identity} - ${detail}` };
         case "cancelled":
-            return { level: "info", message: `cancelled: ${identity} - ${job.error || "Download cancelled"}` };
+            return { level: "info", message: `cancelled: ${identity} - ${job.error || "Download cancelled"}${warningSuffix}` };
         case "unavailable":
             return { level: "error", message: `unavailable: ${identity} - ${detail}` };
         default:
@@ -812,6 +815,14 @@ export function useDownload() {
         for (const job of newlyStartedJobs) {
             const track = trackForMediaJob(job);
             logger.info(`starting download: ${track.name || "Unknown track"} - ${track.artists || ""}`);
+        }
+        for (const queue of queues) {
+            for (const job of queue.jobs) {
+                if (isQueueTerminal(job.status) && !loggedTerminalJobIdsRef.current.has(job.id)) {
+                    loggedTerminalJobIdsRef.current.add(job.id);
+                    writeCompatibilityLog(queueTerminalLog(job));
+                }
+            }
         }
         const preferredQueue = latestQueueIdRef.current
             ? downloadQueues.snapshot.queues[latestQueueIdRef.current]

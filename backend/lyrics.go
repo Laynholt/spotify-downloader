@@ -361,6 +361,14 @@ func (c *LyricsClient) FetchLyricsAllSourcesContext(ctx context.Context, spotify
 	if err := ctx.Err(); err != nil {
 		return nil, "", err
 	}
+	var failures []string
+	recordFailure := func(source string, err error) {
+		detail := "no lyrics returned"
+		if err != nil {
+			detail = err.Error()
+		}
+		failures = append(failures, source+": "+detail)
+	}
 
 	resp, err := c.FetchLyricsFromSpotifyAPIContext(ctx, spotifyID)
 	if err == nil && resp != nil && !resp.Error && len(resp.Lines) > 0 {
@@ -370,6 +378,7 @@ func (c *LyricsClient) FetchLyricsAllSourcesContext(ctx context.Context, spotify
 		return nil, "", ctxErr
 	}
 	fmt.Printf("   Spotify Lyrics API: %v\n", err)
+	recordFailure("Spotify Lyrics API", err)
 
 	resp, err = c.FetchLyricsWithMetadataContext(ctx, trackName, artistName, duration)
 	if err == nil && resp != nil && !resp.Error && len(resp.Lines) > 0 {
@@ -379,6 +388,7 @@ func (c *LyricsClient) FetchLyricsAllSourcesContext(ctx context.Context, spotify
 		return nil, "", ctxErr
 	}
 	fmt.Printf("   LRCLIB exact: %v\n", err)
+	recordFailure("LRCLIB exact", err)
 
 	resp, err = c.FetchLyricsFromLRCLibSearchContext(ctx, trackName, artistName)
 	if err == nil && resp != nil && !resp.Error && len(resp.Lines) > 0 {
@@ -388,6 +398,7 @@ func (c *LyricsClient) FetchLyricsAllSourcesContext(ctx context.Context, spotify
 		return nil, "", ctxErr
 	}
 	fmt.Printf("   LRCLIB search: %v\n", err)
+	recordFailure("LRCLIB search", err)
 
 	simplifiedTrack := simplifyTrackName(trackName)
 	if simplifiedTrack != trackName {
@@ -400,6 +411,7 @@ func (c *LyricsClient) FetchLyricsAllSourcesContext(ctx context.Context, spotify
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, "", ctxErr
 		}
+		recordFailure("LRCLIB exact (simplified)", err)
 
 		resp, err = c.FetchLyricsFromLRCLibSearchContext(ctx, simplifiedTrack, artistName)
 		if err == nil && resp != nil && !resp.Error && len(resp.Lines) > 0 {
@@ -408,9 +420,10 @@ func (c *LyricsClient) FetchLyricsAllSourcesContext(ctx context.Context, spotify
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, "", ctxErr
 		}
+		recordFailure("LRCLIB search (simplified)", err)
 	}
 
-	return nil, "", fmt.Errorf("lyrics not found in any source")
+	return nil, "", fmt.Errorf("no lyrics retrieved; %s", strings.Join(failures, "; "))
 }
 
 func (c *LyricsClient) ConvertToLRC(lyrics *LyricsResponse, trackName, artistName string) string {

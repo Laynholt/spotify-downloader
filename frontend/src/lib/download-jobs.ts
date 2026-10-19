@@ -28,6 +28,15 @@ export interface YouTubeRedownloadPayload extends SpotifyDownloadPayload {
 export type MediaJobPayload = SpotifyDownloadPayload | YouTubeRedownloadPayload;
 export type MediaJobResult = DownloadResponse | SuspiciousRedownloadResult;
 
+export function mediaResultWarnings(result?: MediaJobResult): string {
+    if (!result) return "";
+    return [...new Set([
+        result.validation_warning,
+        ...(result.warnings ?? []),
+        "diagnostics" in result ? result.diagnostics : undefined,
+    ].filter(Boolean))].join("\n");
+}
+
 export interface BuildSpotifyCandidateArgs {
     queue: DownloadQueueContext;
     track: TrackMetadata;

@@ -169,6 +169,7 @@ func UpdateTrackMetadata(req TrackMetadataUpdateRequest) TrackMetadataUpdateResu
 		tagging, warnings := fetchTaggingMetadata(context.Background(), CurrentMetadataCache(), TaggingMetadataRequest{
 			TrackID: req.TrackID, TrackName: req.TrackName, ArtistName: req.ArtistName, AlbumName: req.AlbumName,
 			ReleaseDate: req.ReleaseDate, UseSingleGenre: req.UseSingleGenre, EmbedGenre: req.EmbedGenre,
+			TrackNumber: req.TrackNumber,
 		})
 		for _, warning := range warnings {
 			fmt.Printf("Warning: %s\n", warning)
@@ -265,6 +266,7 @@ func prepareYouTubeRedownloadMetadata(ctx context.Context, req TrackMetadataUpda
 		tagging, warnings := fetchTaggingMetadata(ctx, CurrentMetadataCache(), TaggingMetadataRequest{
 			TrackID: req.TrackID, TrackName: req.TrackName, ArtistName: req.ArtistName, AlbumName: req.AlbumName,
 			ReleaseDate: req.ReleaseDate, UseSingleGenre: req.UseSingleGenre, EmbedGenre: req.EmbedGenre,
+			TrackNumber: req.TrackNumber,
 		})
 		if err := ctx.Err(); err != nil {
 			return Metadata{}, "", err

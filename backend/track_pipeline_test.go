@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -695,6 +696,25 @@ func TestTrackPipelineForceBypassesExistingOutput(t *testing.T) {
 	}
 }
 
+func TestMergeTrackPipelineMetadataPreservesAlbumNumbers(t *testing.T) {
+	for _, test := range []struct {
+		name                 string
+		base                 Metadata
+		tagging              taggingMetadataResult
+		wantTrack, wantTotal int
+	}{
+		{"known album number", Metadata{TrackNumber: 3, TotalTracks: 10}, taggingMetadataResult{TrackNumber: 7, TotalTracks: 12}, 3, 10},
+		{"lookup failed", Metadata{}, taggingMetadataResult{}, 0, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := mergeTrackPipelineMetadata(test.base, trackPipelineMetadataResult{tagging: test.tagging})
+			if got.TrackNumber != test.wantTrack || got.TotalTracks != test.wantTotal {
+				t.Fatalf("album numbering = %d/%d, want %d/%d", got.TrackNumber, got.TotalTracks, test.wantTrack, test.wantTotal)
+			}
+		})
+	}
+}
+
 func TestTrackPipelineDefaultMetadataPropagatesCacheOutcomes(t *testing.T) {
 	cache, warnings := OpenMetadataCache("", CacheOptions{})
 	if len(warnings) != 0 {
@@ -718,7 +738,8 @@ func TestTrackPipelineDefaultMetadataPropagatesCacheOutcomes(t *testing.T) {
 
 	_, _, outcomes := pipelineDeps.metadata(context.Background(), cache, TaggingMetadataRequest{
 		TrackID: trackID, TrackName: "Track", ArtistName: "Artist", AlbumName: "Album", ReleaseDate: "2024-01-01",
-		EmbedGenre: true, UseSingleGenre: true,
+		TrackNumber: 1,
+		EmbedGenre:  true, UseSingleGenre: true,
 	})
 	for _, key := range []string{isrcCacheKey(trackID), chosicTrackCacheKey(trackID), artistGenreCacheKey("artist-1")} {
 		if got := outcomes[key]; got != CacheHit {
@@ -736,7 +757,7 @@ func TestTrackPipelineDefaultMetadataSpotifyCacheOutcomeMissThenHit(t *testing.T
 		}
 		spotifyCalls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"data":{"trackUnion":{"id":"spotify-outcome-track","name":"Track","trackNumber":1,"discNumber":1,"artists":{"items":[{"profile":{"name":"Artist"}}]},"duration":{"totalMilliseconds":180000},"albumOfTrack":{"name":"Album","artists":{"items":[{"profile":{"name":"Artist"}}]},"date":{"isoString":"2024-01-02"},"tracks":{"totalCount":1},"copyright":{"items":[]}}}}}`))
+		_, _ = w.Write([]byte(`{"data":{"trackUnion":{"id":"spotify-outcome-track","name":"Track","trackNumber":7,"discNumber":1,"artists":{"items":[{"profile":{"name":"Artist"}}]},"duration":{"totalMilliseconds":180000},"albumOfTrack":{"name":"Album","artists":{"items":[{"profile":{"name":"Artist"}}]},"date":{"isoString":"2024-01-02"},"tracks":{"totalCount":12},"copyright":{"items":[]}}}}}`))
 	}))
 	defer server.Close()
 
@@ -772,6 +793,10 @@ func TestTrackPipelineDefaultMetadataSpotifyCacheOutcomeMissThenHit(t *testing.T
 	if got := firstOutcomes[spotifyCacheKey(req.TrackID)]; got != CacheMiss {
 		t.Fatalf("first spotify outcome = %q, want %q (all=%v)", got, CacheMiss, firstOutcomes)
 	}
+	metadata := mergeTrackPipelineMetadata(Metadata{}, trackPipelineMetadataResult{tagging: first})
+	if metadata.TrackNumber != 7 || metadata.TotalTracks != 12 {
+		t.Fatalf("Spotify album numbering was lost before tagging: %+v", metadata)
+	}
 
 	_, _, secondOutcomes := pipelineDeps.metadata(context.Background(), cache, req)
 	if got := secondOutcomes[spotifyCacheKey(req.TrackID)]; got != CacheHit {
@@ -779,6 +804,36 @@ func TestTrackPipelineDefaultMetadataSpotifyCacheOutcomeMissThenHit(t *testing.T
 	}
 	if got := spotifyCalls.Load(); got != 1 {
 		t.Fatalf("spotify calls = %d, want one miss loader call", got)
+	}
+
+	// A playlist may already have its date enriched while its album number is unknown.
+	pipelineReq, _ := testTrackPipelineRequest(t)
+	pipelineReq.TrackID = req.TrackID
+	pipelineReq.EmbedGenre, pipelineReq.EmbedLyrics = false, false
+	pipelineReq.CoverURL = ""
+	pipelineReq.BaseMetadata.ISRC = "ISRC-1"
+	installPipelineDepsForTest(t, trackPipelineDeps{
+		resolveTarget: func(context.Context, *SpotiDownloader, TrackPipelineRequest) (string, string, error) {
+			return "source", ".mp3", nil
+		},
+		downloadAudio: func(_ context.Context, _ *SpotiDownloader, _ string, base, ext, _ string) (string, error) {
+			path := base + ext
+			return path, os.WriteFile(path, []byte("audio"), 0600)
+		},
+		convertAudio:  func(_ context.Context, path, _, _ string) (string, error) { return path, nil },
+		probeDuration: func(context.Context, string) (float64, error) { return 180, nil },
+		finalizeMedia: func(_ context.Context, _ string, metadata Metadata, _ string) error {
+			if metadata.TrackNumber != 7 || metadata.TotalTracks != 12 || metadata.Date != "2024-01-01" {
+				return fmt.Errorf("incorrect album tags at finalization: %+v", metadata)
+			}
+			return nil
+		},
+	})
+	if _, err := (&SpotiDownloader{metadataCache: cache}).RunTrackPipeline(context.Background(), pipelineReq); err != nil {
+		t.Fatal(err)
+	}
+	if got := spotifyCalls.Load(); got != 1 {
+		t.Fatalf("pipeline bypassed Spotify cache: %d requests", got)
 	}
 }
 
@@ -994,6 +1049,7 @@ func TestTrackPipelineLyricsDeadlineUsesInjectedContext(t *testing.T) {
 	req.EmbedGenre = false
 	req.BaseMetadata.Date = "2024-01-01"
 	req.BaseMetadata.ISRC = "ISRC-1"
+	req.BaseMetadata.TrackNumber = 1
 	startedAt := time.Unix(0, 0)
 	deadline := startedAt.Add(trackPipelineLyricsBudget)
 	timerCreated := make(chan struct{})
@@ -1103,6 +1159,7 @@ func TestTrackPipelineRefreshCancellationDuringResolverAndAudio(t *testing.T) {
 			req.CoverURL = ""
 			req.BaseMetadata.Date = "2024-01-01"
 			req.BaseMetadata.ISRC = "ISRC-1"
+			req.BaseMetadata.TrackNumber = 1
 			var requests atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				requests.Add(1)

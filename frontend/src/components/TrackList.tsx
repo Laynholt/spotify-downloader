@@ -261,7 +261,7 @@ export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloa
     return (<div className="space-y-4">
     <div className="rounded-md border">
       <div className="overflow-x-auto">
-        <table className="w-full">
+        <table className="w-full min-w-[560px] table-fixed">
           <thead>
             <tr className="border-b bg-muted/50">
               {showCheckboxes && (<th className="h-12 px-4 text-left align-middle w-12">
@@ -273,7 +273,7 @@ export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloa
               <th className="h-12 px-4 text-left align-middle font-medium text-muted-foreground">
                 Title
               </th>
-              {!hideAlbumColumn && (<th className="h-12 px-4 text-left align-middle font-medium text-muted-foreground hidden md:table-cell">
+              {!hideAlbumColumn && (<th className="h-12 px-4 text-left align-middle font-medium text-muted-foreground hidden md:table-cell w-1/4">
                 Album
               </th>)}
               <th className="h-12 px-4 text-left align-middle font-medium text-muted-foreground hidden lg:table-cell w-24">
@@ -282,7 +282,7 @@ export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloa
               <th className="h-12 px-4 text-left align-middle font-medium text-muted-foreground hidden xl:table-cell w-32">
                 Plays
               </th>
-              <th className="h-12 px-4 text-center align-middle font-medium text-muted-foreground w-32">
+              <th className="h-12 px-4 text-center align-middle font-medium text-muted-foreground w-48">
                 Actions
               </th>
             </tr>
@@ -332,8 +332,8 @@ export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloa
               </td>
               <td className="p-4 align-middle">
                 <div className="flex items-center gap-3">
-                  {track.images && (<img src={track.images} alt={track.name} className="w-10 h-10 rounded object-cover"/>)}
-                  <div className="flex flex-col">
+                  {track.images && (<img src={track.images} alt={track.name} className="w-10 h-10 shrink-0 rounded object-cover"/>)}
+                  <div className="flex min-w-0 flex-col [overflow-wrap:anywhere]">
                     <div className="flex items-center gap-2">
                       {onTrackClick ? (<span className="font-medium cursor-pointer hover:underline" onClick={() => onTrackClick(track)}>
                         {track.name}
@@ -373,19 +373,19 @@ export function TrackList({ tracks, searchQuery, sortBy, selectedTracks, downloa
                         {track.artists}
                       </span>) : (track.artists)}
                     </span>
-                    {attempt?.status === "active" && (<span className="max-w-[420px] truncate text-xs text-muted-foreground">
+                    {attempt?.status === "active" && (<span className="whitespace-pre-wrap text-xs text-muted-foreground">
                       {phaseLabel(attempt.phase || "downloading")}{attempt.detail ? ` · ${attempt.detail}` : ""}
                     </span>)}
                     {(transfer || speedMbps > 0) && (<span className="text-xs font-mono text-muted-foreground">
                       {transfer}{transfer && speedMbps > 0 ? " · " : ""}
                       {speedMbps > 0 ? `${speedMbps.toFixed(2)} MB/s` : ""}
                     </span>)}
-                    {attempt?.warning && (<span className="max-w-[420px] truncate text-xs text-yellow-600 dark:text-yellow-400">{attempt.warning}</span>)}
-                    {attempt?.error && (attempt.status === "failed" || attempt.status === "cancelled" || attempt.status === "unavailable") && (<span className="max-w-[420px] truncate text-xs text-red-500">{attempt.error}</span>)}
+                    {attempt?.warning && (<span className="whitespace-pre-wrap text-xs text-yellow-600 dark:text-yellow-400">{attempt.warning}</span>)}
+                    {attempt?.error && (attempt.status === "failed" || attempt.status === "cancelled" || attempt.status === "unavailable") && (<span className="whitespace-pre-wrap text-xs text-red-500">{attempt.error}</span>)}
                   </div>
                 </div>
               </td>
-              {!hideAlbumColumn && (<td className="p-4 align-middle text-sm text-muted-foreground hidden md:table-cell">
+              {!hideAlbumColumn && (<td className="p-4 align-middle text-sm text-muted-foreground hidden md:table-cell [overflow-wrap:anywhere]">
                 {onAlbumClick && track.album_id && track.album_url ? (<span className="cursor-pointer hover:underline" onClick={() => onAlbumClick({
                         id: track.album_id!,
                         name: track.album_name,

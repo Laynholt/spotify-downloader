@@ -84,6 +84,19 @@ function playlistMetadata(title: string): SpotifyMetadataResponse {
 }
 
 describe("download queue selectors", () => {
+    it("keeps every result warning and validation detail in track and queue views without backend progress", () => {
+        const warnings = ["lyrics unavailable", "Chosic track lookup failed: timed out"];
+        const snapshot = queue([job("done", "spotify:one", "completed", {
+            result: { success: true, message: "Downloaded", warnings, validation_warning: "duration unavailable" },
+        })]);
+        const track = selectLatestTrackAttempt(snapshot, "spotify:one");
+        const merged = mergeDownloadQueueInfo({ queues: { [queueId]: snapshot }, activeCount: 0, peakActive: 1 },
+            { queue: [] } as unknown as backend.DownloadQueueInfo);
+        for (const warning of [...warnings, "duration unavailable"]) {
+            expect(track?.warning).toContain(warning);
+            expect(merged.queue[0]?.warning).toContain(warning);
+        }
+    });
     it("merges waiting frontend jobs with backend details by attempt identity without duplicate rows", () => {
         const active = job("active-job", "spotify:active", "active", { backendItemId: "registered-id" });
         const waiting = job("waiting-job", "spotify:waiting", "queued");
