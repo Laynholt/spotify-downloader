@@ -607,6 +607,8 @@ func publishTrackPipelineFile(ctx context.Context, srcPath, dstPath string) erro
 	}
 	_, copyErr := copyWithContext(ctx, dst, src)
 	closeErr := dst.Close()
+	// Windows cannot delete the source below while it is still open.
+	_ = src.Close()
 	if copyErr != nil || closeErr != nil || ctx.Err() != nil {
 		_ = os.Remove(dstPath)
 		if ctxErr := ctx.Err(); ctxErr != nil {

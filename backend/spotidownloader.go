@@ -565,6 +565,50 @@ func preferredAudioExtension(audioFormat string) string {
 	}
 }
 
+func isHLSPlaylist(contentType string, sniff []byte) bool {
+	return bytes.HasPrefix(bytes.TrimLeft(sniff, "\ufeff \t\r\n"), []byte("#EXTM3U")) ||
+		strings.Contains(strings.ToLower(contentType), "mpegurl")
+}
+
+// fetchHLSAudio lets FFmpeg fetch every segment of an HLS stream and remux the
+// audio, without re-encoding, into one .m4a file.
+// shortcut: no byte progress for HLS downloads, the queue item only shows the phase.
+func fetchHLSAudio(ctx context.Context, playlistURL, outputBasePath string) (string, error) {
+	ffmpegPath, err := GetFFmpegPathContext(ctx)
+	if err != nil {
+		return "", fmt.Errorf("track is an HLS stream and FFmpeg is required to download it: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(outputBasePath), 0755); err != nil {
+		return "", err
+	}
+	outputPath := outputBasePath + ".m4a"
+	tempPath := outputBasePath + ".hls.m4a"
+	_ = os.Remove(tempPath)
+	output, err := newManagedCommand(ctx, ffmpegPath,
+		"-nostdin", "-v", "error", "-y",
+		"-i", playlistURL,
+		"-vn", "-map", "0:a:0", "-c:a", "copy",
+		"-movflags", "+faststart", "-f", "ipod",
+		tempPath,
+	).CombinedOutput()
+	if err != nil {
+		_ = os.Remove(tempPath)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
+		return "", fmt.Errorf("HLS download failed: %s - %w", strings.TrimSpace(string(output)), err)
+	}
+	if err := MoveFileWithFallback(tempPath, outputPath); err != nil {
+		_ = os.Remove(tempPath)
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
+		_ = os.Remove(outputPath)
+		return "", err
+	}
+	return outputPath, nil
+}
+
 func detectAudioExtension(contentType string, sniff []byte, fallbackExt string) string {
 	normalizedFallback := normalizeAudioExtension(fallbackExt)
 	contentType = strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
@@ -846,6 +890,11 @@ func (s *SpotiDownloader) fetchAudio(ctx context.Context, downloadURL, outputBas
 
 	reader := bufio.NewReader(resp.Body)
 	sniff, _ := reader.Peek(32)
+	if isHLSPlaylist(resp.Header.Get("Content-Type"), sniff) {
+		// Some tracks are served as an HLS stream (SoundCloud AAC) instead of a file.
+		_ = resp.Body.Close()
+		return fetchHLSAudio(ctx, downloadURL, outputBasePath)
+	}
 	actualExt := detectAudioExtension(resp.Header.Get("Content-Type"), sniff, fallbackExt)
 	outputPath := outputBasePath + actualExt
 
