@@ -158,6 +158,10 @@ func (s *SongLinkClient) getLinksResponseContext(ctx context.Context, spotifyTra
 				lastErr = fmt.Errorf("song.link API rate limited request")
 			} else {
 				lastErr = fmt.Errorf("API returned status %d", statusCode)
+				if statusCode < http.StatusInternalServerError {
+					// Retrying cannot fix a client error; the public API now answers 401 to everyone.
+					return nil, lastErr
+				}
 			}
 		} else {
 			lastErr = err

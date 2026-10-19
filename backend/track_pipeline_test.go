@@ -782,6 +782,51 @@ func TestTrackPipelineDefaultMetadataSpotifyCacheOutcomeMissThenHit(t *testing.T
 	}
 }
 
+// Production break caught: audio always outlasts the 5s lyrics deadline, and
+// lyrics found in time were dropped because the deadline had passed by the
+// time the pipeline looked at them.
+func TestTrackPipelineKeepsLyricsFoundBeforeDeadlineWhenAudioIsSlow(t *testing.T) {
+	req, _ := testTrackPipelineRequest(t)
+	startedAt := time.Now()
+	var clock atomic.Int64
+	lyricsDone := make(chan struct{})
+	var embedded atomic.Value
+	installPipelineDepsForTest(t, trackPipelineDeps{
+		resolveTarget: func(context.Context, *SpotiDownloader, TrackPipelineRequest) (string, string, error) {
+			return "source", ".mp3", nil
+		},
+		downloadAudio: func(_ context.Context, _ *SpotiDownloader, _ string, base, ext, _ string) (string, error) {
+			<-lyricsDone
+			clock.Store(int64(8 * time.Second)) // audio finished well after the lyrics deadline
+			path := base + ext
+			return path, os.WriteFile(path, []byte("audio"), 0600)
+		},
+		convertAudio:  func(_ context.Context, path, _, _ string) (string, error) { return path, nil },
+		downloadCover: func(context.Context, *SpotiDownloader, string, string, bool) (string, error) { return "", nil },
+		metadata: func(context.Context, *MetadataCache, TaggingMetadataRequest) (taggingMetadataResult, []string, map[string]CacheOutcome) {
+			return taggingMetadataResult{}, nil, nil
+		},
+		lyrics: func(context.Context, TrackPipelineRequest, int) (string, error) {
+			defer close(lyricsDone)
+			return "[00:01.00]in time", nil
+		},
+		probeDuration: func(context.Context, string) (float64, error) { return 120, nil },
+		finalizeMedia: func(_ context.Context, _ string, metadata Metadata, _ string) error {
+			embedded.Store(metadata.Lyrics)
+			return nil
+		},
+		now: func() time.Time { return startedAt.Add(time.Duration(clock.Load())) },
+	})
+
+	result, err := (&SpotiDownloader{}).RunTrackPipeline(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lyrics, _ := embedded.Load().(string); !strings.Contains(lyrics, "in time") {
+		t.Fatalf("embedded lyrics = %q, warnings = %v", lyrics, result.Warnings)
+	}
+}
+
 func TestTrackPipelineRejectsLyricsCompletedAtAbsoluteDeadline(t *testing.T) {
 	req, _ := testTrackPipelineRequest(t)
 	req.EmbedLyrics = true
@@ -1044,7 +1089,8 @@ func TestTrackPipelineRefreshCancellationDuringResolverAndAudio(t *testing.T) {
 		{name: "audio", setup: func(t *testing.T, server *httptest.Server) {
 			installPipelineDepsForTest(t, trackPipelineDeps{
 				resolveTarget: func(context.Context, *SpotiDownloader, TrackPipelineRequest) (string, string, error) {
-					return server.URL, ".mp3", nil
+					// Only API-hosted files carry the session token, so only they refresh it.
+					return spotidownloaderAPIBase + "/audio.mp3", ".mp3", nil
 				},
 			})
 		}},
@@ -1167,7 +1213,7 @@ func TestTrackPipelineDefaultAudioRetriesSessionToken(t *testing.T) {
 		s.sessionToken = "fresh"
 		return nil
 	}
-	path, err := s.downloadAudio(context.Background(), server.URL, filepath.Join(t.TempDir(), "track"), ".mp3", "item-1")
+	path, err := s.downloadAudio(context.Background(), spotidownloaderAPIBase+"/audio.mp3", filepath.Join(t.TempDir(), "track"), ".mp3", "item-1")
 	if err != nil {
 		t.Fatal(err)
 	}

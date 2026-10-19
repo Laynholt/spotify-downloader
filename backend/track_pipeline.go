@@ -351,32 +351,36 @@ func (s *SpotiDownloader) RunTrackPipeline(ctx context.Context, req TrackPipelin
 
 	var lyricsOutcome trackPipelineLyricsResult
 	if lyricsStarted {
-		remaining := lyricsDeadline.Sub(now())
-		if remaining > 0 {
+		var candidate trackPipelineLyricsResult
+		received := false
+		// Audio usually outlasts the deadline, so first take a result that is
+		// already waiting; its completion time decides whether it was in time.
+		select {
+		case candidate = <-lyricsCh:
+			received = true
+		default:
+		}
+		if remaining := lyricsDeadline.Sub(now()); !received && remaining > 0 {
 			timerC, stopTimer := deps.newTimer(remaining)
 			select {
-			case candidate := <-lyricsCh:
+			case candidate = <-lyricsCh:
 				stopTimer()
-				lyricsOutcome = candidate
-				if !candidate.completedAt.IsZero() && !candidate.completedAt.Before(lyricsDeadline) {
-					cancelLyrics()
-					warnings = append(warnings, "lyrics deadline exceeded; finalized without lyrics")
-					result.Timings.LyricsMS = candidate.elapsed
-					lyricsOutcome = trackPipelineLyricsResult{}
-				}
+				received = true
 			case <-timerC:
-				cancelLyrics()
-				warnings = append(warnings, "lyrics deadline exceeded; finalized without lyrics")
-				result.Timings.LyricsMS = trackPipelineElapsedMS(now, lyricsStartedAt)
-				lyricsOutcome = trackPipelineLyricsResult{}
 			case <-ctx.Done():
 				stopTimer()
 				return trackPipelineFailure(&result, req, ctx.Err(), warnings)
 			}
+		}
+		if received && (candidate.completedAt.IsZero() || candidate.completedAt.Before(lyricsDeadline)) {
+			lyricsOutcome = candidate
 		} else {
 			cancelLyrics()
 			warnings = append(warnings, "lyrics deadline exceeded; finalized without lyrics")
 			result.Timings.LyricsMS = trackPipelineElapsedMS(now, lyricsStartedAt)
+			if received {
+				result.Timings.LyricsMS = candidate.elapsed
+			}
 		}
 	} else {
 		lyricsOutcome = <-lyricsCh

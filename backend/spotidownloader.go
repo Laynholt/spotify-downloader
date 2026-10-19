@@ -10,9 +10,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -570,10 +572,74 @@ func isHLSPlaylist(contentType string, sniff []byte) bool {
 		strings.Contains(strings.ToLower(contentType), "mpegurl")
 }
 
+func isSpotiDownloaderURL(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(parsed.Hostname())
+	return host == "spotidownloader.com" || strings.HasSuffix(host, ".spotidownloader.com")
+}
+
+// hlsDurationSeconds sums the #EXTINF segment durations of a media playlist.
+func hlsDurationSeconds(playlist []byte) float64 {
+	total := 0.0
+	for _, line := range strings.Split(string(playlist), "\n") {
+		value, ok := strings.CutPrefix(strings.TrimSpace(line), "#EXTINF:")
+		if !ok {
+			continue
+		}
+		value, _, _ = strings.Cut(value, ",")
+		if seconds, err := strconv.ParseFloat(strings.TrimSpace(value), 64); err == nil && seconds > 0 {
+			total += seconds
+		}
+	}
+	return total
+}
+
+// hlsProgressReporter turns FFmpeg "-progress" key=value lines into queue
+// item transfer updates.
+// shortcut: the total size is extrapolated from output size and stream
+// position, so it settles only as the download goes on; exact once it ends.
+type hlsProgressReporter struct {
+	itemID       string
+	totalSeconds float64
+	size, outUS  int64
+	lastSize     int64
+	lastAt       time.Time
+}
+
+func (r *hlsProgressReporter) line(line string) {
+	key, value, _ := strings.Cut(strings.TrimSpace(line), "=")
+	switch key {
+	case "total_size":
+		if size, err := strconv.ParseInt(value, 10, 64); err == nil {
+			r.size = size
+		}
+	case "out_time_us":
+		if outUS, err := strconv.ParseInt(value, 10, 64); err == nil {
+			r.outUS = outUS
+		}
+	case "progress":
+		total := int64(0)
+		if value == "end" {
+			total = r.size
+		} else if r.totalSeconds > 0 && r.outUS > 0 {
+			total = max(r.size, int64(float64(r.size)*r.totalSeconds*1e6/float64(r.outUS)))
+		}
+		now := time.Now()
+		speed := 0.0
+		if elapsed := now.Sub(r.lastAt).Seconds(); !r.lastAt.IsZero() && elapsed > 0 {
+			speed = float64(r.size-r.lastSize) / float64(bytesPerMegabyte) / elapsed
+		}
+		r.lastSize, r.lastAt = r.size, now
+		UpdateItemTransfer(r.itemID, r.size, total, max(speed, 0))
+	}
+}
+
 // fetchHLSAudio lets FFmpeg fetch every segment of an HLS stream and remux the
 // audio, without re-encoding, into one .m4a file.
-// shortcut: no byte progress for HLS downloads, the queue item only shows the phase.
-func fetchHLSAudio(ctx context.Context, playlistURL, outputBasePath string) (string, error) {
+func fetchHLSAudio(ctx context.Context, playlistURL string, totalSeconds float64, outputBasePath, itemID string) (string, error) {
 	ffmpegPath, err := GetFFmpegPathContext(ctx)
 	if err != nil {
 		return "", fmt.Errorf("track is an HLS stream and FFmpeg is required to download it: %w", err)
@@ -584,19 +650,35 @@ func fetchHLSAudio(ctx context.Context, playlistURL, outputBasePath string) (str
 	outputPath := outputBasePath + ".m4a"
 	tempPath := outputBasePath + ".hls.m4a"
 	_ = os.Remove(tempPath)
-	output, err := newManagedCommand(ctx, ffmpegPath,
-		"-nostdin", "-v", "error", "-y",
+	cmd := newManagedCommand(ctx, ffmpegPath,
+		"-nostdin", "-v", "error", "-nostats", "-progress", "pipe:1", "-y",
 		"-i", playlistURL,
 		"-vn", "-map", "0:a:0", "-c:a", "copy",
 		"-movflags", "+faststart", "-f", "ipod",
 		tempPath,
-	).CombinedOutput()
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
+	if err == nil {
+		err = cmd.Start()
+	}
+	if err == nil {
+		reporter := hlsProgressReporter{itemID: itemID, totalSeconds: totalSeconds}
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			if itemID != "" {
+				reporter.line(scanner.Text())
+			}
+		}
+		err = cmd.Wait()
+	}
 	if err != nil {
 		_ = os.Remove(tempPath)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return "", ctxErr
 		}
-		return "", fmt.Errorf("HLS download failed: %s - %w", strings.TrimSpace(string(output)), err)
+		return "", fmt.Errorf("HLS download failed: %s - %w", strings.TrimSpace(stderr.String()), err)
 	}
 	if err := MoveFileWithFallback(tempPath, outputPath); err != nil {
 		_ = os.Remove(tempPath)
@@ -866,7 +948,12 @@ func (s *SpotiDownloader) fetchAudio(ctx context.Context, downloadURL, outputBas
 		return "", err
 	}
 
-	req.Header.Set("Authorization", "Bearer "+s.sessionToken)
+	// Links often point at third-party CDNs; an Azure-backed one rejects the
+	// whole request when it carries our session token.
+	apiHost := isSpotiDownloaderURL(downloadURL)
+	if apiHost {
+		req.Header.Set("Authorization", "Bearer "+s.sessionToken)
+	}
 	req.Header.Set("Referer", "https://spotidownloader.com/")
 	req.Header.Set("Origin", "https://spotidownloader.com")
 
@@ -882,6 +969,10 @@ func (s *SpotiDownloader) fetchAudio(ctx context.Context, downloadURL, outputBas
 			return "", ctxErr
 		}
 		err := statusError(resp.StatusCode, body)
+		if !apiHost {
+			// A CDN never saw our token, so its rejection must not trigger a token refresh.
+			return "", fmt.Errorf("failed to download file: %v", err)
+		}
 		if isSessionTokenError(err) {
 			return "", err
 		}
@@ -892,8 +983,9 @@ func (s *SpotiDownloader) fetchAudio(ctx context.Context, downloadURL, outputBas
 	sniff, _ := reader.Peek(32)
 	if isHLSPlaylist(resp.Header.Get("Content-Type"), sniff) {
 		// Some tracks are served as an HLS stream (SoundCloud AAC) instead of a file.
+		playlist, _ := io.ReadAll(io.LimitReader(reader, 1<<20))
 		_ = resp.Body.Close()
-		return fetchHLSAudio(ctx, downloadURL, outputBasePath)
+		return fetchHLSAudio(ctx, downloadURL, hlsDurationSeconds(playlist), outputBasePath, itemID)
 	}
 	actualExt := detectAudioExtension(resp.Header.Get("Content-Type"), sniff, fallbackExt)
 	outputPath := outputBasePath + actualExt
